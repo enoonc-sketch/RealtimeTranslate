@@ -50,3 +50,55 @@ jobs:
             RealtimeTranslate.exe
             Output\RealtimeTranslate_Setup_v2.4.0.exe
           generate_release_notes: true
+  build-offline:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+      - name: Syntax check
+        run: python -m py_compile desktop_translator.py tray_win32.py screen_win.py ocr_win.py offline_engine.py netcheck.py prepare_offline_models.py
+      - name: Install build deps
+        run: python -m pip install --disable-pip-version-check "pyinstaller>=6.0" ctranslate2 sentencepiece numpy
+      - name: Download language packs locally
+        shell: pwsh
+        run: |
+          python prepare_offline_models.py
+          if ($LASTEXITCODE -eq 2) { throw "no language packs available, cannot build offline version" }
+      - name: Build offline exe
+        env:
+          PYTHONUTF8: "1"
+        run: python -m PyInstaller --noconfirm --clean realtime_translate_offline.spec
+      - name: Self-test (load model, translate a sentence)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist\RealtimeTranslateOffline\RealtimeTranslate.exe)) { throw "offline exe not found" }
+          $p = Start-Process -FilePath "dist\RealtimeTranslateOffline\RealtimeTranslate.exe" -ArgumentList "--selftest" -Wait -PassThru
+          if (Test-Path "$env:APPDATA\RealtimeTranslate\selftest.txt") { Get-Content "$env:APPDATA\RealtimeTranslate\selftest.txt" }
+          if ($p.ExitCode -ne 0) { throw "self-test failed" }
+      - name: Install Inno Setup and build offline installer
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DOFFLINE=1 installer.iss
+      - name: Upload offline installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: RealtimeTranslate-offline-setup
+          path: Output\RealtimeTranslate_Offline_Setup_v2.4.0.exe
+      - name: Upload offline portable folder artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: RealtimeTranslate-offline-portable
+          path: dist\RealtimeTranslateOffline\
+      - name: Attach to Release on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Output\RealtimeTranslate_Offline_Setup_v2.4.0.exe
+          generate_release_notes: true
