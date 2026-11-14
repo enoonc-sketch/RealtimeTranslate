@@ -21,6 +21,14 @@ import time
 import urllib.request
 import zipfile
 
+# Windows 控制台默认编码不一定是 UTF-8（如 cp1252），中文 print 会直接崩；
+# 把 stdout/stderr 强制成 UTF-8（失败也不影响主流程）。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:  # noqa: BLE001
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import offline_engine as oe   # noqa: E402
