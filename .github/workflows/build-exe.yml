@@ -1,10 +1,10 @@
 name: build-exe
-# 在 GitHub 云端的 Windows 机器上打包实时翻译 v2.4：不需要自己电脑装 Python。
+# 在 GitHub 云端的 Windows 机器上打包实时翻译 v2.6.0：不需要自己电脑装 Python。
 # 用法：Actions → build-exe → Run workflow，跑完在页面底部 Artifacts 里下载。
 # 两个构建：
-#   标准版：RealtimeTranslate.exe（免安装，约 13 MB）+ RealtimeTranslate_Setup_v2.4.0.exe（安装包）
+#   标准版：RealtimeTranslate.exe（免安装，约 13 MB）+ RealtimeTranslate_Setup_v2.6.0.exe（安装包）
 #   离线版：构建时在本地下载语言包（offline_models.txt 默认中↔英两对，约 100~240 MB）
-#     打进安装包 RealtimeTranslate_Offline_Setup_v2.4.0.exe 和免安装文件夹
+#     打进安装包 RealtimeTranslate_Offline_Setup_v2.6.0.exe 和免安装文件夹
 #     RealtimeTranslateOffline，装完/解压完直接能离线用，不用再在程序里下载。
 # 推 v* 标签时自动跑，并把安装包挂到对应 Release 上。
 on:
@@ -51,14 +51,14 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: RealtimeTranslate-setup
-          path: Output\RealtimeTranslate_Setup_v2.4.0.exe
+          path: Output\RealtimeTranslate_Setup_v2.6.0.exe
       - name: Attach to Release on tag
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
             RealtimeTranslate.exe
-            Output\RealtimeTranslate_Setup_v2.4.0.exe
+            Output\RealtimeTranslate_Setup_v2.6.0.exe
           generate_release_notes: true
 
   build-offline:
@@ -104,7 +104,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: RealtimeTranslate-offline-setup
-          path: Output\RealtimeTranslate_Offline_Setup_v2.4.0.exe
+          path: Output\RealtimeTranslate_Offline_Setup_v2.6.0.exe
       - name: Upload offline portable folder artifact
         uses: actions/upload-artifact@v7
         with:
@@ -115,5 +115,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            Output\RealtimeTranslate_Offline_Setup_v2.4.0.exe
+            Output\RealtimeTranslate_Offline_Setup_v2.6.0.exe
           generate_release_notes: true
