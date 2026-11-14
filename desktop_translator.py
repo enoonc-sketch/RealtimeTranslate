@@ -14,10 +14,14 @@
   8. 在线下载离线语言包：程序内直接取官方列表、勾选下载、自动安装（不必手动找文件）
   9. 指针取词：把鼠标放在文字上按 Ctrl+Alt+D，就在指针旁弹出小气泡显示译文（不打开主窗口）
  10. 托盘图标（Windows）：只用标准库 ctypes 调 Shell_NotifyIconW，
-     不依赖 pystray / Pillow；点 × 是隐藏到托盘，右键菜单可显示 / 截图 / 退出
+     不依赖 pystray / Pillow；点 × 是隐藏到托盘；右键菜单可显示 / 截图 /
+     翻译剪贴板，直接开关指针取词、悬停取词、监听剪贴板、置顶、开机自启，
+     高级设置（按 常规 / 翻译 / 取词 / 托盘 / 离线与网络 / 快捷键与关于 分类），
+     切换取词范围（单词 / 整行 / 整段），打开网络检查 / 离线语言包，或退出
  11. 悬停取词（Windows）：鼠标在文字上停住约 0.8 秒就自动取词——
-     先用系统 OCR（Windows.Media.Ocr，截图里认字）定位光标下的单词，
-     认不到且光标是「I」形时退回双击取词；图片、游戏、扫描 PDF 里也能用
+     先用系统 OCR（Windows.Media.Ocr，截图里认字）定位光标下的单词 / 整行 /
+     整段（看「范围」），认不到且光标是「I」形时退回双击 / 三击取词；
+     图片、游戏、扫描 PDF 里也能用；指针取词（Ctrl+Alt+D）同样支持整行 / 整段
  12. 截图翻译（Windows，Ctrl+Alt+S）：框选屏幕任意区域 → 系统 OCR
      认字 → 翻译。截图用 ctypes GDI BitBlt，OCR 用系统自带引擎，
      全程不装第三方库
@@ -64,8 +68,10 @@ POINTER_LABEL = "Ctrl+Alt+D"
 PYNPUT_POINTER = "<ctrl>+<alt>+d"
 SCREENSHOT_LABEL = "Ctrl+Alt+S"
 PYNPUT_SCREENSHOT = "<ctrl>+<alt>+s"
-SCOPE_NAMES = {"word": "单词", "paragraph": "整段"}
+SCOPE_NAMES = {"word": "单词", "line": "整行", "paragraph": "整段"}
 SCOPE_CODES = {v: k for k, v in SCOPE_NAMES.items()}
+CLOSE_NAMES = {"tray": "隐藏到托盘", "quit": "直接退出"}      # 点窗口 × 时
+CLOSE_CODES = {v: k for k, v in CLOSE_NAMES.items()}
 __version__ = "2.4.0"
 APP_TITLE = "实时翻译"
 MUTEX_NAME = "RealtimeTranslate_SingleInstance"   # 与 installer.iss 的 AppMutex 保持一致
@@ -153,6 +159,7 @@ DEFAULTS = {
     "engine": "Google", "auto_offline": True,
     "pointer": True, "pointer_scope": "word", "pack_mirror": "",
     "hover": True, "hover_ms": 800,
+    "close_action": "tray", "tray_tip": True,
 }
 
 
@@ -575,14 +582,53 @@ _TERMINAL_CLASSES = ("ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "min
 def pointer_plan(ibeam, terminal, scope):
     """指针取词该做哪些动作（纯逻辑，便于测试）。
 
-    click2 / click3 = 在指针处双击 / 三击（选中单词 / 整段）；copy = 发送 Ctrl+C。
+    click2 / click3 = 在指针处双击 / 三击（选中单词 / 整行或整段）；copy = 发送 Ctrl+C。
+    （整行 / 整段优先走截图 OCR，OCR 取不到才退回三击：三击选中的是一行还是一段，
+    取决于软件——记事本、代码编辑器是一行，浏览器、Word 是一段。）
     只有指针是「I」形文字光标时才会点击，所以不会误点按钮、链接。
     """
     if ibeam:
-        return ["click3" if scope == "paragraph" else "click2", "copy"]
+        return ["click3" if scope in ("line", "paragraph") else "click2", "copy"]
     if terminal:
         return []          # 终端里没有选区时 Ctrl+C 会中断正在运行的程序，绝不发送
     return ["copy"]        # 认不出光标形状（软件自绘光标）：只复制已有的选区
+
+
+def tray_menu_items(snap, is_win=True):
+    """托盘右键菜单（纯逻辑，便于测试）。snap 是主程序备好的状态快照 dict。"""
+    scope = snap.get("scope", "word")
+    items = [
+        {"id": "show", "label": "显示主窗口(&S)", "default": True},
+        {"id": "shot", "label": "截图翻译(&C)　Ctrl+Alt+S"},
+        {"id": "clip", "label": "翻译剪贴板内容(&V)"},
+        {"sep": True},
+        {"id": "pointer", "label": "指针取词　Ctrl+Alt+D", "checked": bool(snap.get("pointer"))},
+        {"id": "hover", "label": "悬停取词", "checked": bool(snap.get("hover"))},
+        {"label": "取词范围", "sub": [
+            {"id": "scope:%s" % k, "label": v, "checked": scope == k}
+            for k, v in SCOPE_NAMES.items()]},
+        {"sep": True},
+        {"id": "watch", "label": "监听剪贴板", "checked": bool(snap.get("watch"))},
+        {"id": "top", "label": "窗口置顶", "checked": bool(snap.get("top"))},
+        {"id": "auto_off", "label": "断网时自动用离线翻译", "checked": bool(snap.get("auto_off"))},
+    ]
+    if is_win:
+        items.append({"id": "autostart", "label": "开机自启", "checked": bool(snap.get("autostart"))})
+    items += [
+        {"sep": True},
+        {"id": "settings", "label": "高级设置…"},
+        {"id": "netcheck", "label": "网络检查…"},
+        {"id": "packs", "label": "离线语言包…"},
+        {"sep": True},
+        {"id": "quit", "label": "退出(&Q)"},
+    ]
+    return items
+
+
+def tray_tooltip(snap):
+    on = lambda k: "开" if snap.get(k) else "关"
+    return "%s｜指针取词:%s 悬停:%s 范围:%s" % (
+        APP_TITLE, on("pointer"), on("hover"), SCOPE_NAMES.get(snap.get("scope", "word"), "单词"))
 
 
 def cursor_is_ibeam_win():
@@ -877,6 +923,8 @@ class App:
         self.dl_busy = False
         self.dl_cancel = False
         self.tray = None
+        self._tray_snap = {}
+        self._tray_tip = ""
         self.hover_last = None
         self.hover_since = 0.0
         self.hover_fired = False
@@ -894,6 +942,7 @@ class App:
         self.root.report_callback_exception = self._on_tk_error
         self.bubble = Bubble(self)
         self._build_ui()
+        self._fit_min_width()
 
         self.last_clip = self._get_clip()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -904,7 +953,7 @@ class App:
         self._start_hotkey()
         self._start_tray()
         if "--minimized" in sys.argv:
-            self.hide_window()
+            self.hide_window(tip=False)
 
     @staticmethod
     def _load_cfg():
@@ -934,6 +983,9 @@ class App:
         except Exception:
             cfg["hover_ms"] = 800
         cfg["hover_ms"] = max(300, min(cfg["hover_ms"], 3000))
+        if cfg.get("close_action") not in CLOSE_NAMES:
+            cfg["close_action"] = "tray"
+        cfg["tray_tip"] = bool(cfg.get("tray_tip", True))
         if not isinstance(cfg.get("pack_mirror"), str):
             cfg["pack_mirror"] = ""
         if not re.match(r"^\d+x\d+([+-]-?\d+[+-]-?\d+)?$", str(cfg.get("geometry", ""))):
@@ -946,20 +998,102 @@ class App:
         log_crash(text)
         self.status.configure(text="发生内部错误，详见 %s" % CRASH_LOG)
 
-    def hide_window(self):
+    def hide_window(self, tip=True):
         # 有托盘时隐藏到托盘（withdraw，任务栏不留窗口，点托盘图标找回）；
         # 没托盘时才最小化——旧版 withdraw 后没有托盘图标，窗口就找不回来了。
         if getattr(self, "tray", None) is not None and self.tray.is_running():
             self.root.withdraw()
+            if tip and self.cfg.get("tray_tip", True) and not self.cfg.get("tray_tip_shown"):
+                # 第一次隐藏时弹一次气泡，告诉用户程序没退出、在哪找回
+                self.cfg["tray_tip_shown"] = True
+                try:
+                    self.tray.notify(APP_TITLE, "已隐藏到托盘。单击托盘图标显示窗口，右键可切换取词选项或退出。")
+                except Exception:
+                    pass                # 气泡只是提示，失败不能影响隐藏窗口
+                self._save()
         else:
             self.root.iconify()
 
     def _on_close(self):
-        # 点 ×：有托盘就隐藏到托盘（真正退出走托盘右键菜单 / 主界面「退出」按钮）
-        if getattr(self, "tray", None) is not None and self.tray.is_running():
+        # 点 ×：按「高级设置 → 常规」里的选择：直接退出，或有托盘就隐藏到托盘
+        # （真正退出走托盘右键菜单 / 主界面「退出」按钮）
+        if self.cfg.get("close_action", "tray") != "quit" \
+                and getattr(self, "tray", None) is not None and self.tray.is_running():
             self.hide_window()
         else:
             self.quit()
+
+    def _refresh_tray_state(self):
+        """把当前选项拍成快照给托盘菜单读（托盘线程不能碰 Tk），并更新托盘提示文字。"""
+        try:
+            self._tray_snap = {
+                "top": self.top_var.get(), "watch": self.watch_var.get(),
+                "pointer": self.pointer_var.get(), "hover": self.hover_var.get(),
+                "scope": SCOPE_CODES.get(self.scope_cb.get(), "word"),
+                "auto_off": self.auto_off_var.get(),
+                "autostart": self.auto_var.get() if hasattr(self, "auto_var") else False,
+            }
+            tray = getattr(self, "tray", None)
+            if tray is not None and tray.is_running():
+                tip = tray_tooltip(self._tray_snap)
+                if tip != self._tray_tip:
+                    self._tray_tip = tip
+                    tray.set_tooltip(tip)
+        except Exception:
+            pass
+
+    def _on_tray_cmd(self, cid):
+        """托盘菜单命令（在 Tk 线程里执行，走和主窗口选项完全相同的处理函数）。"""
+        toggles = {"top": ("top_var", "_on_top"), "watch": ("watch_var", "_on_watch"),
+                   "pointer": ("pointer_var", "_on_pointer_opt"),
+                   "hover": ("hover_var", "_on_pointer_opt"),
+                   "auto_off": ("auto_off_var", "_on_auto_offline"),
+                   "autostart": ("auto_var", "_on_autostart")}
+        if cid in toggles:
+            var, handler = toggles[cid]
+            v = getattr(self, var, None)
+            if v is None:
+                return
+            v.set(not v.get())
+            getattr(self, handler)()
+        elif isinstance(cid, str) and cid.startswith("scope:"):
+            code = cid.split(":", 1)[1]
+            if code in SCOPE_NAMES:
+                self.scope_cb.set(SCOPE_NAMES[code])
+                self._on_pointer_opt()
+        elif cid == "clip":
+            self.show_window()
+            text = self._get_clip().strip()
+            if text:
+                self._set_src(text[:MAX_LEN])
+                self.translate_now()
+            else:
+                self.status.configure(text="剪贴板里没有文字")
+        elif cid == "settings":
+            self.show_window()
+            self.open_settings()
+        elif cid == "netcheck":
+            self.show_window()
+            self.open_netcheck()
+        elif cid == "packs":
+            self.show_window()
+            self._show_offline_packs()
+        self._refresh_tray_state()
+
+    def _fit_min_width(self):
+        # 选项 / 按钮行是横向排的，写死的 minsize(520) 比内容窄，窗口一缩小
+        # 右边的复选框、「范围」下拉、「退出」按钮就被裁掉。这里按各行实际
+        # 需要的宽度（随字体 / DPI 变化）算最小宽度，并把过窄的已存宽度撑开。
+        try:
+            self.root.update_idletasks()
+            need = max(w.winfo_reqwidth() for w in self._fit_rows) + 2 * 12 + 4
+            min_w = max(520, need)
+            self.root.minsize(min_w, 420)
+            m = re.match(r"^(\d+)x(\d+)(.*)$", str(self.root.geometry()))
+            if m and int(m.group(1)) < min_w:
+                self.root.geometry("%dx%d%s" % (min_w, int(m.group(2)), m.group(3)))
+        except Exception:
+            pass
 
     def _start_tray(self):
         # 托盘只在 Windows 上有；失败（比如被安全软件拦了）也不影响主程序，
@@ -971,9 +1105,14 @@ class App:
                 icon_path=resource_path("app.ico"), tooltip=APP_TITLE,
                 on_show=lambda: self.q.put(("tray_show",)),
                 on_screenshot=lambda: self.q.put(("tray_shot",)),
-                on_quit=lambda: self.q.put(("tray_quit",)))
+                on_quit=lambda: self.q.put(("tray_quit",)),
+                # 菜单在托盘线程里弹出：只读快照，点击后把命令放进队列，由 Tk 线程执行
+                menu_provider=lambda: tray_menu_items(self._tray_snap, IS_WIN),
+                on_command=lambda cid: self.q.put(("tray_cmd", cid)))
             if not self.tray.start():
                 self.tray = None
+            else:
+                self._refresh_tray_state()
         except Exception:
             self.tray = None
 
@@ -1071,15 +1210,24 @@ class App:
         ttk.Button(btns, text="截图翻译", command=self.start_screenshot).pack(side="left", padx=6)
         ttk.Button(btns, text="退出", command=self.quit).pack(side="right")
 
-        # —— 选项区（两行，更整齐） ——
+        # —— 选项区：常用开关留在主窗口，其余按用途归类放进「高级设置」 ——
         self.top_var = tk.BooleanVar(value=self.cfg["top"])
         self.watch_var = tk.BooleanVar(value=self.cfg["watch"])
         self.smart_var = tk.BooleanVar(value=self.cfg["smart"])
         self.bi_var = tk.BooleanVar(value=self.cfg["bilingual"])
         self.reflow_var = tk.BooleanVar(value=self.cfg["reflow"])
         self.show_src_var = tk.BooleanVar(value=self.cfg["show_src"])
+        if IS_WIN:
+            self.auto_var = tk.BooleanVar(value=autostart_enabled())
+        global AUTO_OFFLINE
+        AUTO_OFFLINE = bool(self.cfg.get("auto_offline", True))
+        self.auto_off_var = tk.BooleanVar(value=AUTO_OFFLINE)
+        self.pointer_var = tk.BooleanVar(value=bool(self.cfg.get("pointer", True)))
+        self.hover_var = tk.BooleanVar(value=bool(self.cfg.get("hover", True)))
+        self.hover_ms_var = tk.IntVar(value=int(self.cfg.get("hover_ms", 800)))
+        self.tray_tip_var = tk.BooleanVar(value=bool(self.cfg.get("tray_tip", True)))
 
-        opts = ttk.LabelFrame(root, text="选项", padding=(8, 4))
+        opts = ttk.LabelFrame(root, text="常用", padding=(8, 4))
         opts.pack(fill="x", padx=12, pady=(8, 0))
 
         o1 = ttk.Frame(opts)
@@ -1087,40 +1235,20 @@ class App:
         ttk.Checkbutton(o1, text="窗口置顶", variable=self.top_var, command=self._on_top).pack(side="left")
         ttk.Checkbutton(o1, text="监听剪贴板", variable=self.watch_var, command=self._on_watch).pack(side="left", padx=10)
         ttk.Checkbutton(o1, text="中英智能互译", variable=self.smart_var, command=self._retranslate).pack(side="left")
-        ttk.Checkbutton(o1, text="显示原文", variable=self.show_src_var, command=self._on_show_src).pack(side="left", padx=10)
+        ttk.Checkbutton(o1, text="双语对照", variable=self.bi_var, command=self._on_bilingual).pack(side="left", padx=10)
+        ttk.Checkbutton(o1, text="显示原文", variable=self.show_src_var, command=self._on_show_src).pack(side="left")
 
         o2 = ttk.Frame(opts)
         o2.pack(fill="x", pady=(2, 0))
-        ttk.Checkbutton(o2, text="双语对照", variable=self.bi_var, command=self._on_bilingual).pack(side="left")
-        ttk.Checkbutton(o2, text="合并断行（粘贴 PDF / 文档时用）", variable=self.reflow_var,
-                        command=self._retranslate).pack(side="left", padx=10)
-
-        if IS_WIN:
-            self.auto_var = tk.BooleanVar(value=autostart_enabled())
-            ttk.Checkbutton(o2, text="开机自启（最小化）", variable=self.auto_var,
-                            command=self._on_autostart).pack(side="left")
-
-        global AUTO_OFFLINE
-        AUTO_OFFLINE = bool(self.cfg.get("auto_offline", True))
-        self.auto_off_var = tk.BooleanVar(value=AUTO_OFFLINE)
-        o3 = ttk.Frame(opts)
-        o3.pack(fill="x", pady=(2, 0))
-        ttk.Checkbutton(o3, text="断网 / 在线引擎不可用时，自动改用离线翻译", variable=self.auto_off_var,
-                        command=self._on_auto_offline).pack(side="left")
-
-        self.pointer_var = tk.BooleanVar(value=bool(self.cfg.get("pointer", True)))
-        self.hover_var = tk.BooleanVar(value=bool(self.cfg.get("hover", True)))
-        o4 = ttk.Frame(opts)
-        o4.pack(fill="x", pady=(2, 0))
-        ttk.Checkbutton(o4, text="指针取词（%s）" % POINTER_LABEL, variable=self.pointer_var,
+        ttk.Checkbutton(o2, text="指针取词", variable=self.pointer_var,
                         command=self._on_pointer_opt).pack(side="left")
-        ttk.Checkbutton(o4, text="悬停取词（鼠标停住自动取词）", variable=self.hover_var,
-                        command=self._on_pointer_opt).pack(side="left", padx=(10, 0))
-        ttk.Label(o4, text="范围").pack(side="left", padx=(10, 4))
-        self.scope_cb = ttk.Combobox(o4, values=list(SCOPE_NAMES.values()), state="readonly", width=6)
-        self.scope_cb.set(SCOPE_NAMES[self.cfg.get("pointer_scope", "word")])
-        self.scope_cb.pack(side="left")
-        self.scope_cb.bind("<<ComboboxSelected>>", lambda e: self._on_pointer_opt())
+        ttk.Checkbutton(o2, text="悬停取词", variable=self.hover_var,
+                        command=self._on_pointer_opt).pack(side="left", padx=10)
+        ttk.Button(o2, text="高级设置…", command=self.open_settings).pack(side="right")
+
+        self._build_settings_win()
+
+        self._fit_rows = (top, eng_frame, btns, opts)
 
         self.hint = ttk.Label(root, text="", foreground="#5b6676", wraplength=560)
         self.hint.pack(anchor="w", fill="x", padx=12, pady=(6, 10))
@@ -1131,6 +1259,173 @@ class App:
             self.paned.forget(self.f1)
         else:
             self.src.focus_set()
+
+    # ------------------------------------------------ 高级设置（按用途分类）
+    def _build_settings_win(self):
+        """高级设置窗口：创建后先隐藏，控件一直存在（托盘 / 快捷键随时可读写选项）。
+
+        分类：常规 / 翻译 / 取词 / 托盘 / 离线与网络 / 关于。
+        和主窗口共用同一批变量，两边的勾选永远同步。
+        """
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.title("高级设置")
+        win.geometry("600x440")
+        win.minsize(560, 400)
+        win.protocol("WM_DELETE_WINDOW", self.close_settings)
+        win.bind("<Escape>", lambda e: self.close_settings())
+        try:
+            if IS_WIN:
+                win.iconbitmap(resource_path("app.ico"))
+        except Exception:
+            pass
+        self.settings_win = win
+
+        nb = ttk.Notebook(win)
+        nb.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        self.settings_nb = nb
+        self.settings_tabs = {}
+
+        def tab(key, title):
+            f = ttk.Frame(nb, padding=14)
+            nb.add(f, text=title)
+            self.settings_tabs[key] = f
+            return f
+
+        def check(parent, text, var, cmd, note=None):
+            ttk.Checkbutton(parent, text=text, variable=var, command=cmd).pack(anchor="w", pady=(6, 0))
+            if note:
+                ttk.Label(parent, text=note, foreground="#5b6676", wraplength=500,
+                          justify="left").pack(anchor="w", padx=(26, 0))
+
+        # 常规
+        f = tab("general", "常规")
+        check(f, "窗口置顶", self.top_var, self._on_top, "翻译窗口始终显示在其他窗口上面。")
+        if IS_WIN:
+            check(f, "开机自启（最小化到托盘）", self.auto_var, self._on_autostart,
+                  "登录 Windows 后自动运行，并直接收进托盘，不打扰你。")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(14, 0))
+        ttk.Label(row, text="点窗口右上角 ×：").pack(side="left")
+        self.close_cb = ttk.Combobox(row, values=list(CLOSE_NAMES.values()), state="readonly", width=10)
+        self.close_cb.set(CLOSE_NAMES.get(self.cfg.get("close_action", "tray"), "隐藏到托盘"))
+        self.close_cb.pack(side="left")
+        self.close_cb.bind("<<ComboboxSelected>>", lambda e: self._save())
+        ttk.Label(f, text="选「隐藏到托盘」时程序继续在后台运行，快捷键和取词照常可用；"
+                          "没有托盘图标（被安全软件拦截）时会改为最小化。",
+                  foreground="#5b6676", wraplength=500, justify="left").pack(anchor="w", padx=(0, 0), pady=(2, 0))
+
+        # 翻译
+        f = tab("translate", "翻译")
+        check(f, "中英智能互译", self.smart_var, self._retranslate,
+              "检测到中文就译成英文，检测到其他语言译成中文。")
+        check(f, "双语对照", self.bi_var, self._on_bilingual, "译文按句与原文逐句对照显示。")
+        check(f, "显示原文", self.show_src_var, self._on_show_src, "主窗口里显示 / 隐藏上方的原文输入框。")
+        check(f, "合并断行（粘贴 PDF / 文档时用）", self.reflow_var, self._retranslate,
+              "把 PDF、网页里被硬换行切断的句子接起来再翻译，翻得更通顺。")
+        check(f, "断网 / 在线引擎不可用时，自动改用离线翻译", self.auto_off_var, self._on_auto_offline,
+              "需要先装好对应的离线语言包（见「离线与网络」）。")
+
+        # 取词
+        f = tab("grab", "取词")
+        check(f, "监听剪贴板", self.watch_var, self._on_watch, "复制文字后自动翻译并显示主窗口。")
+        check(f, "指针取词（%s）" % POINTER_LABEL, self.pointer_var, self._on_pointer_opt,
+              "把鼠标放在文字上按快捷键，在指针旁弹出气泡显示译文。")
+        check(f, "悬停取词（鼠标停住自动取词）", self.hover_var, self._on_pointer_opt,
+              "鼠标在文字上停住后自动取词；在本程序窗口里不会触发。")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(14, 0))
+        ttk.Label(row, text="取词范围：").pack(side="left")
+        self.scope_cb = ttk.Combobox(row, values=list(SCOPE_NAMES.values()), state="readonly", width=8)
+        self.scope_cb.set(SCOPE_NAMES[self.cfg.get("pointer_scope", "word")])
+        self.scope_cb.pack(side="left")
+        self.scope_cb.bind("<<ComboboxSelected>>", lambda e: self._on_pointer_opt())
+        ttk.Label(row, text="（悬停取词和指针取词共用）", foreground="#5b6676").pack(side="left", padx=6)
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(10, 0))
+        ttk.Label(row, text="悬停等待：").pack(side="left")
+        sp = ttk.Spinbox(row, from_=300, to=3000, increment=100, width=7,
+                         textvariable=self.hover_ms_var, command=self._on_hover_ms)
+        sp.pack(side="left")
+        sp.bind("<Return>", lambda e: self._on_hover_ms())
+        sp.bind("<FocusOut>", lambda e: self._on_hover_ms())
+        ttk.Label(row, text="毫秒（300 ~ 3000，鼠标停住多久后自动取词）", foreground="#5b6676").pack(side="left", padx=6)
+
+        # 托盘
+        f = tab("tray", "托盘")
+        check(f, "第一次隐藏到托盘时提示一次", self.tray_tip_var, self._save,
+              "只在第一次弹出气泡，告诉你程序没退出、去哪里找回。")
+        ttk.Label(f, text="托盘图标右键菜单：", font=self.ui_font).pack(anchor="w", pady=(16, 2))
+        ttk.Label(f, text="显示主窗口 / 截图翻译 / 翻译剪贴板内容\n"
+                          "指针取词、悬停取词、取词范围（可直接开关、切换）\n"
+                          "监听剪贴板、窗口置顶、断网自动离线、开机自启\n"
+                          "高级设置 / 网络检查 / 离线语言包 / 退出",
+                  foreground="#5b6676", justify="left").pack(anchor="w", padx=(12, 0))
+        ttk.Label(f, text="单击托盘图标显示主窗口。", foreground="#5b6676").pack(anchor="w", pady=(8, 0))
+
+        # 离线与网络
+        f = tab("offline", "离线与网络")
+        ttk.Label(f, text="离线语言包让你在没有网络时也能翻译；网络检查帮你判断是哪个翻译引擎连不上。",
+                  foreground="#5b6676", wraplength=500, justify="left").pack(anchor="w")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(14, 0))
+        ttk.Button(row, text="网络检查", command=self.open_netcheck).pack(side="left")
+        ttk.Button(row, text="离线语言包…", command=self._show_offline_packs).pack(side="left", padx=8)
+        ttk.Label(f, text="「断网时自动改用离线翻译」的开关在「翻译」页。",
+                  foreground="#5b6676").pack(anchor="w", pady=(10, 0))
+
+        # 关于
+        f = tab("about", "快捷键与关于")
+        ttk.Label(f, text="%s v%s" % (APP_TITLE, __version__), font=self.ui_font).pack(anchor="w")
+        ttk.Label(f, text="%s　翻译选中的文字\n%s　指针取词（指针处的单词 / 整行 / 整段）\n"
+                          "Ctrl+Alt+S　截图翻译（框选屏幕任意区域）\nEsc　隐藏窗口 / 关闭气泡"
+                          % (HOTKEY_LABEL, POINTER_LABEL),
+                  justify="left").pack(anchor="w", pady=(10, 0))
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(bar, text="恢复默认设置", command=self._reset_settings).pack(side="left")
+        ttk.Button(bar, text="关闭", command=self.close_settings).pack(side="right")
+
+    def open_settings(self, tab=None):
+        win = self.settings_win
+        if tab in self.settings_tabs:
+            self.settings_nb.select(self.settings_tabs[tab])
+        win.deiconify()
+        win.lift()
+        win.attributes("-topmost", True)
+        if not self.top_var.get():
+            win.after(300, lambda: win.attributes("-topmost", False))
+        win.focus_force()
+
+    def close_settings(self):
+        self.settings_win.withdraw()
+
+    def _on_hover_ms(self):
+        try:
+            v = int(self.hover_ms_var.get())
+        except Exception:
+            v = self.cfg.get("hover_ms", 800)
+        v = max(300, min(v, 3000))
+        self.hover_ms_var.set(v)
+        self.cfg["hover_ms"] = v
+        self.hover_fired = False
+        self._save()
+
+    def _reset_settings(self):
+        if not messagebox.askyesno("恢复默认设置", "把高级设置里的选项恢复成默认值？\n（不影响开机自启、翻译引擎和语言）",
+                                   parent=self.settings_win):
+            return
+        d = DEFAULTS
+        self.top_var.set(d["top"]); self.watch_var.set(d["watch"]); self.smart_var.set(d["smart"])
+        self.bi_var.set(d["bilingual"]); self.reflow_var.set(d["reflow"]); self.show_src_var.set(d["show_src"])
+        self.auto_off_var.set(d["auto_offline"]); self.pointer_var.set(d["pointer"]); self.hover_var.set(d["hover"])
+        self.scope_cb.set(SCOPE_NAMES[d["pointer_scope"]])
+        self.hover_ms_var.set(d["hover_ms"]); self.cfg["hover_ms"] = d["hover_ms"]
+        self.close_cb.set(CLOSE_NAMES[d["close_action"]]); self.tray_tip_var.set(d["tray_tip"])
+        self._on_top(); self._on_auto_offline(); self._on_pointer_opt()
+        self._on_show_src(); self._on_bilingual()
+        self._retranslate()                       # 里面会 _save()
 
     def _update_engine_hint(self):
         eng = self.engine.get()
@@ -1731,6 +2026,15 @@ class App:
                     return
         except Exception:
             pass
+        try:
+            sw = self.settings_win
+            if sw.winfo_viewable():
+                sx, sy = sw.winfo_rootx(), sw.winfo_rooty()
+                if sx <= pos[0] <= sx + sw.winfo_width() and sy <= pos[1] <= sy + sw.winfo_height():
+                    self.hover_last = None
+                    return
+        except Exception:
+            pass
         now = time.time()
         if pos != self.hover_last:
             self.hover_last, self.hover_since, self.hover_fired = pos, now, False
@@ -1745,29 +2049,46 @@ class App:
     def _on_hover(self, pos):
         self.grab_mode = "hover"
         self.grab_xy = pos
-        threading.Thread(target=self._hover_worker, args=(pos,), daemon=True).start()
+        scope = SCOPE_CODES.get(self.scope_cb.get(), "word")     # 在 Tk 线程里读，别在 worker 里碰 Tk
+        threading.Thread(target=self._hover_worker, args=(pos, scope), daemon=True).start()
 
-    def _hover_worker(self, pos):
-        # 先走截图 OCR：截光标周围一小块，认出离光标最近的单词。
-        # 这条路不依赖软件本身是否支持选词，图片 / 游戏 / 扫描 PDF 里也能用。
+    # 各范围截光标周围多大一块去 OCR：单词一小块就够，整行要横向更宽，整段要纵向更高
+    _OCR_BOX = {"word": (420, 110), "line": (900, 90), "paragraph": (900, 560)}
+
+    def _ocr_pick(self, pos, scope):
+        """截光标周围一块屏幕，用系统 OCR 取光标处的单词 / 整行 / 整段；取不到返回 None。
+
+        在工作线程里调用（不碰 Tk；屏幕尺寸只在 screen_bounds 取不到时才问 Tk）。
+        """
+        if not ocr_win.ocr_available():
+            return None
+        bounds = screen_bounds()
+        if bounds is None:
+            bounds = (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        bw, bh = self._OCR_BOX.get(scope, self._OCR_BOX["word"])
+        x, y, w, h = screen_win.clamp_region(pos[0] - bw // 2, pos[1] - bh // 2, bw, bh, bounds)
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = os.path.join(DATA_DIR, "hover.bmp")
+        screen_win.capture_file(tmp, x, y, w, h)
+        try:
+            rx, ry = pos[0] - x, pos[1] - y
+            if scope in ("line", "paragraph"):
+                lines = ocr_win.ocr_lines(tmp, lang=self._ocr_lang())
+                return ocr_win.pick_text_at(lines, rx, ry, scope)
+            words = ocr_win.ocr_words(tmp, lang=self._ocr_lang())
+            return ocr_win.pick_word_at(words, rx, ry)
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+    def _hover_worker(self, pos, scope="word"):
+        # 先走截图 OCR：认出光标处的单词 / 整行 / 整段。这条路不依赖软件本身
+        # 是否支持选词，图片 / 游戏 / 扫描 PDF 里也能用。
         word, ibeam = None, False
         try:
-            if ocr_win.ocr_available():
-                bounds = screen_bounds()
-                if bounds is None:
-                    bounds = (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
-                x, y, w, h = screen_win.clamp_region(pos[0] - 210, pos[1] - 55, 420, 110, bounds)
-                os.makedirs(DATA_DIR, exist_ok=True)
-                tmp = os.path.join(DATA_DIR, "hover.bmp")
-                screen_win.capture_file(tmp, x, y, w, h)
-                try:
-                    words = ocr_win.ocr_words(tmp, lang=self._ocr_lang())
-                    word = ocr_win.pick_word_at(words, pos[0] - x, pos[1] - y)
-                finally:
-                    try:
-                        os.remove(tmp)
-                    except Exception:
-                        pass
+            word = self._ocr_pick(pos, scope)
         except Exception:
             word = None
         if not word:
@@ -1999,7 +2320,9 @@ class App:
             geometry=self.root.geometry(), engine=self.engine.get(),
             auto_offline=AUTO_OFFLINE, pointer=self.pointer_var.get(),
             hover=self.hover_var.get(), hover_ms=self.cfg.get("hover_ms", 800),
-            pointer_scope=SCOPE_CODES.get(self.scope_cb.get(), "word"))
+            pointer_scope=SCOPE_CODES.get(self.scope_cb.get(), "word"),
+            close_action=CLOSE_CODES.get(self.close_cb.get(), "tray"),
+            tray_tip=self.tray_tip_var.get())
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
             tmp = CONFIG_PATH + ".tmp"
@@ -2009,6 +2332,7 @@ class App:
         except Exception:
             pass
         self._update_engine_hint()
+        self._refresh_tray_state()
 
     def _retranslate(self):
         self._save()
@@ -2025,6 +2349,7 @@ class App:
         except Exception as e:
             self.auto_var.set(autostart_enabled())
             messagebox.showerror("开机自启", "设置失败：%s" % e)
+        self._refresh_tray_state()
 
     def _on_top(self):
         self.root.attributes("-topmost", self.top_var.get())
@@ -2248,8 +2573,19 @@ class App:
 
     def _pointer_grab_win(self):
         """指针取词（Windows）：光标是「I」形才在指针处双击 / 三击选词，再 Ctrl+C。"""
+        self._pointer_text = None
         if not wait_keys_up_win((0x10, 0x11, 0x12, 0x44)):
             return                                    # 快捷键没松开，宁可不取也不乱点
+        no_ocr, self._no_ocr = getattr(self, "_no_ocr", False), False
+        if self.grab_scope in ("line", "paragraph") and not no_ocr:
+            # 整行 / 整段：先用截图 OCR 取，不依赖软件支持选词、也不会点击任何东西；
+            # OCR 没取到才退回三击选中。
+            try:
+                self._pointer_text = self._ocr_pick(self.grab_xy, self.grab_scope)
+            except Exception:
+                self._pointer_text = None
+            if self._pointer_text:
+                return
         self.grab_plan = pointer_plan(cursor_is_ibeam_win(), foreground_is_terminal_win(), self.grab_scope)
         for act in self.grab_plan:
             if act.startswith("click"):
@@ -2288,6 +2624,8 @@ class App:
 
     def _on_copied(self):
         text = self._get_clip()
+        if self.grab_mode == "pointer" and getattr(self, "_pointer_text", None):
+            text, self._pointer_text = self._pointer_text, None      # OCR 取到的整行 / 整段
         self._set_clip(self.old_clip)
         self.last_clip = self.old_clip
         self.grabbing = False
@@ -2351,6 +2689,8 @@ class App:
                     self.start_screenshot()
                 elif kind == "tray_quit":
                     self.quit()
+                elif kind == "tray_cmd":
+                    self._on_tray_cmd(msg[1])
                 elif kind == "shot_ocr":
                     self._on_shot_ocr(msg[1], msg[2], msg[3])
                 elif kind == "hover_ocr":
@@ -2363,6 +2703,7 @@ class App:
                         self.grab_xy = xy
                         self.grab_scope = SCOPE_CODES.get(self.scope_cb.get(), "word")
                         self.grab_plan = []
+                        self._no_ocr = True         # 刚 OCR 过没取到，别再 OCR 一遍
                         self.grabbing = True
                         self.old_clip = self._get_clip()
                         self.root.clipboard_clear()
