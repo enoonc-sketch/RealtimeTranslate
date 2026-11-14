@@ -1,10 +1,20 @@
 name: build-exe
+# 在 GitHub 云端的 Windows 机器上打包实时翻译 v2.4：不需要自己电脑装 Python。
+# 用法：Actions → build-exe → Run workflow，跑完在页面底部 Artifacts 里下载。
+# 两个构建：
+#   标准版：RealtimeTranslate.exe（免安装，约 13 MB）+ RealtimeTranslate_Setup_v2.4.0.exe（安装包）
+#   离线版：构建时在本地下载语言包（offline_models.txt 默认中↔英两对，约 100~240 MB）
+#     打进安装包 RealtimeTranslate_Offline_Setup_v2.4.0.exe 和免安装文件夹
+#     RealtimeTranslateOffline，装完/解压完直接能离线用，不用再在程序里下载。
+# 推 v* 标签时自动跑，并把安装包挂到对应 Release 上。
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+
 permissions:
   contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -50,10 +60,13 @@ jobs:
             RealtimeTranslate.exe
             Output\RealtimeTranslate_Setup_v2.4.0.exe
           generate_release_notes: true
+
   build-offline:
     needs: build
     runs-on: windows-latest
     timeout-minutes: 60
+    env:
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -68,7 +81,9 @@ jobs:
         shell: pwsh
         run: |
           python prepare_offline_models.py
-          if ($LASTEXITCODE -eq 2) { throw "no language packs available, cannot build offline version" }
+          $code = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          if ($code -eq 2) { throw "no language packs available, cannot build offline version" }
       - name: Build offline exe
         env:
           PYTHONUTF8: "1"
