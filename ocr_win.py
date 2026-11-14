@@ -61,7 +61,10 @@ def _run_ps(image_path, lang=None, want_json=False, timeout=60):
     if want_json:
         cmd += ["-Json"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        kwargs = {}
+        if IS_WIN:
+            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW：不弹黑窗
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout, **kwargs)
     except subprocess.TimeoutExpired:
         raise OcrError("OCR 超时（%d 秒），图片可能太大或 OCR 卡住了" % timeout)
     except Exception as e:
