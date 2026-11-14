@@ -10,6 +10,21 @@ ICON = os.path.join(HERE, 'app.ico')
 VERSION = os.path.join(HERE, 'version_info.txt')
 MODELS = os.path.join(HERE, 'offline_models')
 
+# sentencepiece 的 Windows 轮子用 delvewheel 把 msvcp140/vcomp140 放在
+# site-packages/sentencepiece.libs/ 里（文件名带 hash），PyInstaller 不会自动收；
+# 不收的话 _sentencepiece.pyd 加载时报 "DLL load failed"。
+# 把这两个 DLL 收到打包根目录（onedir 的 exe 目录在 DLL 搜索路径上）。
+sp_dlls = []
+try:
+    import sentencepiece
+    _sp_dir = os.path.dirname(sentencepiece.__file__)
+    _libs = os.path.join(os.path.dirname(_sp_dir), 'sentencepiece.libs')
+    if os.path.isdir(_libs):
+        sp_dlls = [(os.path.join(_libs, f), '.')
+                   for f in sorted(os.listdir(_libs)) if f.lower().endswith('.dll')]
+except Exception:
+    sp_dlls = []
+
 # 语言包：每个含 metadata.json 的子目录原样带入（跳过 _downloads 等下划线目录）
 model_datas = []
 if os.path.isdir(MODELS):
@@ -23,7 +38,7 @@ if not model_datas:
 a = Analysis(
     ['desktop_translator.py'],
     pathex=[HERE],
-    binaries=collect_dynamic_libs('ctranslate2'),
+    binaries=collect_dynamic_libs('ctranslate2') + collect_dynamic_libs('sentencepiece') + sp_dlls,
     datas=model_datas + ([(ICON, '.')] if os.path.exists(ICON) else []) + ([('winocr.ps1', '.')] if os.path.exists('winocr.ps1') else []),
     hiddenimports=['pack_downloader', 'runtime_installer', 'tray_win32', 'screen_win', 'ocr_win', 'ctypes.wintypes', 'ctranslate2', 'sentencepiece', 'numpy'],
     hookspath=[],
