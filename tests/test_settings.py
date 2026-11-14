@@ -41,8 +41,8 @@ ok("settings window exists, hidden at start", not sw.winfo_viewable())
 
 # 分类页
 tabs = [app.settings_nb.tab(i, "text") for i in range(app.settings_nb.index("end"))]
-ok("tabs: 常规/翻译/取词/托盘/离线与网络/快捷键与关于",
-   tabs == ["常规", "翻译", "取词", "托盘", "离线与网络", "快捷键与关于"])
+ok("tabs: 常规/翻译/取词/历史/托盘/离线与网络/快捷键与关于",
+   tabs == ["常规", "翻译", "取词", "历史", "托盘", "离线与网络", "快捷键与关于"])
 ok("取词 tab holds scope + hover wait", any(w is app.scope_cb for w in walk(app.settings_tabs["grab"])))
 ok("翻译 tab has 合并断行", any("合并断行" in t for t in texts(app.settings_tabs["translate"])))
 ok("离线与网络 tab has 网络检查 / 离线语言包…",

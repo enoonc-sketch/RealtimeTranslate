@@ -100,13 +100,29 @@ app.grabbing = True
 app._pointer_grab_win()
 ok("pointer line: OCR miss falls back to triple-click + copy", shown == [("CLICK", 3), ("COPY",)])
 
-# 单词范围不走 OCR（仍是双击）
+# 单词范围：I 形光标双击取到字（剪贴板变了）→ 不走 OCR
+seq = [0]
+dt.clip_seq_win = lambda: seq[0]
+dt.send_copy_win = lambda: (shown.append(("COPY",)), seq.__setitem__(0, seq[0] + 1))
 shown.clear()
 calls.clear()
+app._seq0 = 0
 app._ocr_pick = lambda pos, scope: (calls.append(scope), "x")[1]
 app.grab_scope = "word"
 app._pointer_grab_win()
-ok("pointer word: still double-click, no OCR", shown == [("CLICK", 2), ("COPY",)] and calls == [])
+ok("pointer word: still double-click, no OCR when copy worked", shown == [("CLICK", 2), ("COPY",)] and calls == [])
+
+# 按钮 / 菜单这类选不中的文字：光标不是 I 形，复制不到 → 改用 OCR 取单词（指针取词能取应用按钮词）
+shown.clear()
+calls.clear()
+seq[0] = 0
+app._seq0 = 0
+dt.send_copy_win = lambda: shown.append(("COPY",))          # 复制不到：剪贴板序号不变
+dt.cursor_is_ibeam_win = lambda: False
+app._pointer_text = None
+app._pointer_grab_win()
+ok("pointer word on a button: no click, OCR fallback gets the word",
+   ("CLICK", 2) not in shown and calls == ["word"] and app._pointer_text == "x")
 
 app.root.destroy()
 print("ALL OK" if all(res) else "FAILED")

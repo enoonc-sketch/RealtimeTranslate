@@ -177,7 +177,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[(ICON, '.')] + ([('winocr.ps1', '.')] if os.path.exists('winocr.ps1') else []),
-    hiddenimports=['pack_downloader', 'runtime_installer', 'tray_win32', 'screen_win', 'ocr_win', 'ctypes.wintypes'] + RUNTIME_STDLIB,       # 其余导入 PyInstaller 能自动分析到
+    hiddenimports=['pack_downloader', 'runtime_installer', 'tray_win32', 'screen_win', 'ocr_win', 'history_store', 'tts_win', 'doc_translate', 'stt_win', 'sqlite3', 'ctypes.wintypes'] + RUNTIME_STDLIB,       # 其余导入 PyInstaller 能自动分析到
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -188,7 +188,7 @@ a = Analysis(
         'matplotlib', 'numpy', 'pandas', 'PIL', 'cv2', 'torch', 'tensorflow', 'scipy',
         # 用不到的标准库与打包工具，缩小体积
         'pytest', 'unittest', 'doctest', 'pydoc', 'test', 'lib2to3', 'distutils',
-        'setuptools', 'pkg_resources', 'pip', 'wheel', 'xmlrpc', 'sqlite3',
+        'setuptools', 'pkg_resources', 'pip', 'wheel', 'xmlrpc',
         'tkinter.test', 'idlelib', 'turtle', 'turtledemo',
     ],
     noarchive=False,

@@ -242,3 +242,27 @@ def pick_text_at(lines, px, py, scope):
     if scope == "line":
         return lines[i]["text"] or None
     return join_lines([lines[k]["text"] for k in paragraph_indices(lines, i)]) or None
+
+
+def group_paragraphs(lines):
+    """把一页 OCR 行分成若干段（每段是行下标列表），按从上到下、从左到右排序。
+
+    截图翻译「盖在截图上」时按段翻译：整段一起翻上下文更完整，译文也盖在整段的框里。
+    """
+    seen, groups = set(), []
+    for i in sorted(range(len(lines)), key=lambda k: (lines[k]["y"], lines[k]["x"])):
+        if i in seen:
+            continue
+        idxs = paragraph_indices(lines, i)
+        seen.update(idxs)
+        groups.append(idxs)
+    return groups
+
+
+def paragraph_box(lines, idxs):
+    """一段所有行的外框 (x, y, w, h)。"""
+    x0 = min(lines[k]["x"] for k in idxs)
+    y0 = min(lines[k]["y"] for k in idxs)
+    x1 = max(lines[k]["x"] + lines[k]["w"] for k in idxs)
+    y1 = max(lines[k]["y"] + lines[k]["h"] for k in idxs)
+    return x0, y0, x1 - x0, y1 - y0

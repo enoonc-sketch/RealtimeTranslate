@@ -22,7 +22,7 @@ def ok(name, cond):
 
 
 # 1. 源码里没有任何 pystray / PIL / Pillow 导入（注释里提一下名字不算）
-for mod in ("tray_win32.py", "screen_win.py", "ocr_win.py", "desktop_translator.py"):
+for mod in ("tray_win32.py", "screen_win.py", "ocr_win.py", "history_store.py", "desktop_translator.py"):
     tree = ast.parse(open(os.path.join(BASE, mod), encoding="utf-8").read())
     imports = set()
     for node in ast.walk(tree):

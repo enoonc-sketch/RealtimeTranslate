@@ -101,8 +101,8 @@ ok("bubble appears loading", pump(0.1, lambda: app.bubble.alive()) )
 ok("bubble shows translation", pump(3, lambda: app.bubble.body.cget("text").startswith("译:")))
 ok("bubble head has route", "英语" in app.bubble.head.cget("text") and "→" in app.bubble.head.cget("text"))
 ok("bubble below-right of pointer", app.bubble.win.winfo_x() == 314 and app.bubble.win.winfo_y() == 322)
-# 点击复制
-app.bubble._click(); pump(0.1)
+# 点击复制（点一下先复制，250ms 后关：等双击，双击到就改朗读）
+app.bubble._click(); pump(0.5)
 ok("click copies & closes", r.clipboard_get() == "译:hello" and not app.bubble.alive())
 # 屏幕边缘：不越界、放不下就翻到指针上方
 sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
