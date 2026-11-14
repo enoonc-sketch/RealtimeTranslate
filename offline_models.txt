@@ -1,0 +1,16 @@
+# 离线版要内置的语言对，每行一个「源语言-目标语言」。# 开头是注释。
+# 语言代码：en 英 zh 中 ja 日 ko 韩 fr 法 de 德 es 西 ru 俄 pt 葡 it 意 ar 阿 hi 印地 tr 土 pl 波 nl 荷 uk 乌 ...
+# 完整列表见 https://github.com/argosopentech/argospm-index （index.json）
+#
+# 每个语言对约 50~120 MB（安装包里会压缩）。没有直达语言对时程序会自动经英语中转，
+# 例如只装 ja-en + en-zh，也能做 日→中（质量略低于直达）。
+en-zh
+zh-en
+
+# 需要更多时去掉行首 # ：
+# en-ja
+# ja-en
+# en-ko
+# ko-en
+# en-fr
+# fr-en
