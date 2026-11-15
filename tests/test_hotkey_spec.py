@@ -62,7 +62,8 @@ out = dt.validate_hotkey_cfg({"hotkey_main": "bogus", "hotkey_pointer": "t",
                               "hotkey_shot": ""})
 ok("invalid fall back to defaults",
    out == {"hotkey_main": "ctrl+alt+t", "hotkey_pointer": "ctrl+alt+d",
-           "hotkey_shot": "ctrl+alt+s", "hotkey_replace": "ctrl+alt+r"})
+           "hotkey_shot": "ctrl+alt+s", "hotkey_replace": "ctrl+alt+r",
+           "hotkey_clip": "ctrl+shift+v"})
 out = dt.validate_hotkey_cfg({"hotkey_main": "ctrl+alt+t",
                               "hotkey_pointer": "ctrl+alt+t",
                               "hotkey_shot": "ctrl+alt+s"})
@@ -70,6 +71,16 @@ ok("duplicate falls back to its default",
    out["hotkey_main"] == "ctrl+alt+t" and out["hotkey_pointer"] == "ctrl+alt+d")
 out = dt.validate_hotkey_cfg({})
 ok("missing keys get defaults", out == dt.DEFAULT_HOTKEYS)
+
+# ---- v2.8 粘贴图片翻译快捷键 ----
+ok("clip default is ctrl+shift+v", dt.DEFAULT_HOTKEYS["hotkey_clip"] == "ctrl+shift+v")
+ok("clip label", dt.hotkey_label("ctrl+shift+v") == "Ctrl+Shift+V")
+ok("clip pynput spec", dt.pynput_spec("ctrl+shift+v") == "<ctrl>+<shift>+v")
+out = dt.validate_hotkey_cfg({"hotkey_clip": "ctrl+alt+v"})
+ok("clip custom kept", out["hotkey_clip"] == "ctrl+alt+v")
+out = dt.validate_hotkey_cfg({"hotkey_main": "ctrl+shift+v", "hotkey_clip": "ctrl+shift+v"})
+ok("clip duplicate of main: default collides, stays (UI blocks saving dups)",
+   out["hotkey_main"] == "ctrl+shift+v" and out["hotkey_clip"] == "ctrl+shift+v")
 
 # ---- 5. 坏配置经 _load_cfg 回落，程序照常能起 ----
 tmp = tempfile.mkdtemp()

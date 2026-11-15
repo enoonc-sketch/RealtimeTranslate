@@ -69,10 +69,11 @@ ok("combobox has 3 scopes", list(app.scope_cb["values"]) == ["单词", "整行",
 ok("minsize still fits options", app.root.minsize()[0] >= max(w.winfo_reqwidth() for w in app._fit_rows))
 
 calls = []
-app._ocr_pick = lambda pos, scope: (calls.append((pos, scope)), "HELLO %s" % scope)[1]
-app._hover_worker((100, 200), "line")
+app._ocr_pick = lambda pos, scope, lang=None, bounds=None: (calls.append((pos, scope, lang, bounds)), "HELLO %s" % scope)[1]
+app._hover_worker((100, 200), "line", "en", (0, 0, 1920, 1080))
 kind = app.q.get_nowait()
-ok("hover worker passes scope + queues text", calls[-1] == ((100, 200), "line") and kind == ("hover_ocr", "HELLO line", (100, 200), False))
+ok("hover worker passes scope + lang + bounds + queues text",
+   calls[-1] == ((100, 200), "line", "en", (0, 0, 1920, 1080)) and kind == ("hover_ocr", "HELLO line", (100, 200), False))
 
 # 指针取词：整段走 OCR，不点击、结果进气泡
 shown = []
@@ -85,13 +86,13 @@ dt.send_copy_win = lambda: shown.append(("COPY",))
 app.grab_mode, app.grab_xy, app.grab_scope, app.grabbing = "pointer", (5, 6), "paragraph", True
 app.old_clip = ""
 app._pointer_grab_win()
-ok("pointer paragraph: OCR used, no click/copy", calls[-1] == ((5, 6), "paragraph") and shown == [])
+ok("pointer paragraph: OCR used, no click/copy", calls[-1] == ((5, 6), "paragraph", None, None) and shown == [])
 app._on_copied()
 ok("pointer paragraph: OCR text goes to bubble", shown == [("HELLO paragraph", (5, 6))])
 
 # OCR 没取到 -> 退回三击 + Ctrl+C（只有 I 形光标才点）
 shown.clear()
-app._ocr_pick = lambda pos, scope: None
+app._ocr_pick = lambda pos, scope, lang=None, bounds=None: None
 dt.cursor_is_ibeam_win = lambda: True
 dt.foreground_is_terminal_win = lambda: False
 app._seq0 = dt.clip_seq_win() if dt.IS_WIN else 0
@@ -107,7 +108,7 @@ dt.send_copy_win = lambda: (shown.append(("COPY",)), seq.__setitem__(0, seq[0] +
 shown.clear()
 calls.clear()
 app._seq0 = 0
-app._ocr_pick = lambda pos, scope: (calls.append(scope), "x")[1]
+app._ocr_pick = lambda pos, scope, lang=None, bounds=None: (calls.append(scope), "x")[1]
 app.grab_scope = "word"
 app._pointer_grab_win()
 ok("pointer word: still double-click, no OCR when copy worked", shown == [("CLICK", 2), ("COPY",)] and calls == [])

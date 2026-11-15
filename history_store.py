@@ -1,7 +1,7 @@
 """翻译记录存储 — 只用标准库 sqlite3，不装任何第三方库。
 
 存什么：每次翻译成功的 原文 / 译文 / 语言 / 引擎 / 来源（主窗口、指针取词、悬停取词、截图），
-可以收藏、搜索、导出（CSV / TXT / JSON），也可以当「翻译记忆」用：相同原文 + 相同语言
+可以收藏、搜索、导出（CSV / TXT / JSON / Markdown / Anki TSV），也可以当「翻译记忆」用：相同原文 + 相同语言
 直接取已存译文，不再联网。
 
 设计要点：
@@ -46,6 +46,32 @@ KIND_NAMES = {"main": "主窗口", "pointer": "指针取词", "hover": "悬停�
               "screenshot": "截图翻译", "doc": "文档翻译", "image": "图片翻译",
               "replace": "翻译并替换"}
 _COLS = ("id", "ts", "src", "dst", "sl", "tl", "req_sl", "req_tl", "engine", "kind", "fav", "count")
+
+
+def _is_word(src):
+    """是不是单词条目：单个词、无空白、1~30 字（与主程序的 is_word_entry 同义）。"""
+    s = (src or "").strip()
+    return bool(s) and len(s) <= 30 and not any(ch.isspace() for ch in s)
+
+
+def filter_history(entries, query):
+    """按子串筛历史条目（纯函数，v2.8 历史搜索框用）。
+
+    query 为空返回全部；否则原文或译文里含 query（大小写不敏感，casefold）
+    才留。entries 是 search() 返回的 dict 列表（键 src / dst）。
+    和 SQL 的 search 不同：这里把整个 query 当一个子串，不按空格拆词。
+    """
+    q = (query or "").strip().casefold()
+    if not q:
+        return list(entries or [])
+    return [r for r in (entries or [])
+            if q in (r.get("src") or "").casefold()
+            or q in (r.get("dst") or "").casefold()]
+
+
+def _one_line_tsv(s):
+    """TSV 一格：换行/制表符改成空格，Anki 一行一条才不会串行。"""
+    return "".join(" " if ch in "\t\r\n" else ch for ch in (s or "")).strip()
 
 
 def _like(term):
@@ -215,12 +241,48 @@ class HistoryStore:
 
     # ---- 导出 --------------------------------------------------------
     def export(self, path, rows=None):
-        """导出到 .csv / .txt / .json（按扩展名；其他当 .txt）。rows 为空 = 全部记录。
-        写文件失败抛 OSError，由界面提示用户。返回导出条数。"""
+        """导出到 .csv / .txt / .json / .tsv（按扩展名；其他当 .txt）。rows 为空 = 全部记录。
+
+        .tsv 是 Anki 导入格式：只导单词条目（原文是单个词），每行「原文<TAB>译文」，
+        UTF-8、无表头、无 HTML，Anki 里选「制表符分隔」直接导入。
+        .md 按日期分组（新日期在前）：标题 + 导出时间/条数，每天一个二级标题，
+        每条原文 + 译文 + 语言/引擎/来源（收藏带 ★）。
+        写文件失败抛 OSError，由界面提示用户。返回导出条数。
+        """
         if rows is None:
             rows = self.search("", False, 0)
         ext = os.path.splitext(path)[1].lower()
         stamp = lambda ts: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        if ext == ".md":
+            groups, order = {}, []
+            for r in rows:
+                day = time.strftime("%Y-%m-%d", time.localtime(r["ts"]))
+                if day not in groups:
+                    groups[day] = []
+                    order.append(day)
+                groups[day].append(r)
+            order.sort(reverse=True)          # 新日期在前
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("# 翻译记录\n\n")
+                f.write("导出时间：%s，共 %d 条\n" % (
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), len(rows)))
+                for day in order:
+                    f.write("\n## %s\n" % day)
+                    for r in groups[day]:
+                        f.write("\n**原文：** %s\n\n**译文：** %s\n\n" % (r["src"], r["dst"]))
+                        meta = "%s → %s · %s · %s" % (
+                            r["sl"] or "?", r["tl"] or "?", r["engine"],
+                            KIND_NAMES.get(r["kind"], r["kind"]))
+                        if r["fav"]:
+                            meta += " · ★"
+                        f.write("*%s*\n" % meta)
+            return len(rows)
+        if ext == ".tsv":
+            words = [r for r in rows if _is_word(r["src"])]
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                for r in words:
+                    f.write("%s\t%s\n" % (_one_line_tsv(r["src"]), _one_line_tsv(r["dst"])))
+            return len(words)
         if ext == ".json":
             data = [{"time": stamp(r["ts"]), "source": r["src"], "translation": r["dst"],
                      "from": r["sl"], "to": r["tl"], "engine": r["engine"],

@@ -5,7 +5,7 @@ title 构建 RealtimeTranslate 独立 exe
 cd /d "%~dp0"
 
 echo ========================================
-echo   实时翻译 v2.6 - 标准版 exe 一键构建
+echo   实时翻译 v2.9 - 标准版 exe 一键构建
 echo   (需在 Windows 上运行)
 echo ========================================
 echo.
@@ -25,7 +25,7 @@ if errorlevel 1 goto :notk
 
 echo.
 echo [2/5] 检查源码语法
-%PY% -m py_compile desktop_translator.py tray_win32.py screen_win.py ocr_win.py history_store.py tts_win.py doc_translate.py stt_win.py
+%PY% -m py_compile desktop_translator.py tray_win32.py screen_win.py ocr_win.py history_store.py tts_win.py doc_translate.py stt_win.py glossary.py update_check.py
 if errorlevel 1 goto :syntax
 
 echo.

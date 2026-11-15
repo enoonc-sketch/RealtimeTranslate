@@ -5,7 +5,7 @@ title 构建 RealtimeTranslate 离线版
 cd /d "%~dp0"
 
 echo ========================================
-echo   实时翻译 v2.6 - 离线版 一键构建
+echo   实时翻译 v2.9 - 离线版 一键构建
 echo   内置 ctranslate2 本地推理 + 离线语言包
 echo   (需在 Windows 上运行，首次需联网下载语言包)
 echo ========================================
@@ -28,7 +28,7 @@ if errorlevel 1 goto :notk
 
 echo.
 echo [2/6] 检查源码语法
-%PY% -m py_compile desktop_translator.py tray_win32.py screen_win.py ocr_win.py history_store.py tts_win.py doc_translate.py stt_win.py offline_engine.py netcheck.py prepare_offline_models.py
+%PY% -m py_compile desktop_translator.py tray_win32.py screen_win.py ocr_win.py history_store.py tts_win.py doc_translate.py stt_win.py glossary.py update_check.py offline_engine.py netcheck.py prepare_offline_models.py
 if errorlevel 1 goto :syntax
 
 echo.

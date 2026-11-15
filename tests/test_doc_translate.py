@@ -72,7 +72,7 @@ ok("srt_translate keeps index+times",
 
 # ---- 5. 扩展名校验 ----
 for p, want in (("a.txt", True), ("a.MD", True), ("a.srt", True),
-                ("a.docx", False), ("a.pdf", False), ("a.png", False),
+                ("a.docx", True), ("a.pdf", False), ("a.png", False),  # v2.7：.docx 已支持
                 ("a.png", False), ("noext", False), ("", False)):
     ok("doc ext %s -> %s" % (p, want), d.supported_doc_ext(p) is want)
 for p, want in (("a.png", True), ("a.JPG", True), ("a.jpeg", True),

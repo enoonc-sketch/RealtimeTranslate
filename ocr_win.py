@@ -47,6 +47,29 @@ def ocr_available():
         and os.path.isfile(_script_path())
 
 
+def _no_window_kwargs():
+    """起子进程时不弹黑窗：CREATE_NO_WINDOW + STARTUPINFO 藏窗口，双保险。
+
+    只有 CREATE_NO_WINDOW 时个别机器仍会闪黑窗（2.6.0 修完用户真机仍报），
+    再补 STARTUPINFO（STARTF_USESHOWWINDOW + SW_HIDE）压住。
+    非 Windows 返回 {}；Linux 上没有 subprocess.STARTUPINFO 时只给
+    creationflags（POSIX 下这两个参数都被忽略，不影响运行）。
+    """
+    if not IS_WIN:
+        return {}
+    kw = {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+    try:
+        si_cls = getattr(subprocess, "STARTUPINFO", None)
+        if si_cls is not None:
+            si = si_cls()
+            si.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+            si.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+            kw["startupinfo"] = si
+    except Exception:
+        pass
+    return kw
+
+
 def _run_ps(image_path, lang=None, want_json=False, timeout=60):
     ps = find_powershell()
     if not IS_WIN or not ps:
@@ -61,10 +84,8 @@ def _run_ps(image_path, lang=None, want_json=False, timeout=60):
     if want_json:
         cmd += ["-Json"]
     try:
-        kwargs = {}
-        if IS_WIN:
-            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW：不弹黑窗
-        proc = subprocess.run(cmd, capture_output=True, timeout=timeout, **kwargs)
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                              **_no_window_kwargs())
     except subprocess.TimeoutExpired:
         raise OcrError("OCR 超时（%d 秒），图片可能太大或 OCR 卡住了" % timeout)
     except Exception as e:

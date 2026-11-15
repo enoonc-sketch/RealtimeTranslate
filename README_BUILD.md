@@ -1,4 +1,4 @@
-# 实时翻译 v2.4 — Windows 构建说明
+# 实时翻译 v2.9 — Windows 构建说明
 
 当前环境是 Linux，**无法交叉编译出 Windows 程序**，请在 **Windows 电脑**上按下面步骤操作。
 
@@ -27,7 +27,7 @@
    建独立虚拟环境 → 下载语言包到 `offline_models\` → 打包 → **自动自检**（真正加载模型翻译一句）
 4. 得到 `dist\RealtimeTranslateOffline\`，里面的 `RealtimeTranslate.exe` 可直接运行，整个文件夹可复制给别人
 5. 做成安装向导：安装 [Inno Setup 6](https://jrsoftware.org/isdl.php)，运行 `build_installer.bat offline`
-   → `Output\RealtimeTranslate_Offline_Setup_v2.3.0.exe`
+   → `Output\RealtimeTranslate_Offline_Setup_v2.9.0.exe`
 
 **语言包下载不下来？**（`argos-net.com` 在部分网络下不通）
 用浏览器 / 代理从 [索引](https://github.com/argosopentech/argospm-index)（`index.json` 的 `links` 字段）下载 `.argosmodel`，
@@ -37,12 +37,77 @@
 **离线版运行时**：语言包在 `_internal\offline_models`（内置）和 `%APPDATA%\RealtimeTranslate\models`（用户导入）。
 用户随时可在程序里点「离线语言包…」导入更多 `.argosmodel`，无需重新构建。
 
+## v2.9 新增
+
+### 悬停取词黑窗加固
+- 2.6.0 给 OCR 调 PowerShell 时补了 CREATE_NO_WINDOW，但用户真机上仍报悬停取词闪黑窗。本轮三处起子进程的地方（OCR / 朗读 / 语音输入）在 CREATE_NO_WINDOW 之外再补 STARTUPINFO（STARTF_USESHOWWINDOW + SW_HIDE）双保险；悬停路径上其他位置（截图、托盘、网络检查、检查更新）全树核查过，都不 spawn 新进程。注意：如果装的还是 2.4.0（当时 _run_ps 根本没带这个标志），升级到 2.9.0 才能验证到底是哪一种原因。
+
+### 代理设置（在线翻译引擎）
+- 设置 → 离线与网络里加代理：启用开关、地址、端口、可选账号密码；配了就走代理，没配就和今天一样直连。只影响 Google / 微软在线翻译引擎；离线翻译、检查更新、语言包下载不走这个代理。密码只存本机 config.json，导出设置时不带出。
+
+### 朗读语音选择
+- 设置 → 翻译的朗读语速下面加「朗读语音」下拉框：列 Windows 已安装的语音（System.Speech 枚举），选了就记住，重启仍生效；选「系统默认语音」就是以前的行为。非 Windows 上只有默认语音一项。
+
+### 翻译历史导出 .md
+- 翻译历史的导出对话框里加 Markdown（按日期分组）：标题 + 导出时间/条数，每天一个二级标题，每条原文 + 译文 + 语言/引擎/来源（收藏带 ★）。原来的 CSV / TXT / JSON / Anki TSV 都还在。
+
+## v2.8 新增
+
+### 术语表 JSON 导入 / 导出
+- 设置 → 翻译的术语表旁边加「导入…」「导出…」：JSON 文件，一份 `[{"src": ..., "dst": ...}]` 列表；导入会替换掉现在的术语表，导入完状态栏会说“导入 N 对，跳过 M 条重复/非法”；文件不对、JSON 坏了就弹错，什么都不改。
+
+### 粘贴图片翻译（剪贴板图片 → 系统 OCR）
+- 主窗口加「粘贴图片翻译」按钮，全局快捷键 Ctrl+Shift+V（设置 → 快捷键与关于里可改）：复制一张图片后按一下，程序读剪贴板里的图片（DIB 转 BMP，只用标准库），走系统 OCR 认字再翻译；剪贴板里没有图片时只在状态栏说一句，不弹窗、不崩。只在 Windows 上可用。
+
+### 历史搜索
+- 翻译历史窗口顶上的搜索框现在按原文或译文筛（整个输入当一个子串，大小写不敏感，中英文都行），和「只看收藏」「只看单词」可以一起用；旁边加 ✕ 按钮，一点就清空回到全部。
+
+### 单实例
+- 程序同时只能跑一份：Windows 用命名互斥体（和安装包的 AppMutex 同名），非 Windows 用临时目录下的锁文件；已经有一份在跑时，新启动的那份会把旧窗口提到前台然后自己退出。单实例检查本身出了任何问题都不会阻止启动（宁可多跑一份，也不让程序起不来）。
+
+### 设置导出 / 导入
+- 设置 → 常规里加「导出设置…」「导入设置…」：JSON 文件，含全部配置、术语表和自定义快捷键，不含任何密码。导入前先全量校验：JSON 坏了、顶层不是对象就整份拒绝；未知键、类型不对的值逐个忽略并在状态栏报数；数值超范围的按范围夹紧；绝不半应用。
+
+### PDF 翻译（尽力而为）
+- 「翻译文档…」现在也支持 .pdf：只用标准库（zlib 解 Flate 流、解析 Tj/TJ 文字操作、ToUnicode 能解析就用），按段落翻，输出是原文旁边的 `-译文.txt`（不写回 PDF）。注意：没有 ToUnicode 的内嵌字体可能出乱码，不保证版式与阅读顺序；提不出文字的 PDF（扫描件/图片型，少于 10 个字符）会直接告诉你改用截图翻译。
+
+### 小打磨
+- 翻译完状态栏末尾显示字数，例如“英文 → 中文 · Google · 原文 128 字 · 译文 96 字”。
+
+## v2.7 新增
+
+### 健壮性审计（先审代码，再修问题）
+- 全树查了一遍所有 subprocess / 系统启动：OCR、朗读、语音输入三个调 PowerShell 的地方都带 CREATE_NO_WINDOW，不弹黑窗；macOS/Linux 的 `open`/`xdg-open` 只在非 Windows 上走，不涉及控制台窗口；`os.startfile` 与 `webbrowser.open` 不开控制台。
+- 全树查了一遍后台线程：悬停取词、截图翻译、指针取词的 worker 之前在线程里直接读 Tk 下拉框/变量（`_codes()`、`smart_var.get()`、`winfo_screenwidth()`），Tk 控件不是线程安全的，改成在 Tk 线程里读好再传进 worker；文档/图片/语音 worker 本来就是这么做的，这次没动。
+- 后台线程静默吞错：离线预热与网络检查的 worker 以前崩了就悄悄死掉（网络检查会一直卡在“检测中”），现在失败写进崩溃日志，网络检查还在界面上给出结论，不再卡住；悬停 OCR 失败仍静默退回双击取词（悬停本来就是静默的），但原因记在 `self._hover_ocr_err` 里方便查。
+
+### 检查更新
+- 设置 → 快捷键与关于里加「检查更新」按钮；启动后每天静默查一次（只在当天没查过时查），有新版才弹框问你要不要去下载页，绝不自动下载、绝不自动安装；断网、查不到时不弹窗，手动查才在状态栏说一句。
+
+### .docx 文档翻译
+- 「翻译文档…」现在也支持 .docx：只用标准库 zipfile + 字符串替换，段落译文写回第一个 `<w:t>`，其余字节（样式、图片、页眉页脚）原样保留，保存为 `-译文.docx`。
+
+### 自定义术语表
+- 设置 → 翻译里加术语表编辑框（每行 `原文 = 译文`，最多 200 对，每词 ≤40 字）：专有名词、产品名、品牌名按固定译文翻，不再被引擎翻走样；空着就是没有术语表，翻译和以前一样。实现是占位符保护（私有区字符，原文里撞上了会自动换一对）。
+
+### 生词本导出 Anki
+- 翻译历史导出多一种格式 .tsv：只导单词条目，每行「原文<TAB>译文」，UTF-8、无表头，Anki 里选制表符分隔直接导入。
+
+### 深色外观（默认浅色，可选）
+- 设置 → 常规里勾「深色外观」：主窗口、设置、历史、网络检查里的文本框与气泡/小窗口换成深色，对比度都过了 4.5:1；默认不勾，就是今天的浅色。以下几处故意不动：截图翻译的盖图层（画在截图上，颜色由截图决定）、托盘菜单（Windows 原生）、ttk 按钮与下拉框（Windows 原生主题下强行换肤会错位）。
+
+### 悬停取词更快
+- 指针静止时 2 秒内不再重复 OCR：同一范围、同一 8px 位置格的结果直接复用；指针移开、换范围、超过 2 秒就重新认。
+
+### 小打磨
+- 原文框里按 Ctrl+Enter 立即翻译，不用等 0.35 秒防抖；第一次运行（还没有配置文件）时状态栏会提示“在上方输入文字，或在任意软件里选中文字按 Ctrl+Alt+T 翻译”。
+
 ## v2.6 新增
 
 ### 文档翻译（.txt / .md / .srt）
 - 主窗口「翻译文档…」按钮：选文件后在后台线程翻译，状态栏显示进度；翻完让用户选保存路径（默认在原文旁加 `-译文` 后缀），译文同时载入主窗口、存进历史（来源「文档翻译」）
 - `.txt` / `.md` 按段落分块翻译，空行与段落结构原样保留；`.srt` 只翻字幕正文行，序号与时间轴逐字保留
-- 实现是新模块 `doc_translate.py`（纯函数：`split_paragraphs` / `rebuild_paragraphs` / `srt_parse` / `srt_rebuild`，往返逐字还原有测试）；`.docx` / `.pdf` 不支持——要解析它们得另装库，不符合本程序标准库 only 的路线
+- 实现是新模块 `doc_translate.py`（纯函数：`split_paragraphs` / `rebuild_paragraphs` / `srt_parse` / `srt_rebuild`，往返逐字还原有测试）；`.docx` 在 v2.7 加上了（标准库 zipfile），`.pdf` 在 v2.8 加上了（标准库提取正文，输出是 -译文.txt）
 
 ### 图片文件翻译
 - 主窗口「翻译图片…」按钮：选 `.png` / `.jpg` / `.jpeg` / `.bmp` / `.tif` 文件，Windows 上复用已有的 `ocr_win.py` 系统 OCR 认字，认出的文字进主窗口翻译并存历史（来源「图片翻译」）
@@ -320,6 +385,13 @@
 - `tray_win32.py` — Windows 托盘（纯 ctypes，不依赖 pystray / Pillow）
 - `screen_win.py` — Windows 截图（ctypes GDI，不用 Pillow）
 - `ocr_win.py` + `winocr.ps1` — Windows 自带 OCR（Windows.Media.Ocr，经 PowerShell 5.1 调用）
+- `doc_translate.py` — 文档翻译（.txt / .md / .srt / .docx）
+- `pdf_translate.py` — PDF 正文提取（标准库，尽力而为；输出是 -译文.txt）
+- `clip_image.py` — 剪贴板 DIB 图片转 BMP（粘贴图片翻译用）
+- `single_instance.py` — 单实例（Windows 互斥体 / 非 Windows 文件锁）
+- `settings_io.py` — 设置导出 / 导入（JSON，全量校验）
+- `glossary.py` — 自定义术语表（占位符保护，JSON 导入/导出）
+- `update_check.py` — 检查更新（GitHub Releases）
 - `offline_engine.py` — 离线引擎（Argos 语言包 + ctranslate2）
 - `pack_downloader.py` — 在线下载语言包（取列表 / 下载 / 校验 / 安装，仅标准库）
 - `runtime_installer.py` — 在线安装离线运行库（从 PyPI 取轮子，仅标准库）

@@ -76,28 +76,102 @@ def _find_powershell():
 
 
 # 固定朗读脚本：只从 -TextFile 读文字，命令行里没有任何用户文字。
-# 参数：-TextFile 文字文件（UTF-8）、-Culture 语音 culture、-Rate 语速。
-_PS_SCRIPT = r"""param([string]$TextFile, [string]$Culture, [int]$Rate)
+# 参数：-TextFile 文字文件（UTF-8）、-Culture 语音 culture、-Rate 语速、
+#   -Voice 语音名（v2.9：指定了就优先按名字选语音，选不到回落到 culture）。
+# 枚举已安装语音的脚本：每行「名字<TAB>culture<TAB>性别」。
+_LIST_VOICES_SCRIPT = r"""Add-Type -AssemblyName System.Speech
+$sp = New-Object System.Speech.Synthesis.SpeechSynthesizer
+foreach ($v in $sp.GetInstalledVoices()) {
+  $i = $v.VoiceInfo
+  "$($i.Name)`t$($i.Culture)`t$($i.Gender)"
+}
+"""
+
+
+def list_voices(timeout=15):
+    """列出 Windows 已安装的朗读语音（System.Speech）。
+
+    返回 [{"name": 语音名, "culture": "zh-CN", "gender": "Female"}, ...]。
+    非 Windows / 没有语音 / 枚举失败都返回 []，绝不抛异常。
+    """
+    if not IS_WIN:
+        return []
+    ps = _find_powershell()
+    if not ps:
+        return []
+    try:
+        script_path = _write_temp(_LIST_VOICES_SCRIPT, ".ps1")
+    except Exception:
+        return []
+    try:
+        cmd = [ps, "-NoProfile", "-ExecutionPolicy", "Bypass",
+               "-File", os.path.abspath(script_path)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                                  **_no_window_kwargs())
+        except Exception:
+            return []
+        if proc.returncode != 0:
+            return []
+        out = (proc.stdout or b"").decode("utf-8", errors="replace")
+        voices = []
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[0].strip():
+                voices.append({"name": parts[0].strip(),
+                               "culture": parts[1].strip(),
+                               "gender": parts[2].strip() if len(parts) > 2 else ""})
+        return voices
+    finally:
+        _cleanup_files([script_path])
+
+
+_PS_SCRIPT = r"""param([string]$TextFile, [string]$Culture, [int]$Rate, [string]$Voice)
 $text = [System.IO.File]::ReadAllText($TextFile, [System.Text.Encoding]::UTF8)
 if (-not $text.Trim()) { exit 0 }
 Add-Type -AssemblyName System.Speech
 $sp = New-Object System.Speech.Synthesis.SpeechSynthesizer
-try { $sp.SelectVoiceByCulture($Culture) } catch { }
+if ($Voice) { try { $sp.SelectVoice($Voice) } catch { try { $sp.SelectVoiceByCulture($Culture) } catch { } } }
+else { try { $sp.SelectVoiceByCulture($Culture) } catch { } }
 $sp.Rate = $Rate
 $sp.Speak($text)
 """
 
 
-def build_command(text_file, script_file, lang_code, rate=0):
+def _no_window_kwargs():
+    """起子进程时不弹黑窗：CREATE_NO_WINDOW + STARTUPINFO 藏窗口，双保险。
+
+    只有 CREATE_NO_WINDOW 时个别机器仍会闪黑窗（2.6.0 修完用户真机仍报），
+    再补 STARTUPINFO（STARTF_USESHOWWINDOW + SW_HIDE）压住。
+    非 Windows 返回 {}；Linux 上没有 subprocess.STARTUPINFO 时只给
+    creationflags（POSIX 下这两个参数都被忽略，不影响运行）。
+    """
+    if not IS_WIN:
+        return {}
+    kw = {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+    try:
+        si_cls = getattr(subprocess, "STARTUPINFO", None)
+        if si_cls is not None:
+            si = si_cls()
+            si.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+            si.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+            kw["startupinfo"] = si
+    except Exception:
+        pass
+    return kw
+
+
+def build_command(text_file, script_file, lang_code, rate=0, voice=None):
     """拼出朗读命令（纯函数，便于测试）：命令里只有两个临时文件路径、
-    culture、语速，绝不含用户文字。非 Windows 返回 None。"""
+    culture、语速、语音名，绝不含用户文字。非 Windows 返回 None。"""
     ps = _find_powershell()
     if not IS_WIN or not ps:
         return None
     return [ps, "-NoProfile", "-ExecutionPolicy", "Bypass",
             "-File", os.path.abspath(script_file),
             "-TextFile", os.path.abspath(text_file),
-            "-Culture", culture_for(lang_code), "-Rate", str(clamp_rate(rate))]
+            "-Culture", culture_for(lang_code), "-Rate", str(clamp_rate(rate)),
+            "-Voice", voice or ""]
 
 
 def _write_temp(text, suffix):
@@ -147,9 +221,10 @@ def stop():
     _cleanup_files(files)
 
 
-def speak(text, lang_code, rate=0):
+def speak(text, lang_code, rate=0, voice=None):
     """朗读 text（非阻塞：另起 powershell 进程，立刻返回 True）。
 
+    voice 是 Windows 已安装语音的名字（v2.9；None/空串 = 系统默认语音）。
     再调一次 speak() 会先停掉上一次。失败（非 Windows / 没文字 /
     起不来进程）返回 False，绝不向界面抛异常。
     """
@@ -170,14 +245,13 @@ def speak(text, lang_code, rate=0):
     except Exception:
         _cleanup_files([txt_path])
         return False
-    cmd = build_command(txt_path, ps_path, lang_code, rate)
+    cmd = build_command(txt_path, ps_path, lang_code, rate, voice=voice)
     if cmd is None:
         _cleanup_files([txt_path, ps_path])
         return False
     try:
         kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
-        if IS_WIN:
-            kwargs["creationflags"] = 0x08000000       # CREATE_NO_WINDOW：不弹黑窗
+        kwargs.update(_no_window_kwargs())       # 不弹黑窗（双保险，见 _no_window_kwargs）
         proc = subprocess.Popen(cmd, **kwargs)
     except Exception:
         _cleanup_files([txt_path, ps_path])

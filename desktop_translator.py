@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-实时翻译 — 桌面独立版 v2.6，Windows / macOS / Linux(X11)
+实时翻译 — 桌面独立版 v2.7，Windows / macOS / Linux(X11)
 
 功能
   1. 输入即译：窗口里打字或粘贴，停顿约 0.35 秒自动翻译
@@ -35,6 +35,18 @@
      短词组时才显示）、语音输入（Windows 自带语音识别，15 秒超时）、
      生词本（历史里只看单词）、界面字号 10~18、翻译并替换原文
      （Ctrl+Alt+R，翻完直接粘贴回原处，有窗口校验与终端保护）
+ 15. v2.7：健壮性审计（worker 线程不再碰 Tk 控件、网络检查与离线预热
+     失败写崩溃日志、OCR/TTS/语音的 PowerShell 全都不弹黑窗）、检查更新
+     （GitHub Releases，手动 + 每天启动时静默一次，绝不自动下载安装）、
+     .docx 文档翻译（标准库 zipfile，样式图片原样保留）、自定义术语表
+     （专有名词按固定译文翻）、生词本导出 Anki（.tsv）、深色外观（默认浅色，
+     可选）、悬停取词 2 秒缓存（指针不动不再重复 OCR）、Ctrl+Enter 立即翻译
+ 16. v2.8：术语表 JSON 导入 / 导出、粘贴图片翻译（剪贴板图片 → 系统 OCR，
+     Ctrl+Shift+V）、历史搜索框（按原文或译文筛，可和只看单词 / 只看收藏
+     一起用）、单实例（Windows 互斥体，非 Windows 用文件锁；已有实例在
+     跑就唤起它）、设置导出 / 导入（JSON，导入前先全量校验）、PDF 翻译
+     （标准库提取正文，输出是 -译文.txt；扫描版 PDF 请用截图翻译）、
+     状态栏显示原文 / 译文字数
 """
 import base64
 import collections
@@ -64,6 +76,13 @@ import tray_win32
 import screen_win
 import ocr_win
 import doc_translate
+import glossary
+import update_check
+import pdf_translate
+import clip_image
+import settings_io
+import single_instance
+import tempfile
 
 try:
     import tts_win
@@ -93,10 +112,13 @@ SCREENSHOT_LABEL = "Ctrl+Alt+S"
 PYNPUT_SCREENSHOT = "<ctrl>+<alt>+s"
 REPLACE_LABEL = "Ctrl+Alt+R"
 PYNPUT_REPLACE = "<ctrl>+<alt>+r"
+CLIP_LABEL = "Ctrl+Shift+V"
+PYNPUT_CLIP = "<ctrl>+<shift>+v"
 # 默认全局快捷键（配置键名 → 默认组合；用户可在高级设置里改，保存后重启生效）
 DEFAULT_HOTKEYS = {"hotkey_main": "ctrl+alt+t", "hotkey_pointer": "ctrl+alt+d",
-                   "hotkey_shot": "ctrl+alt+s", "hotkey_replace": "ctrl+alt+r"}
-HOTKEY_KEYS = ("hotkey_main", "hotkey_pointer", "hotkey_shot", "hotkey_replace")
+                   "hotkey_shot": "ctrl+alt+s", "hotkey_replace": "ctrl+alt+r",
+                   "hotkey_clip": "ctrl+shift+v"}
+HOTKEY_KEYS = ("hotkey_main", "hotkey_pointer", "hotkey_shot", "hotkey_replace", "hotkey_clip")
 # Windows RegisterHotKey 的修饰键位（和 start_hotkey_win 里的常量一致）
 _MOD_BITS = {"ctrl": 0x2, "alt": 0x1, "shift": 0x4, "win": 0x8}
 _MOD_NAMES = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win"}
@@ -151,6 +173,11 @@ def hotkey_label(spec):
     return parse_hotkey(spec)[2]
 
 
+def format_status_counts(src_len, dst_len):
+    """状态栏字数（纯函数，v2.8）：\"原文 128 字 · 译文 96 字\"。"""
+    return "原文 %d 字 · 译文 %d 字" % (int(src_len), int(dst_len))
+
+
 def pynput_spec(spec):
     """组合键 → pynput GlobalHotKeys 的写法，如 "ctrl+alt+t" → "<ctrl>+<alt>+t"。"""
     parts = [p.strip().lower() for p in spec.replace(" ", "").split("+") if p.strip()]
@@ -166,10 +193,11 @@ def pynput_spec(spec):
 
 
 def validate_hotkey_cfg(cfg):
-    """校验配置里的三个快捷键：非法或重复的逐个回落到默认值，绝不抛异常。
+    """校验配置里的五个快捷键：非法或重复的逐个回落到默认值，绝不抛异常。
 
-    返回新的 dict（只含 hotkey_main / hotkey_pointer / hotkey_shot 三个键）。
-    重复按主窗口 → 指针取词 → 截图翻译的顺序判定：先出现的保留，后出现的回默认。
+    返回新的 dict（只含 HOTKEY_KEYS 里的五个键）。
+    重复按主窗口 → 指针取词 → 截图翻译 → 翻译并替换 → 粘贴图片翻译的顺序判定：
+    先出现的保留，后出现的回默认。
     """
     out, seen = {}, set()
     for k in HOTKEY_KEYS:
@@ -195,9 +223,8 @@ SHOT_CODES = {v: k for k, v in SHOT_NAMES.items()}
 MINI_SIZE = {"mini_w": (160, 800, 320), "mini_h": (60, 500, 110)}   # 小窗口宽 / 高：(最小, 最大, 默认)
 CLOSE_NAMES = {"tray": "隐藏到托盘", "quit": "直接退出"}      # 点窗口 × 时
 CLOSE_CODES = {v: k for k, v in CLOSE_NAMES.items()}
-__version__ = "2.6.0"
+__version__ = "2.9.0"
 APP_TITLE = "实时翻译"
-MUTEX_NAME = "RealtimeTranslate_SingleInstance"   # 与 installer.iss 的 AppMutex 保持一致
 RUN_VALUE = "RealtimeTranslate"
 FROZEN = bool(getattr(sys, "frozen", False))
 OLD_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".gt_desktop_translator.json")
@@ -289,9 +316,16 @@ DEFAULTS = {
     # v2.5：朗读语速（-10~10，默认 0）、自动复制译文（默认关）、自定义全局快捷键
     "tts_rate": 0, "auto_copy": False,
     "hotkey_main": "ctrl+alt+t", "hotkey_pointer": "ctrl+alt+d", "hotkey_shot": "ctrl+alt+s",
-    "hotkey_replace": "ctrl+alt+r",
+    "hotkey_replace": "ctrl+alt+r", "hotkey_clip": "ctrl+shift+v",
     # v2.6：界面字号（10~18，默认 11）
     "font_size": 11,
+    # v2.7：深色外观（默认浅色）、术语表（默认空）、每天自动检查更新（默认开）、上次检查日期
+    "dark_mode": False, "glossary": [], "update_auto": True, "update_last_check": "",
+    # v2.9：在线翻译引擎代理（默认不用；勾上才走代理。密码只存本机，设置导出不带出）
+    "proxy_enabled": False, "proxy_host": "", "proxy_port": 0,
+    "proxy_user": "", "proxy_pass": "",
+    # v2.9：朗读语音（空 = 系统默认语音；下拉框里选的是 Windows 已安装语音的名字）
+    "tts_voice": "",
 }
 
 
@@ -316,6 +350,40 @@ def to_argos(code):
     return ARGOS_CODE.get(code, base(code) or "en")
 
 
+# ---------------------------------------------------------------- 外观主题（v2.7 深色外观，可选，默认浅色）
+# 浅色是今天的样子（不改任何默认值）；深色只在用户勾选后才用。
+# 对比度：正文 #f5f5f7 / #2c2c2e ≈ 13.5:1，灰字 #a1a1a6 / #2c2c2e ≈ 5.6:1，
+# 都过了 WCAG AA 的 4.5:1（test_dark_mode.py 里会算一遍）。
+THEME_LIGHT = {"bg": "#f0f0f0", "fg": "#000000", "gray": "#5b6676",
+               "text_bg": "#ffffff", "text_fg": "#000000",
+               "bubble_bg": "#fffdf6", "bubble_fg": "#111111",
+               "bubble_gray": "#6b7380", "bubble_foot": "#9aa3b2",
+               "border": "#c9ced6", "error": "#b42318"}
+THEME_DARK = {"bg": "#1c1c1e", "fg": "#f5f5f7", "gray": "#a1a1a6",
+              "text_bg": "#2c2c2e", "text_fg": "#f5f5f7",
+              "bubble_bg": "#2c2c2e", "bubble_fg": "#f5f5f7",
+              "bubble_gray": "#a1a1a6", "bubble_foot": "#8e8e93",
+              "border": "#48484a", "error": "#ff6961"}
+
+
+def theme_colors(dark):
+    return dict(THEME_DARK if dark else THEME_LIGHT)
+
+
+def _lum(hexcolor):
+    hexcolor = hexcolor.lstrip("#")
+    r, g, b = (int(hexcolor[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    f = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = f(r), f(g), f(b)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast_ratio(fg, bg):
+    """两色的 WCAG 对比度（>= 4.5:1 才算正文可读）。"""
+    l1, l2 = sorted((_lum(fg), _lum(bg)), reverse=True)
+    return (l1 + 0.05) / (l2 + 0.05)
+
+
 # ---------------------------------------------------------------- 翻译核心
 CACHE = collections.OrderedDict()
 CACHE_MAX = 800
@@ -327,6 +395,62 @@ def _is_rate_limit(exc):
         return exc.code in (429, 503)
     s = str(exc).lower()
     return "429" in s or "too many requests" in s
+
+
+# ---- 在线翻译引擎的代理（v2.9.0） ----
+_PROXY = {"url": None}
+
+
+def proxy_url(cfg):
+    """按配置拼出代理 URL；没启用 / 没配主机端口 / 端口非法 → None（不走代理）。
+
+    纯函数，便于测试。账号密码做 URL 编码后拼进 URL；密码只存本机
+    config.json，设置导出时不带出（见 settings_io 的说明）。
+    """
+    cfg = cfg or {}
+    if not cfg.get("proxy_enabled"):
+        return None
+    host = str(cfg.get("proxy_host") or "").strip()
+    if not host:
+        return None
+    try:
+        port = int(cfg.get("proxy_port"))
+    except Exception:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    auth = ""
+    user = str(cfg.get("proxy_user") or "").strip()
+    if user:
+        auth = urllib.parse.quote(user, safe="")
+        pw = str(cfg.get("proxy_pass") or "")
+        if pw:
+            auth += ":" + urllib.parse.quote(pw, safe="")
+        auth += "@"
+    return "http://%s%s:%d" % (auth, host, port)
+
+
+def set_proxy_url(url):
+    """设置在线引擎用的代理（None / 空串 = 不用代理）。"""
+    _PROXY["url"] = url or None
+
+
+def get_proxy_url():
+    return _PROXY["url"]
+
+
+def _urlopen(req, timeout=None):
+    """在线引擎的统一出口：配了代理就走代理 opener，没配就和原来一样走 urlopen。
+
+    只影响 Google / 微软在线翻译引擎；检查更新、语言包下载、网络检查
+    不走这里（不在本次代理范围）。
+    """
+    url = _PROXY["url"]
+    if not url:
+        return urllib.request.urlopen(req, timeout=timeout)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": url, "https": url}))
+    return opener.open(req, timeout=timeout)
 
 
 def g_translate_full(text, sl, tl, attempts=3, timeout=12):
@@ -353,7 +477,7 @@ def g_translate_full(text, sl, tl, attempts=3, timeout=12):
     for attempt in range(attempts):
         try:
             req = urllib.request.Request(url, data=body, headers=headers)
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _urlopen(req, timeout=timeout) as r:
                 data = json.loads(r.read().decode("utf-8"))
             out = "".join((seg[0] or "") for seg in (data[0] or []) if seg)
             det = data[2] if len(data) > 2 and data[2] else sl
@@ -458,6 +582,38 @@ def replace_decision(is_win, same_hwnd, is_terminal):
     return "paste" if same_hwnd else "clipboard-only"
 
 
+class HoverCache:
+    """悬停取词的 OCR 结果缓存（纯逻辑，便于测试）。
+
+    指针静止时悬停每 100ms 检查一次，但 OCR 不该每次都重跑：
+    同一个范围 + 同一个 8px 位置格 + 2 秒内，直接用上次的 OCR 结果。
+    指针移出格子、换了范围、超过 2 秒都算失效。缓存的是 OCR 认出的
+    词（也可能是 None——该位置没认出字，2 秒内也不再重跑）。
+    """
+    _MISS = object()
+
+    def __init__(self, ttl=2.0, bucket=8):
+        self.ttl, self.bucket = ttl, bucket
+        self._store = {}
+
+    def _key(self, pos, scope):
+        return (scope, int(pos[0]) // self.bucket, int(pos[1]) // self.bucket)
+
+    def get(self, pos, scope, now=None):
+        now = time.time() if now is None else now
+        ent = self._store.get(self._key(pos, scope))
+        if ent is None or now - ent[0] > self.ttl:
+            return self._MISS, None
+        return True, ent[1]
+
+    def put(self, pos, scope, value, now=None):
+        now = time.time() if now is None else now
+        self._store[self._key(pos, scope)] = (now, value)
+
+    def clear(self):
+        self._store.clear()
+
+
 _ms_token = {"value": "", "ts": 0.0}
 _ms_lock = threading.Lock()
 MS_AUTH = "https://edge.microsoft.com/translate/auth"
@@ -474,7 +630,7 @@ def _ms_get_token(force=False):
         if not force and _ms_token["value"] and time.time() - _ms_token["ts"] < 480:
             return _ms_token["value"]
         req = urllib.request.Request(MS_AUTH, headers={"User-Agent": _UA_EDGE})
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with _urlopen(req, timeout=10) as r:
             tok = r.read().decode("utf-8").strip()
         _ms_token.update(value=tok, ts=time.time())
         return tok
@@ -499,7 +655,7 @@ def ms_translate(text, sl, tl, attempts=3, timeout=15):
                 "Authorization": "Bearer " + _ms_get_token(force=attempt > 0 and _is_auth_error(last)),
             }
             req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _urlopen(req, timeout=timeout) as r:
                 data = json.loads(r.read().decode("utf-8"))
             item = data[0] if isinstance(data, list) and data else {}
             translations = item.get("translations") or []
@@ -660,12 +816,15 @@ def _join(parts, tl):
 
 
 def translate_unit(unit, sl, tl, engine, cancelled=None):
+    # 术语表（v2.7）：先把用户定的词换成占位符再翻，翻完换回固定译文。
+    # 术语表为空时 protect/restore 都是原样返回，零开销、零行为变化。
+    protected, mapping = glossary.protect(unit)
     parts = []
-    for p in split_long(unit):
+    for p in split_long(protected):
         if cancelled and cancelled():
             raise RuntimeError("cancelled")
         parts.append(cached(p, sl, tl, engine)[0])
-    return _join(parts, tl)
+    return glossary.restore(_join(parts, tl), mapping)
 
 
 def alt_target(tl):
@@ -752,7 +911,8 @@ def translate_doc(text, sl, tl, smart, reflow, engine, progress, cancelled):
 
 # ---------------------------------------------------------------- Windows 全局热键
 def start_hotkey_win(q, specs=None):
-    """Windows 全局热键：注册三个组合键（主窗口 / 指针取词 / 截图翻译）。
+    """Windows 全局热键：注册五个组合键（主窗口 / 指针取词 / 截图翻译 /
+    翻译并替换 / 粘贴图片翻译）。
 
     specs 是 {"hotkey_main": "ctrl+alt+t", ...} 这类配置，不传（None）就用
     默认组合；非法组合逐个回落到默认，绝不抛异常。返回主窗口热键是否注册成功。
@@ -761,7 +921,7 @@ def start_hotkey_win(q, specs=None):
     import ctypes.wintypes
     user32 = ctypes.windll.user32
     ready, state = threading.Event(), {"ok": False, "pointer_ok": False, "shot_ok": False,
-                                        "replace_ok": False}
+                                        "replace_ok": False, "clip_ok": False}
     parsed = {}
     for i, key in enumerate(HOTKEY_KEYS, start=1):
         raw = (specs or {}).get(key, DEFAULT_HOTKEYS[key]) if isinstance(specs, dict) else DEFAULT_HOTKEYS[key]
@@ -773,11 +933,12 @@ def start_hotkey_win(q, specs=None):
 
     def loop():
         MOD_NOREPEAT = 0x4000
-        names = ("ok", "pointer_ok", "shot_ok", "replace_ok")
+        names = ("ok", "pointer_ok", "shot_ok", "replace_ok", "clip_ok")
         for i, (mods, vk) in parsed.items():
             state[names[i - 1]] = bool(user32.RegisterHotKey(None, i, mods | MOD_NOREPEAT, vk))
         ready.set()
-        if not (state["ok"] or state["pointer_ok"] or state["shot_ok"] or state["replace_ok"]):
+        if not (state["ok"] or state["pointer_ok"] or state["shot_ok"] or state["replace_ok"]
+                or state["clip_ok"]):
             return
         msg = ctypes.wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
@@ -789,6 +950,7 @@ def start_hotkey_win(q, specs=None):
     start_hotkey_win.pointer_ok = state["pointer_ok"]
     start_hotkey_win.shot_ok = state["shot_ok"]
     start_hotkey_win.replace_ok = state["replace_ok"]
+    start_hotkey_win.clip_ok = state["clip_ok"]
     return state["ok"]
 
 
@@ -1002,31 +1164,6 @@ def enable_dpi_awareness():
         pass
 
 
-_mutex_handle = None
-
-
-def acquire_single_instance():
-    """Windows 单实例：已有实例在运行则唤起它并返回 False。"""
-    global _mutex_handle
-    if not IS_WIN:
-        return True
-    try:
-        import ctypes
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CreateMutexW.restype = ctypes.c_void_p
-        _mutex_handle = k32.CreateMutexW(None, False, MUTEX_NAME)
-        if ctypes.get_last_error() == 183:      # ERROR_ALREADY_EXISTS
-            u = ctypes.windll.user32
-            hwnd = u.FindWindowW(None, APP_TITLE)
-            if hwnd:
-                u.ShowWindow(hwnd, 9)           # SW_RESTORE
-                u.SetForegroundWindow(hwnd)
-            return False
-    except Exception:
-        pass
-    return True
-
-
 def _run_command():
     if FROZEN:
         return '"%s" --minimized' % sys.executable
@@ -1122,14 +1259,16 @@ class Bubble:
             w.attributes("-topmost", True)
         except tk.TclError:
             pass
-        frame = tk.Frame(w, bg=self.BG, highlightbackground=self.BORDER, highlightthickness=1,
-                         padx=10, pady=7)
+        th = app.popup_colors()
+        frame = tk.Frame(w, bg=th["bubble_bg"], highlightbackground=th["border"],
+                         highlightthickness=1, padx=10, pady=7)
         frame.pack()
-        self.head = tk.Label(frame, bg=self.BG, fg=self.GRAY, font=app.ui_font, anchor="w",
+        self.head = tk.Label(frame, bg=th["bubble_bg"], fg=th["bubble_gray"],
+                             font=app.ui_font, anchor="w", justify="left", wraplength=380)
+        self.body = tk.Label(frame, bg=th["bubble_bg"], font=app.font, anchor="w",
                              justify="left", wraplength=380)
-        self.body = tk.Label(frame, bg=self.BG, font=app.font, anchor="w", justify="left",
-                             wraplength=380)
-        self.foot = tk.Label(frame, bg=self.BG, fg="#9aa3b2", font=(app.ui_font[0], 8), anchor="w",
+        self.foot = tk.Label(frame, bg=th["bubble_bg"], fg=th["bubble_foot"],
+                             font=(app.ui_font[0], 8), anchor="w",
                              text="点击复制译文 · 双击朗读译文 · 右键或 Esc 关闭")
         self.head.pack(fill="x")
         self.body.pack(fill="x", pady=(2, 2))
@@ -1159,8 +1298,9 @@ class Bubble:
             self._place()
 
     def _fill(self, head, body, error):
+        th = self.app.popup_colors()
         self.head.configure(text=head)
-        self.body.configure(text=body, fg=self.RED if error else "#111111")
+        self.body.configure(text=body, fg=th["error"] if error else th["bubble_fg"])
         self.copy_text = "" if error else body
         self.foot.configure(text="右键或 Esc 关闭" if error else "点击复制译文 · 双击朗读译文 · 右键或 Esc 关闭")
 
@@ -1270,16 +1410,18 @@ class MiniWin:
             w.attributes("-topmost", True)
         except tk.TclError:
             pass
-        frame = tk.Frame(w, bg=Bubble.BG, highlightbackground=Bubble.BORDER, highlightthickness=1,
-                         width=W, height=H)
+        th = app.popup_colors()
+        frame = tk.Frame(w, bg=th["bubble_bg"], highlightbackground=th["border"],
+                         highlightthickness=1, width=W, height=H)
         frame.pack()
         frame.pack_propagate(False)                   # 固定大小：文字太长就裁掉，不撑大窗口
-        self.head = tk.Label(frame, bg=Bubble.BG, fg=Bubble.GRAY, font=(app.ui_font[0], 8),
-                             anchor="w", justify="left")
-        self.body = tk.Label(frame, bg=Bubble.BG, font=app.font, anchor="nw", justify="left",
-                             wraplength=max(60, W - 20))
-        self.foot = tk.Label(frame, bg=Bubble.BG, fg="#9aa3b2", font=(app.ui_font[0], 8),
-                             anchor="w", text="点击复制译文 · 双击朗读译文 · 右键或 Esc 关闭")
+        self.head = tk.Label(frame, bg=th["bubble_bg"], fg=th["bubble_gray"],
+                             font=(app.ui_font[0], 8), anchor="w", justify="left")
+        self.body = tk.Label(frame, bg=th["bubble_bg"], font=app.font, anchor="nw",
+                             justify="left", wraplength=max(60, W - 20))
+        self.foot = tk.Label(frame, bg=th["bubble_bg"], fg=th["bubble_foot"],
+                             font=(app.ui_font[0], 8), anchor="w",
+                             text="点击复制译文 · 双击朗读译文 · 右键或 Esc 关闭")
         self.head.pack(fill="x", padx=8, pady=(4, 0))
         self.body.pack(fill="both", expand=True, padx=8, pady=(0, 4))
         self.foot.pack(fill="x", padx=8, pady=(0, 4))
@@ -1311,8 +1453,9 @@ class MiniWin:
                 self._follow()
 
     def _fill(self, head, body, error):
+        th = self.app.popup_colors()
         self.head.configure(text=head)
-        self.body.configure(text=body, fg=Bubble.RED if error else "#111111")
+        self.body.configure(text=body, fg=th["error"] if error else th["bubble_fg"])
         self.copy_text = "" if error else body
         self.foot.configure(text="右键或 Esc 关闭" if error else "点击复制译文 · 双击朗读译文 · 右键或 Esc 关闭")
 
@@ -1364,6 +1507,13 @@ class MiniWin:
 class App:
     def __init__(self):
         self.cfg = self._load_cfg()
+        set_proxy_url(proxy_url(self.cfg))   # v2.9：启动时按配置决定在线引擎走不走代理
+        # 首次运行（还没有配置文件）：状态栏给一句空态提示，告诉用户从哪开始
+        self._first_run = not (os.path.exists(CONFIG_PATH)
+                               or os.path.exists(OLD_CONFIG_PATH))
+        self._hover_cache = HoverCache()
+        self._hover_ocr_err = ""
+        glossary.set_active(self.cfg.get("glossary", []))
 
         self.q = queue.Queue()
         self.seq = 0
@@ -1406,6 +1556,10 @@ class App:
         self.shot_overlay = None
         self._build_ui()
         self._fit_min_width()
+        self._orig_colors = self._snapshot_colors()
+        self._apply_theme()
+        if self._first_run:
+            self.status.configure(text="在上方输入文字，或在任意软件里选中文字按 Ctrl+Alt+T 翻译")
 
         self.last_clip = self._get_clip()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1414,6 +1568,7 @@ class App:
         self.root.after(100, self._poll)
         self.root.after(600, self._watch_clip)
         self.root.after(1500, self._warmup)
+        self.root.after(5000, self._auto_update_check)
         self._start_hotkey()
         self._start_tray()
         if "--minimized" in sys.argv:
@@ -1476,12 +1631,35 @@ class App:
         cfg["tts_rate"] = max(-10, min(cfg["tts_rate"], 10))
         cfg["auto_copy"] = bool(cfg.get("auto_copy", False))
         cfg.update(validate_hotkey_cfg(cfg))
+        # v2.7：深色外观、术语表、自动检查更新
+        cfg["dark_mode"] = bool(cfg.get("dark_mode", False))
+        cfg["glossary"] = glossary.sanitize_pairs(cfg.get("glossary", []))
+        cfg["update_auto"] = bool(cfg.get("update_auto", True))
+        if not isinstance(cfg.get("update_last_check"), str):
+            cfg["update_last_check"] = ""
         # v2.6：界面字号钳制 10~18
         try:
             cfg["font_size"] = int(cfg.get("font_size", 11))
         except Exception:
             cfg["font_size"] = 11
         cfg["font_size"] = max(10, min(cfg["font_size"], 18))
+        # v2.9：代理配置（端口非法回 0 = 没配）；朗读语音只认字符串
+        cfg["proxy_enabled"] = bool(cfg.get("proxy_enabled", False))
+        if not isinstance(cfg.get("proxy_host"), str):
+            cfg["proxy_host"] = ""
+        cfg["proxy_host"] = cfg["proxy_host"].strip()
+        try:
+            cfg["proxy_port"] = int(cfg.get("proxy_port", 0))
+        except Exception:
+            cfg["proxy_port"] = 0
+        if not 0 <= cfg["proxy_port"] <= 65535:
+            cfg["proxy_port"] = 0
+        if not isinstance(cfg.get("proxy_user"), str):
+            cfg["proxy_user"] = ""
+        if not isinstance(cfg.get("proxy_pass"), str):
+            cfg["proxy_pass"] = ""
+        if not isinstance(cfg.get("tts_voice"), str):
+            cfg["tts_voice"] = ""
         if not re.match(r"^\d+x\d+([+-]-?\d+[+-]-?\d+)?$", str(cfg.get("geometry", ""))):
             cfg["geometry"] = DEFAULTS["geometry"]
         return cfg
@@ -1547,6 +1725,13 @@ class App:
         except ValueError:
             return REPLACE_LABEL
 
+    @property
+    def hotkey_clip_label(self):
+        try:
+            return hotkey_label(self.cfg.get("hotkey_clip", DEFAULT_HOTKEYS["hotkey_clip"]))
+        except ValueError:
+            return CLIP_LABEL
+
     def _refresh_tray_state(self):
         """把当前选项拍成快照给托盘菜单读（托盘线程不能碰 Tk），并更新托盘提示文字。"""
         try:
@@ -1561,6 +1746,7 @@ class App:
                 "hotkey_pointer": self.hotkey_pointer_label,
                 "hotkey_shot": self.hotkey_shot_label,
                 "hotkey_replace": self.hotkey_replace_label,
+                "hotkey_clip": self.hotkey_clip_label,
             }
             tray = getattr(self, "tray", None)
             if tray is not None and tray.is_running():
@@ -1726,6 +1912,7 @@ class App:
         box, self.src = self._text_with_scroll(f1, height=7, font=font, undo=True)
         box.pack(fill="both", expand=True, pady=(2, 6))
         self.src.bind("<<Modified>>", self._on_modified)
+        self.src.bind("<Control-Return>", self._on_ctrl_enter)   # Ctrl+Enter 立即翻译，不用等 0.35 秒
 
         row = ttk.Frame(f2)
         row.pack(fill="x")
@@ -1755,6 +1942,7 @@ class App:
         ttk.Button(btns, text="截图翻译", command=self.start_screenshot).pack(side="left", padx=6)
         ttk.Button(btns, text="翻译文档…", command=self._translate_doc_file).pack(side="left")
         ttk.Button(btns, text="翻译图片…", command=self._translate_image_file).pack(side="left", padx=6)
+        ttk.Button(btns, text="粘贴图片翻译", command=self._translate_clipboard_image).pack(side="left")
         ttk.Button(btns, text="🎤 语音输入", command=self.start_voice_input).pack(side="left")
         ttk.Button(btns, text="退出", command=self.quit).pack(side="right")
 
@@ -1778,11 +1966,22 @@ class App:
         self.history_reuse_var = tk.BooleanVar(value=bool(self.cfg.get("history_reuse", False)))
         self.history_max_var = tk.IntVar(value=int(self.cfg.get("history_max", 2000)))
         self.tts_rate_var = tk.IntVar(value=int(self.cfg.get("tts_rate", 0)))
+        self.tts_voice_var = tk.StringVar(value=self.cfg.get("tts_voice", "") or "")
+        self.tts_voice_names = []       # 下拉框里显示的语音名（v2.9，Windows 才有内容）
+        self.proxy_enabled_var = tk.BooleanVar(value=bool(self.cfg.get("proxy_enabled", False)))
+        self.proxy_host_var = tk.StringVar(value=self.cfg.get("proxy_host", ""))
+        self.proxy_port_var = tk.StringVar(
+            value=str(self.cfg.get("proxy_port", 0)) if self.cfg.get("proxy_port") else "")
+        self.proxy_user_var = tk.StringVar(value=self.cfg.get("proxy_user", ""))
+        self.proxy_pass_var = tk.StringVar(value=self.cfg.get("proxy_pass", ""))
         self.auto_copy_var = tk.BooleanVar(value=bool(self.cfg.get("auto_copy", False)))
         self.font_size_var = tk.IntVar(value=int(self.cfg.get("font_size", 11)))
+        self.dark_var = tk.BooleanVar(value=bool(self.cfg.get("dark_mode", False)))
+        self.update_auto_var = tk.BooleanVar(value=bool(self.cfg.get("update_auto", True)))
         self._stt_busy = False
         self._replace_hwnd = 0
         self._doc_path = ""
+        self._doc_bytes = None
 
         opts = ttk.LabelFrame(root, text="常用", padding=(8, 4))
         opts.pack(fill="x", padx=12, pady=(8, 0))
@@ -1887,6 +2086,14 @@ class App:
         sp.bind("<FocusOut>", lambda e: self._on_font_size())
         ttk.Label(row, text="（10 ~ 18，改完立刻生效：原文 / 译文框、气泡 / 小窗口都跟着变）",
                   foreground="#5b6676").pack(side="left", padx=6)
+        check(f, "深色外观", self.dark_var, self._on_dark_mode,
+              "主窗口、设置、历史、气泡 / 小窗口换成深色；默认是浅色，不勾就是今天的样子。")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(14, 0))
+        ttk.Button(row, text="导出设置…", command=self._export_settings).pack(side="left")
+        ttk.Button(row, text="导入设置…", command=self._import_settings).pack(side="left", padx=6)
+        ttk.Label(row, text="设置存成一个 JSON 文件（含术语表和自定义快捷键，不含任何密码）。导入前会先全量校验，有问题的不应用。",
+                  foreground="#5b6676", wraplength=420, justify="left").pack(side="left", padx=8)
 
         # 翻译
         f = tab("translate", "翻译")
@@ -1911,6 +2118,27 @@ class App:
         sp.bind("<FocusOut>", lambda e: self._on_tts_rate())
         ttk.Label(row, text="（-10 最慢 ~ 10 最快，0 是默认语速；朗读只在 Windows 上可用）",
                   foreground="#5b6676").pack(side="left", padx=6)
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(10, 0))
+        ttk.Label(row, text="朗读语音：").pack(side="left")
+        self.tts_voice_cb = ttk.Combobox(row, textvariable=self.tts_voice_var,
+                                         state="readonly", width=32)
+        self.tts_voice_cb.pack(side="left")
+        self.tts_voice_cb.bind("<<ComboboxSelected>>", lambda e: self._on_tts_voice())
+        ttk.Label(row, text="（只在 Windows 上有；选了就记住，重启仍生效）",
+                  foreground="#5b6676").pack(side="left", padx=6)
+        ttk.Label(f, text="术语表（专有名词按固定译文翻，每行一对，原文 = 译文）：",
+                  font=self.ui_font).pack(anchor="w", pady=(16, 2))
+        self.glossary_text = tk.Text(f, height=4, font=self.ui_font, wrap="none")
+        self.glossary_text.pack(fill="x")
+        self._refresh_glossary_text()
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(6, 0))
+        ttk.Button(row, text="保存术语表", command=self._save_glossary).pack(side="left")
+        ttk.Button(row, text="导入…", command=self._import_glossary).pack(side="left", padx=6)
+        ttk.Button(row, text="导出…", command=self._export_glossary).pack(side="left")
+        ttk.Label(row, text="最多 200 对，每词不超过 40 字；空着就是没有术语表，翻译和今天一样。导入会替换掉现在的术语表。",
+                  foreground="#5b6676").pack(side="left", padx=8)
 
         # 取词
         f = tab("grab", "取词")
@@ -2022,6 +2250,26 @@ class App:
         ttk.Button(row, text="离线语言包…", command=self._show_offline_packs).pack(side="left", padx=8)
         ttk.Label(f, text="「断网时自动改用离线翻译」的开关在「翻译」页。",
                   foreground="#5b6676").pack(anchor="w", pady=(10, 0))
+        # v2.9：代理（只影响 Google / 微软在线翻译引擎）
+        ttk.Label(f, text="代理（在线翻译引擎用）：", font=self.ui_font).pack(anchor="w", pady=(16, 2))
+        check(f, "使用代理服务器", self.proxy_enabled_var, self._on_proxy,
+              "公司 / 学校网络需要代理才能上网时勾上；不勾就和今天一样直连。")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(8, 0))
+        ttk.Label(row, text="地址：").pack(side="left")
+        ttk.Entry(row, textvariable=self.proxy_host_var, width=24).pack(side="left")
+        ttk.Label(row, text="端口：").pack(side="left", padx=(8, 0))
+        ttk.Entry(row, textvariable=self.proxy_port_var, width=7).pack(side="left")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(6, 0))
+        ttk.Label(row, text="账号：").pack(side="left")
+        ttk.Entry(row, textvariable=self.proxy_user_var, width=16).pack(side="left")
+        ttk.Label(row, text="密码：").pack(side="left", padx=(8, 0))
+        ttk.Entry(row, textvariable=self.proxy_pass_var, width=16, show="*").pack(side="left")
+        ttk.Button(row, text="保存", command=self._on_proxy).pack(side="left", padx=8)
+        ttk.Label(f, text="只影响 Google / 微软在线翻译引擎；离线翻译、检查更新、语言包下载不走这个代理。"
+                          "密码只存本机，导出设置时不带出。",
+                  foreground="#5b6676", wraplength=500, justify="left").pack(anchor="w", pady=(4, 0))
 
         # 关于
         f = tab("about", "快捷键与关于")
@@ -2036,6 +2284,7 @@ class App:
         self.hotkey_pointer_var = tk.StringVar(value=self.hotkey_pointer_label)
         self.hotkey_shot_var = tk.StringVar(value=self.hotkey_shot_label)
         self.hotkey_replace_var = tk.StringVar(value=self.hotkey_replace_label)
+        self.hotkey_clip_var = tk.StringVar(value=self.hotkey_clip_label)
         for text, var, presets in (
                 ("翻译选中的文字：", self.hotkey_main_var,
                  ["Ctrl+Alt+T", "Ctrl+Shift+T", "Alt+Shift+T", "Ctrl+Alt+Q", "Ctrl+Shift+Q", "Win+Alt+T"]),
@@ -2044,7 +2293,9 @@ class App:
                 ("截图翻译：", self.hotkey_shot_var,
                  ["Ctrl+Alt+S", "Ctrl+Shift+S", "Alt+Shift+S", "Ctrl+Alt+A", "Ctrl+Shift+A", "Win+Alt+S"]),
                 ("翻译并替换原文：", self.hotkey_replace_var,
-                 ["Ctrl+Alt+R", "Ctrl+Shift+R", "Alt+Shift+R", "Ctrl+Alt+Y", "Ctrl+Shift+Y", "Win+Alt+R"])):
+                 ["Ctrl+Alt+R", "Ctrl+Shift+R", "Alt+Shift+R", "Ctrl+Alt+Y", "Ctrl+Shift+Y", "Win+Alt+R"]),
+                ("粘贴图片翻译：", self.hotkey_clip_var,
+                 ["Ctrl+Shift+V", "Ctrl+Alt+V", "Alt+Shift+V", "Ctrl+Shift+B", "Win+Alt+V"])):
             row = ttk.Frame(f)
             row.pack(anchor="w", pady=(4, 0))
             ttk.Label(row, text=text, width=16).pack(side="left")
@@ -2054,6 +2305,15 @@ class App:
         ttk.Button(row, text="保存快捷键", command=self._save_hotkeys).pack(side="left")
         ttk.Label(row, text="保存后重启程序生效（热键注册只在启动时做一次）。",
                   foreground="#5b6676").pack(side="left", padx=8)
+        ttk.Label(f, text="更新：", font=self.ui_font).pack(anchor="w", pady=(16, 2))
+        row = ttk.Frame(f)
+        row.pack(anchor="w")
+        ttk.Button(row, text="检查更新", command=self._check_update_manual).pack(side="left")
+        self.update_label = ttk.Label(row, text="当前版本 v%s" % __version__,
+                                      foreground="#5b6676")
+        self.update_label.pack(side="left", padx=8)
+        check(f, "每天启动时自动检查更新", self.update_auto_var, self._save,
+              "每天只查一次；有新版才告诉你，从不自动下载、从不自动安装。")
 
         bar = ttk.Frame(win)
         bar.pack(fill="x", padx=10, pady=(0, 10))
@@ -2062,6 +2322,7 @@ class App:
 
     def open_settings(self, tab=None):
         win = self.settings_win
+        self._refresh_tts_voices()   # 打开设置时才枚举已安装语音，不拖慢启动
         if tab in self.settings_tabs:
             self.settings_nb.select(self.settings_tabs[tab])
         win.deiconify()
@@ -2117,9 +2378,10 @@ class App:
         try:
             self.about_hotkey_label.configure(
                 text="%s　翻译选中的文字\n%s　指针取词（指针处的单词 / 整行 / 整段）\n"
-                     "%s　截图翻译（框选屏幕任意区域）\n%s　翻译并替换原文（选中文字翻完直接替换回原处）\nEsc　隐藏窗口 / 关闭气泡"
+                     "%s　截图翻译（框选屏幕任意区域）\n%s　翻译并替换原文（选中文字翻完直接替换回原处）\n"
+                     "%s　粘贴图片翻译（剪贴板里的图片 → 系统 OCR → 翻译）\nEsc　隐藏窗口 / 关闭气泡"
                      % (self.hotkey_main_label, self.hotkey_pointer_label,
-                        self.hotkey_shot_label, self.hotkey_replace_label))
+                        self.hotkey_shot_label, self.hotkey_replace_label, self.hotkey_clip_label))
         except Exception:
             pass
         try:
@@ -2138,7 +2400,8 @@ class App:
         for key, var in (("hotkey_main", self.hotkey_main_var),
                          ("hotkey_pointer", self.hotkey_pointer_var),
                          ("hotkey_shot", self.hotkey_shot_var),
-                         ("hotkey_replace", self.hotkey_replace_var)):
+                         ("hotkey_replace", self.hotkey_replace_var),
+                         ("hotkey_clip", self.hotkey_clip_var)):
             vals[key] = var.get().strip()
         seen = set()
         for key, spec in vals.items():
@@ -2171,6 +2434,7 @@ class App:
             self.hotkey_pointer_var.set(self.hotkey_pointer_label)
             self.hotkey_shot_var.set(self.hotkey_shot_label)
             self.hotkey_replace_var.set(self.hotkey_replace_label)
+            self.hotkey_clip_var.set(self.hotkey_clip_label)
         except Exception:
             pass
 
@@ -2221,6 +2485,384 @@ class App:
         self.cfg["tts_rate"] = v
         self._save()
 
+    def _refresh_tts_voices(self):
+        """朗读语音下拉框：列 Windows 已安装的语音（v2.9）。
+
+        下拉框显示的是语音名；「系统默认语音」一项对应配置里的空串。
+        非 Windows 上 tts_win.list_voices() 返回 []，下拉框只留
+        「系统默认语音」一项；本机没有语音时也一样，绝不报错。
+        """
+        names = []
+        try:
+            if tts_win is not None:
+                names = [v.get("name", "") for v in tts_win.list_voices()
+                         if v.get("name")]
+        except Exception:
+            names = []
+        self.tts_voice_names = names
+        cur = (self.cfg.get("tts_voice", "") or "").strip()
+        self.tts_voice_cb["values"] = ["系统默认语音"] + names
+        self.tts_voice_var.set(cur if cur in names else "系统默认语音")
+
+    def _on_tts_voice(self):
+        """朗读语音改了就保存（下拉框显示「系统默认语音」时存空串）。"""
+        v = self.tts_voice_var.get().strip()
+        self.cfg["tts_voice"] = "" if v == "系统默认语音" else v
+        self._save()
+
+    def _on_proxy(self):
+        """代理设置改了就保存并立刻生效（不用重启）。"""
+        try:
+            port = int((self.proxy_port_var.get() or "").strip() or 0)
+        except Exception:
+            port = 0
+        self.cfg["proxy_enabled"] = bool(self.proxy_enabled_var.get())
+        self.cfg["proxy_host"] = self.proxy_host_var.get().strip()
+        self.cfg["proxy_port"] = max(0, min(port, 65535))
+        self.cfg["proxy_user"] = self.proxy_user_var.get().strip()
+        self.cfg["proxy_pass"] = self.proxy_pass_var.get()
+        self.proxy_port_var.set(str(self.cfg["proxy_port"])
+                                if self.cfg["proxy_port"] else "")
+        self._save()
+
+    # ------------------------------------------------ v2.7 深色外观
+    def popup_colors(self):
+        """气泡 / 小窗口用的颜色（深色时跟主题走，浅色就是原来的米白）。"""
+        return theme_colors(bool(self.cfg.get("dark_mode", False)))
+
+    def _snapshot_colors(self):
+        """记下浅色下各文本框的原始颜色：切回浅色时按原样恢复。"""
+        snap = {}
+        for name in ("src", "dst"):
+            w = getattr(self, name, None)
+            if w is not None:
+                try:
+                    snap[name] = (w.cget("background"), w.cget("foreground"),
+                                  w.cget("insertbackground"))
+                except Exception:
+                    pass
+        try:
+            snap["root_bg"] = self.root.cget("background")
+        except Exception:
+            pass
+        return snap
+
+    def _on_dark_mode(self):
+        self.cfg["dark_mode"] = self.dark_var.get()
+        self._apply_theme()
+        self._save()
+
+    def _apply_theme(self):
+        """应用当前外观：深色 / 浅色。
+
+        覆盖：主窗口原文/译文框、状态栏与提示字、设置/历史/网络检查里的
+        文本框、气泡与小窗口（下次弹出时按新主题画；正显示着的也立刻换色）。
+        不覆盖：截图翻译的盖图层（它画在截图上，颜色由截图本身决定）、
+        托盘图标与托盘菜单（Windows 原生菜单）、ttk 按钮与下拉框在 Windows
+        原生主题（vista）下保持系统样式——这是 Tk 在 Windows 上的限制，
+        强行换肤会让按钮错位，所以只换能安全换的部分。
+        """
+        dark = bool(self.cfg.get("dark_mode", False))
+        th = theme_colors(dark)
+        try:
+            self.root.configure(background=th["bg"])
+        except Exception:
+            pass
+        try:
+            style = ttk.Style()
+            style.configure("TFrame", background=th["bg"])
+            style.configure("TLabel", background=th["bg"], foreground=th["fg"])
+            style.configure("TLabelframe", background=th["bg"], foreground=th["fg"])
+            style.configure("TLabelframe.Label", background=th["bg"], foreground=th["fg"])
+            style.configure("TNotebook", background=th["bg"])
+            style.configure("TNotebook.Tab", background=th["bg"], foreground=th["fg"])
+        except Exception:
+            pass
+        for name in ("src", "dst"):
+            w = getattr(self, name, None)
+            if w is None:
+                continue
+            try:
+                if dark:
+                    w.configure(background=th["text_bg"], foreground=th["text_fg"],
+                                insertbackground=th["text_fg"])
+                else:
+                    orig = self._orig_colors.get(name)
+                    if orig:
+                        w.configure(background=orig[0], foreground=orig[1],
+                                    insertbackground=orig[2])
+            except Exception:
+                pass
+        try:
+            self.dst.tag_configure("src", foreground=th["gray"])
+        except Exception:
+            pass
+        for w in (getattr(self, "status", None), getattr(self, "hint", None),
+                  getattr(self, "engine_hint", None)):
+            try:
+                if w is not None:
+                    w.configure(foreground=th["gray"] if dark else "#5b6676")
+            except Exception:
+                pass
+        for w in (getattr(self, "hist_detail", None), getattr(self, "net_txt", None)):
+            try:
+                if w is not None:
+                    if dark:
+                        w.configure(background=th["text_bg"], foreground=th["text_fg"],
+                                    insertbackground=th["text_fg"])
+                    else:
+                        w.configure(background="#ffffff", foreground="#000000",
+                                    insertbackground="#000000")
+            except Exception:
+                pass
+        if getattr(self, "dict_label", None) is not None:
+            try:
+                self.dict_label.configure(foreground=th["fg"] if dark else "#000000")
+            except Exception:
+                pass
+        for pop in (self.bubble, self.mini):
+            try:
+                if pop.alive():
+                    pop._fill(pop.head.cget("text"), pop.body.cget("text"), False)
+                    for wd, key in ((pop.head, "bubble_gray"), (pop.body, "bubble_fg"),
+                                    (pop.foot, "bubble_foot")):
+                        wd.configure(background=th["bubble_bg"], foreground=th[key])
+            except Exception:
+                pass
+        try:
+            self.render()
+        except Exception:
+            pass
+
+    # ------------------------------------------------ v2.7 术语表
+    @staticmethod
+    def _parse_glossary_text(text):
+        """术语表编辑框的文本 -> [[原文, 译文], ...]：每行一对，分隔符是 = 或 Tab。"""
+        pairs = []
+        for ln in (text or "").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            if "=" in ln:
+                src, dst = ln.split("=", 1)
+            elif "\t" in ln:
+                src, dst = ln.split("\t", 1)
+            else:
+                continue
+            pairs.append([src.strip(), dst.strip()])
+        return pairs
+
+    def _refresh_glossary_text(self):
+        try:
+            self.glossary_text.delete("1.0", "end")
+            for src, dst in self.cfg.get("glossary", []):
+                self.glossary_text.insert("end", "%s = %s\n" % (src, dst))
+        except Exception:
+            pass
+
+    def _save_glossary(self):
+        pairs = glossary.sanitize_pairs(
+            self._parse_glossary_text(self.glossary_text.get("1.0", "end")))
+        self.cfg["glossary"] = pairs
+        glossary.set_active(pairs)
+        self._refresh_glossary_text()
+        self._save()
+        self.status.configure(text="术语表已保存（%d 对）" % len(pairs))
+
+    def _import_glossary(self):
+        """术语表 JSON 导入（v2.8）：导入会替换掉现在的术语表。"""
+        path = filedialog.askopenfilename(
+            title="导入术语表", filetypes=[("JSON", "*.json"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                text = f.read()
+        except Exception as e:      # noqa: BLE001
+            messagebox.showerror("导入术语表", "打不开文件：%s" % e, parent=self.settings_win)
+            return
+        pairs, skipped, err = glossary.load_glossary_json(text)
+        if err:
+            messagebox.showerror("导入术语表", "文件不对：%s" % err, parent=self.settings_win)
+            return
+        self.cfg["glossary"] = pairs
+        glossary.set_active(pairs)
+        self._refresh_glossary_text()
+        self._save()
+        self.status.configure(text="术语表已导入 %d 对%s" % (
+            len(pairs), "，跳过 %d 条重复/非法" % skipped if skipped else ""))
+
+    def _export_glossary(self):
+        """术语表 JSON 导出（v2.8）。"""
+        path = filedialog.asksaveasfilename(
+            title="导出术语表", initialfile="glossary.json", defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(glossary.dump_glossary_json(self.cfg.get("glossary", [])))
+        except Exception as e:      # noqa: BLE001
+            messagebox.showerror("导出术语表", "保存失败：%s" % e, parent=self.settings_win)
+            return
+        self.status.configure(text="术语表已导出 %d 对到 %s" % (
+            len(self.cfg.get("glossary", [])), path))
+
+    # ------------------------------------------------ v2.7 检查更新
+    def _check_update_manual(self):
+        """设置页「检查更新」：一定查一次，结果写在设置页与状态栏。"""
+        try:
+            self.update_label.configure(text="正在检查…")
+        except Exception:
+            pass
+        threading.Thread(target=self._update_worker, args=(True,), daemon=True).start()
+
+    def _auto_update_check(self):
+        """启动后静默检查一次：每天只查一次；没新版、查不到都不打扰。"""
+        if not self.cfg.get("update_auto", True):
+            return
+        today = time.strftime("%Y-%m-%d")
+        if self.cfg.get("update_last_check", "") == today:
+            return
+        threading.Thread(target=self._update_worker, args=(False,), daemon=True).start()
+
+    def _update_worker(self, manual):
+        try:
+            status, tag = update_check.check(__version__)
+        except Exception as e:      # noqa: BLE001
+            status, tag = "error", str(e)[:200]
+        self.q.put(("update_result", status, tag, manual))
+
+    def _on_update_result(self, status, tag, manual):
+        today = time.strftime("%Y-%m-%d")
+        if status == "newer":
+            self.cfg["update_last_check"] = today
+            self._save()
+            msg = "发现新版本 %s（当前 v%s），去下载？" % (tag, __version__)
+            self.status.configure(text="发现新版本 %s" % tag)
+            try:
+                self.update_label.configure(text="发现新版本 %s" % tag)
+            except Exception:
+                pass
+            if messagebox.askyesno("发现新版本", msg + "\n\n只打开下载页，不会自动下载或安装。",
+                                   parent=self.root):
+                import webbrowser
+                webbrowser.open(update_check.RELEASES_URL)
+        elif status == "same":
+            self.cfg["update_last_check"] = today
+            self._save()
+            if manual:
+                self.status.configure(text="已是最新版本 v%s" % __version__)
+                try:
+                    self.update_label.configure(text="已是最新版本 v%s" % __version__)
+                except Exception:
+                    pass
+        elif status == "older":
+            self.cfg["update_last_check"] = today
+            self._save()
+            if manual:
+                self.status.configure(text="当前版本比已发布的更新（开发版）")
+        else:  # error：静默——断网时不弹窗，手动查才在状态栏说一句
+            if manual:
+                self.status.configure(text="检查更新失败（网络问题），稍后再试")
+                try:
+                    self.update_label.configure(text="检查失败：%s" % tag)
+                except Exception:
+                    pass
+
+    def _on_ctrl_enter(self, _e=None):
+        """Ctrl+Enter：不等 0.35 秒防抖，立刻翻译。"""
+        self.translate_now()
+        return "break"
+
+    def _export_settings(self):
+        """设置导出（v2.8）：JSON 文件，含配置 + 术语表 + 自定义快捷键，不含密码。"""
+        path = filedialog.asksaveasfilename(
+            title="导出设置", initialfile="realtime-translate-settings.json",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(settings_io.export_settings(self.cfg))
+        except Exception as e:      # noqa: BLE001
+            messagebox.showerror("导出设置", "保存失败：%s" % e, parent=self.settings_win)
+            return
+        self.status.configure(text="设置已导出到 %s" % path)
+
+    def _import_settings(self):
+        """设置导入（v2.8）：先全量校验，失败或类型不对的项一律不应用，绝不半应用。"""
+        path = filedialog.askopenfilename(
+            title="导入设置", filetypes=[("JSON", "*.json"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                text = f.read()
+        except Exception as e:      # noqa: BLE001
+            messagebox.showerror("导入设置", "打不开文件：%s" % e, parent=self.settings_win)
+            return
+        cfg, ignored, err = settings_io.import_settings(text, DEFAULTS)
+        if err:
+            messagebox.showerror("导入设置", "文件不对：%s\n没有应用任何设置。" % err,
+                                 parent=self.settings_win)
+            return
+        self._apply_cfg_to_ui(cfg)
+        self.status.configure(text="设置已导入%s" % (
+            "，忽略了 %d 个未知 / 错误的项" % ignored if ignored else ""))
+
+    def _apply_cfg_to_ui(self, cfg):
+        """把一份已校验的配置应用到界面（v2.8 设置导入用）。
+
+        cfg 一定是 settings_io.import_settings 返回的完整配置（以 DEFAULTS
+        为底）。语言 / 引擎只认已知值，否则保持现状；其余项按 _reset_settings
+        的同一套写法回填，再保存一次。
+        """
+        d = cfg
+        self.cfg.update(d)
+        if d.get("sl") == "auto" or d.get("sl") in LANGS:
+            self.sl.set(AUTO if d["sl"] == "auto" else lang_name(d["sl"]))
+        if d.get("tl") in LANGS:
+            self.tl.set(lang_name(d["tl"]))
+        if d.get("engine") in ENGINES:
+            self.engine.set(d["engine"])
+        self.top_var.set(d["top"]); self.watch_var.set(d["watch"]); self.smart_var.set(d["smart"])
+        self.bi_var.set(d["bilingual"]); self.reflow_var.set(d["reflow"]); self.show_src_var.set(d["show_src"])
+        self.auto_off_var.set(d["auto_offline"]); self.pointer_var.set(d["pointer"]); self.hover_var.set(d["hover"])
+        self.scope_cb.set(SCOPE_NAMES[d["pointer_scope"]])
+        self.hover_ms_var.set(d["hover_ms"]); self.cfg["hover_ms"] = d["hover_ms"]
+        self.close_cb.set(CLOSE_NAMES[d["close_action"]]); self.tray_tip_var.set(d["tray_tip"])
+        self.history_on_var.set(d["history_on"]); self.history_reuse_var.set(d["history_reuse"])
+        self.history_max_var.set(d["history_max"]); self.cfg["history_max"] = d["history_max"]
+        self.history.max_items = d["history_max"]
+        self.popup_cb.set(POPUP_NAMES[d["popup_mode"]]); self.shot_cb.set(SHOT_NAMES[d["shot_mode"]])
+        self.mini_w_var.set(d["mini_w"]); self.mini_h_var.set(d["mini_h"])
+        self.cfg["mini_w"], self.cfg["mini_h"] = d["mini_w"], d["mini_h"]
+        self.tts_rate_var.set(d["tts_rate"]); self.cfg["tts_rate"] = d["tts_rate"]
+        self.cfg["tts_voice"] = d["tts_voice"]; self._refresh_tts_voices()
+        self.proxy_enabled_var.set(d["proxy_enabled"])
+        self.proxy_host_var.set(d["proxy_host"])
+        self.proxy_port_var.set(str(d["proxy_port"]) if d["proxy_port"] else "")
+        self.proxy_user_var.set(d["proxy_user"])
+        self.proxy_pass_var.set(d["proxy_pass"])
+        self.auto_copy_var.set(d["auto_copy"]); self.cfg["auto_copy"] = d["auto_copy"]
+        for k in HOTKEY_KEYS:
+            self.cfg[k] = d[k]
+        self._revert_hotkey_vars()
+        self._refresh_hotkey_labels()
+        self.font_size_var.set(d["font_size"]); self.cfg["font_size"] = d["font_size"]
+        self._apply_font_size()
+        self.dark_var.set(d["dark_mode"]); self.cfg["dark_mode"] = d["dark_mode"]
+        self._apply_theme()
+        self.cfg["glossary"] = list(d["glossary"])
+        glossary.set_active(self.cfg["glossary"])
+        self._refresh_glossary_text()
+        self.update_auto_var.set(d["update_auto"]); self.cfg["update_auto"] = d["update_auto"]
+        self._save()
+        self._on_top(); self._on_auto_offline(); self._on_pointer_opt()
+        self._on_show_src(); self._on_bilingual()
+
     def _reset_settings(self):
         if not messagebox.askyesno("恢复默认设置", "把高级设置里的选项恢复成默认值？\n（不影响开机自启、翻译引擎和语言）",
                                    parent=self.settings_win):
@@ -2240,6 +2882,16 @@ class App:
         self.cfg["mini_w"], self.cfg["mini_h"] = d["mini_w"], d["mini_h"]
         # v2.5：朗读语速、自动复制、自定义快捷键也恢复默认
         self.tts_rate_var.set(d["tts_rate"]); self.cfg["tts_rate"] = d["tts_rate"]
+        # v2.9：朗读语音、代理也恢复默认
+        for k in ("proxy_enabled", "proxy_host", "proxy_port", "proxy_user",
+                  "proxy_pass", "tts_voice"):
+            self.cfg[k] = d[k]
+        self._refresh_tts_voices()
+        self.proxy_enabled_var.set(d["proxy_enabled"])
+        self.proxy_host_var.set(d["proxy_host"])
+        self.proxy_port_var.set(str(d["proxy_port"]) if d["proxy_port"] else "")
+        self.proxy_user_var.set(d["proxy_user"])
+        self.proxy_pass_var.set(d["proxy_pass"])
         self.auto_copy_var.set(d["auto_copy"]); self.cfg["auto_copy"] = d["auto_copy"]
         for k in HOTKEY_KEYS:
             self.cfg[k] = d[k]
@@ -2248,6 +2900,13 @@ class App:
         # v2.6：界面字号也恢复默认并立刻应用
         self.font_size_var.set(d["font_size"]); self.cfg["font_size"] = d["font_size"]
         self._apply_font_size()
+        # v2.7：深色外观、术语表、自动检查更新也恢复默认
+        self.dark_var.set(d["dark_mode"]); self.cfg["dark_mode"] = d["dark_mode"]
+        self._apply_theme()
+        self.cfg["glossary"] = list(d["glossary"])
+        glossary.set_active(self.cfg["glossary"])
+        self._refresh_glossary_text()
+        self.update_auto_var.set(d["update_auto"]); self.cfg["update_auto"] = d["update_auto"]
         self._on_top(); self._on_auto_offline(); self._on_pointer_opt()
         self._on_show_src(); self._on_bilingual()
         self._retranslate()                       # 里面会 _save()
@@ -2350,10 +3009,12 @@ class App:
 
         top = ttk.Frame(win)
         top.pack(fill="x", padx=10, pady=(10, 4))
-        ttk.Label(top, text="搜索").pack(side="left")
+        ttk.Label(top, text="搜索原文或译文…").pack(side="left")
         self.hist_q = tk.StringVar()
         ent = ttk.Entry(top, textvariable=self.hist_q)
         ent.pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(top, text="✕", width=2,
+                   command=lambda: self.hist_q.set("")).pack(side="left")
         self.hist_fav = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="只看收藏 ★", variable=self.hist_fav, command=self._hist_refresh).pack(side="left")
         self.hist_word_only = tk.BooleanVar(value=False)
@@ -2426,7 +3087,10 @@ class App:
         if self.hist_win is None or not self.hist_win.winfo_exists():
             return
         keep = set(self.hist_tv.selection())
-        rows = self.history.search(self.hist_q.get(), self.hist_fav.get(), limit=1000)
+        # v2.8：搜索由纯函数 filter_history 在内存里筛（整个 query 当一个子串，
+        # 大小写不敏感），再和「只看收藏」「只看单词」叠加；SQL 只按收藏筛。
+        rows = self.history.search("", self.hist_fav.get(), limit=1000)
+        rows = history_store.filter_history(rows, self.hist_q.get())
         if getattr(self, "hist_word_only", None) is not None and self.hist_word_only.get():
             rows = [r for r in rows if is_word_entry(r["src"])]
         self.hist_rows = {str(r["id"]): r for r in rows}
@@ -2535,7 +3199,9 @@ class App:
         path = filedialog.asksaveasfilename(
             parent=parent, title="导出翻译记录", defaultextension=".csv",
             initialfile="翻译记录-%s" % time.strftime("%Y%m%d"),
-            filetypes=[("CSV（Excel 可打开）", "*.csv"), ("文本", "*.txt"), ("JSON", "*.json")])
+            filetypes=[("CSV（Excel 可打开）", "*.csv"), ("Markdown（按日期分组）", "*.md"),
+                       ("文本", "*.txt"), ("JSON", "*.json"),
+                       ("Anki（只导单词 .tsv）", "*.tsv")])
         if not path:
             return
         try:
@@ -3056,6 +3722,9 @@ class App:
         def job():
             try:
                 OFFLINE.warmup(pkgs[:2])
+            except Exception:      # noqa: BLE001  预热失败不能静默丢掉：写进崩溃日志
+                import traceback
+                log_crash("offline warmup failed:\n" + traceback.format_exc())
             finally:
                 self._warming = False
         threading.Thread(target=job, daemon=True).start()
@@ -3202,21 +3871,26 @@ class App:
         self.grab_xy = pos
         self.mini.hide_for_capture()            # 小窗口别被截进 OCR
         scope = SCOPE_CODES.get(self.scope_cb.get(), "word")     # 在 Tk 线程里读，别在 worker 里碰 Tk
-        threading.Thread(target=self._hover_worker, args=(pos, scope), daemon=True).start()
+        lang = self._ocr_lang()
+        bounds = screen_bounds() or (0, 0, self.root.winfo_screenwidth(),
+                                     self.root.winfo_screenheight())
+        threading.Thread(target=self._hover_worker, args=(pos, scope, lang, bounds),
+                         daemon=True).start()
 
     # 各范围截光标周围多大一块去 OCR：单词一小块就够，整行要横向更宽，整段要纵向更高
     _OCR_BOX = {"word": (420, 110), "line": (900, 90), "paragraph": (900, 560)}
 
-    def _ocr_pick(self, pos, scope):
+    def _ocr_pick(self, pos, scope, lang=None, bounds=None):
         """截光标周围一块屏幕，用系统 OCR 取光标处的单词 / 整行 / 整段；取不到返回 None。
 
-        在工作线程里调用（不碰 Tk；屏幕尺寸只在 screen_bounds 取不到时才问 Tk）。
+        只在工作线程里调用，不碰 Tk：lang（OCR 语言）与 bounds（屏幕范围）
+        必须由调用它的 Tk 线程在启动 worker 之前读好传进来（v2.7 修复：
+        之前这里在 worker 线程里调 self._ocr_lang() → _codes() 读下拉框，
+        以及 winfo_screenwidth()，Tk 控件不是线程安全的）。
         """
         if not ocr_win.ocr_available():
             return None
-        bounds = screen_bounds()
-        if bounds is None:
-            bounds = (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        bounds = bounds or screen_bounds() or (0, 0, 1920, 1080)
         bw, bh = self._OCR_BOX.get(scope, self._OCR_BOX["word"])
         x, y, w, h = screen_win.clamp_region(pos[0] - bw // 2, pos[1] - bh // 2, bw, bh, bounds)
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -3232,9 +3906,9 @@ class App:
         try:
             rx, ry = (pos[0] - x) * scale, (pos[1] - y) * scale
             if scope in ("line", "paragraph"):
-                lines = ocr_win.ocr_lines(tmp, lang=self._ocr_lang())
+                lines = ocr_win.ocr_lines(tmp, lang=lang)
                 return ocr_win.pick_text_at(lines, rx, ry, scope)
-            words = ocr_win.ocr_words(tmp, lang=self._ocr_lang())
+            words = ocr_win.ocr_words(tmp, lang=lang)
             return ocr_win.pick_word_at(words, rx, ry)
         finally:
             try:
@@ -3242,14 +3916,21 @@ class App:
             except Exception:
                 pass
 
-    def _hover_worker(self, pos, scope="word"):
+    def _hover_worker(self, pos, scope="word", lang=None, bounds=None):
         # 先走截图 OCR：认出光标处的单词 / 整行 / 整段。这条路不依赖软件本身
         # 是否支持选词，图片 / 游戏 / 扫描 PDF 里也能用。
+        # 2 秒缓存：指针静止时不再重复 OCR（见 HoverCache）。
         word, ibeam = None, False
-        try:
-            word = self._ocr_pick(pos, scope)
-        except Exception:
-            word = None
+        hit, cached = self._hover_cache.get(pos, scope)
+        if hit is True:
+            word = cached
+        else:
+            try:
+                word = self._ocr_pick(pos, scope, lang, bounds)
+            except Exception as e:      # noqa: BLE001  OCR 失败不报错、不弹状态，
+                word = None              # 悬停是后台静默取词，失败就退回双击取词，
+                self._hover_ocr_err = str(e)[:200]   # 原因记下来，方便查问题
+            self._hover_cache.put(pos, scope, word)
         if not word:
             try:
                 ibeam = cursor_is_ibeam_win()
@@ -3315,7 +3996,12 @@ class App:
             if rect[2] < 10 or rect[3] < 10:
                 self.status.configure(text="框选区域太小，请重新框选")
                 return
-            threading.Thread(target=self._shot_worker, args=(rect, xy), daemon=True).start()
+            # 语言/引擎/选项在 Tk 线程里读好再传进去：worker 线程里不能碰 Tk 控件。
+            sl, tl = self._codes()
+            threading.Thread(target=self._shot_worker,
+                             args=(rect, xy, self._ocr_lang(), sl, tl,
+                                   self.smart_var.get(), self.engine.get()),
+                             daemon=True).start()
 
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_motion)
@@ -3328,18 +4014,19 @@ class App:
         except Exception:
             pass
 
-    def _shot_worker(self, rect, xy):
+    def _shot_worker(self, rect, xy, lang=None, sl="auto", tl="zh-CN",
+                     smart=True, engine="Google"):
         x, y, w, h = rect
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
             tmp = os.path.join(DATA_DIR, "shot.bmp")
             time.sleep(0.15)      # 等框选层彻底消失，否则会把黑框也截进去
             if self.cfg.get("shot_mode", "overlay") == "overlay":
-                self._shot_overlay_worker(rect, xy, tmp)
+                self._shot_overlay_worker(rect, xy, tmp, lang, sl, tl, smart, engine)
                 return
             screen_win.capture_file(tmp, x, y, w, h)
             try:
-                text = ocr_win.ocr_image(tmp, lang=self._ocr_lang())
+                text = ocr_win.ocr_image(tmp, lang=lang)
             finally:
                 try:
                     os.remove(tmp)
@@ -3349,13 +4036,14 @@ class App:
         except Exception as e:
             self.q.put(("shot_ocr", False, str(e)[:300], xy))
 
-    def _shot_overlay_worker(self, rect, xy, tmp):
+    def _shot_overlay_worker(self, rect, xy, tmp, lang=None, sl="auto",
+                             tl="zh-CN", smart=True, engine="Google"):
         """截图 → OCR 行 → 按段翻译 → 交给界面线程把译文盖在截图上。"""
         x, y, w, h = rect
         cw, ch, bgra = screen_win.capture_region(x, y, w, h)
         screen_win.save_bmp(tmp, cw, ch, bgra)
         try:
-            lines = ocr_win.ocr_lines(tmp, lang=self._ocr_lang())
+            lines = ocr_win.ocr_lines(tmp, lang=lang)
         finally:
             try:
                 os.remove(tmp)
@@ -3364,8 +4052,6 @@ class App:
         if not lines:
             self.q.put(("shot_ocr", True, "", xy))        # 没认出字：走原来的提示
             return
-        sl, tl = self._codes()
-        smart, engine = self.smart_var.get(), self.engine.get()
         groups = ocr_win.group_paragraphs(lines)
         texts = [ocr_win.join_lines([lines[k]["text"] for k in idxs]) for idxs in groups]
         det_box = {"det": sl, "target": tl}
@@ -3529,12 +4215,18 @@ class App:
                 "count": len(OFFLINE.pairs())}
 
         def job():
-            checks, reco = netcheck.run_all(
-                google_fn=lambda: g_translate("hello", "en", "zh-CN", attempts=1, timeout=8)[0],
-                ms_fn=lambda: ms_translate("hello", "en", "zh-CN", attempts=1, timeout=8)[0],
-                offline_info=info,
-                on_item=lambda c: self.q.put(("net_item", run, c)),
-                cancelled=lambda: run != self.net_run)
+            try:
+                checks, reco = netcheck.run_all(
+                    google_fn=lambda: g_translate("hello", "en", "zh-CN", attempts=1, timeout=8)[0],
+                    ms_fn=lambda: ms_translate("hello", "en", "zh-CN", attempts=1, timeout=8)[0],
+                    offline_info=info,
+                    on_item=lambda c: self.q.put(("net_item", run, c)),
+                    cancelled=lambda: run != self.net_run)
+            except Exception as e:      # noqa: BLE001  检测本身崩了也不能让界面一直卡在「检测中」
+                import traceback
+                log_crash("netcheck failed:\n" + traceback.format_exc())
+                checks, reco = [], netcheck.Recommendation(
+                    None, "检测本身出错：%s" % e, "bad")
             self.q.put(("net_done", run, checks, reco))
         threading.Thread(target=job, daemon=True).start()
 
@@ -3615,7 +4307,19 @@ class App:
             history_on=self.history_on_var.get(), history_reuse=self.history_reuse_var.get(),
             history_max=self.cfg.get("history_max", 2000),
             auto_copy=self.auto_copy_var.get(), tts_rate=self.cfg.get("tts_rate", 0),
-            font_size=self.cfg.get("font_size", 11))
+            font_size=self.cfg.get("font_size", 11),
+            dark_mode=self.dark_var.get() if getattr(self, "dark_var", None) is not None
+                      else self.cfg.get("dark_mode", False),
+            glossary=self.cfg.get("glossary", []),
+            update_auto=self.update_auto_var.get() if getattr(self, "update_auto_var", None) is not None
+                        else self.cfg.get("update_auto", True),
+            update_last_check=self.cfg.get("update_last_check", ""),
+            proxy_enabled=self.cfg.get("proxy_enabled", False),
+            proxy_host=self.cfg.get("proxy_host", ""),
+            proxy_port=self.cfg.get("proxy_port", 0),
+            proxy_user=self.cfg.get("proxy_user", ""),
+            proxy_pass=self.cfg.get("proxy_pass", ""),
+            tts_voice=self.cfg.get("tts_voice", ""))
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
             tmp = CONFIG_PATH + ".tmp"
@@ -3624,6 +4328,7 @@ class App:
             os.replace(tmp, CONFIG_PATH)
         except Exception:
             pass
+        set_proxy_url(proxy_url(self.cfg))   # v2.9：保存后立刻按新配置决定走不走代理
         self._update_engine_hint()
         self._refresh_tray_state()
 
@@ -3665,7 +4370,8 @@ class App:
 
     def _set_dst_error(self, text):
         self.pairs = []
-        self.dst.configure(state="normal", foreground="#b42318")
+        th = theme_colors(bool(self.cfg.get("dark_mode", False)))
+        self.dst.configure(state="normal", foreground=th["error"])
         self.dst.delete("1.0", "end")
         self.dst.insert("1.0", text)
         self.dst.configure(state="disabled")
@@ -3675,7 +4381,8 @@ class App:
 
     def render(self):
         t = self.dst
-        t.configure(state="normal", foreground="#000000")
+        th = theme_colors(bool(self.cfg.get("dark_mode", False)))
+        t.configure(state="normal", foreground=th["text_fg"])
         t.delete("1.0", "end")
         bi = self.bi_var.get()
         for s, d in self.pairs:
@@ -3780,7 +4487,8 @@ class App:
                 self._tts_kind = None
                 self.status.configure(text="已停止朗读")
                 return True
-            ok = tts_win.speak(text, lang, rate=int(self.cfg.get("tts_rate", 0)))
+            ok = tts_win.speak(text, lang, rate=int(self.cfg.get("tts_rate", 0)),
+                               voice=self.cfg.get("tts_voice") or None)
         except Exception:
             ok = False
         if ok:
@@ -3867,16 +4575,45 @@ class App:
     def _translate_doc_file(self):
         path = filedialog.askopenfilename(
             title="选择要翻译的文档",
-            filetypes=[("文档", "*.txt *.md *.srt"), ("文本", "*.txt"),
-                       ("Markdown", "*.md"), ("字幕", "*.srt")])
+            filetypes=[("文档", "*.txt *.md *.srt *.docx *.pdf"), ("文本", "*.txt"),
+                       ("Markdown", "*.md"), ("字幕", "*.srt"),
+                       ("Word 文档", "*.docx"), ("PDF", "*.pdf")])
         if not path:
             return
-        if not doc_translate.supported_doc_ext(path):
-            self.status.configure(text="只支持 .txt / .md / .srt 文档")
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".pdf":
+            # v2.8 PDF：标准库提取正文，输出是 -译文.txt（不写回 PDF）。
+            try:
+                text = pdf_translate.extract_pdf_text(path)
+            except Exception as e:      # noqa: BLE001
+                self.status.configure(text="打不开文档：%s" % e)
+                return
+            if len(text.strip()) < pdf_translate.PDF_TRANSLATE_MIN_CHARS:
+                self.status.configure(
+                    text="这个 PDF 几乎没有可提取的文字，可能是扫描件 / 图片型 PDF，请改用截图翻译（框选后识别）")
+                return
+            self._doc_bytes = None
+            self._doc_path = path
+            self.status.configure(text="正在翻译文档…")
+            sl, tl = self._codes()
+            threading.Thread(target=self._doc_worker,
+                             args=(path, text, sl, tl, self.engine.get(),
+                                   self.smart_var.get(), self.reflow_var.get(), None),
+                             daemon=True).start()
             return
+        if not doc_translate.supported_doc_ext(path):
+            self.status.configure(text="只支持 .txt / .md / .srt / .docx / .pdf 文档")
+            return
+        self._doc_bytes = None
         try:
-            with open(path, "r", encoding="utf-8-sig") as f:
-                text = f.read()
+            if ext == ".docx":
+                with open(path, "rb") as f:
+                    self._doc_bytes = f.read()
+                text = "\n\n".join(doc_translate.docx_paragraph_texts(
+                    doc_translate.docx_document_xml(self._doc_bytes)))
+            else:
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    text = f.read()
         except Exception as e:
             self.status.configure(text="打不开文档：%s" % e)
             return
@@ -3889,13 +4626,40 @@ class App:
         sl, tl = self._codes()
         threading.Thread(target=self._doc_worker,
                          args=(path, text, sl, tl, self.engine.get(),
-                               self.smart_var.get(), self.reflow_var.get()),
+                               self.smart_var.get(), self.reflow_var.get(),
+                               self._doc_bytes),
                          daemon=True).start()
 
-    def _doc_worker(self, path, text, sl, tl, engine, smart, reflow):
-        """文档翻译（后台线程）：.srt 只翻正文，.txt/.md 按段落翻整篇。"""
+    def _doc_worker(self, path, text, sl, tl, engine, smart, reflow, data=None):
+        """文档翻译（后台线程）：.srt 只翻正文，.txt/.md/.pdf 按段落翻整篇，
+        .docx 按段落翻并重建文件。"""
         ext = os.path.splitext(path)[1].lower()
         try:
+            if ext == ".docx":
+                if data is None:
+                    raise ValueError("没有读到 .docx 文件内容")
+                texts = doc_translate.docx_paragraph_texts(
+                    doc_translate.docx_document_xml(data))
+                if not any(t.strip() for t in texts):
+                    self.q.put(("doc_done", False, "文档里没有可翻译的文字"))
+                    return
+                first_i = next(i for i, t in enumerate(texts) if t.strip())
+                first, det, target = translate(texts[first_i], sl, tl, smart, engine,
+                                               cancelled=lambda: False)
+                outs = [""] * len(texts)
+                outs[first_i] = first
+                for i, t in enumerate(texts):
+                    if not t.strip() or i == first_i:
+                        continue
+                    self.q.put(("doc_prog", i + 1, len(texts)))
+                    outs[i] = translate_unit(t, det, target, engine,
+                                             cancelled=lambda: False)
+                pairs = [(t, o) for t, o in zip(texts, outs) if t.strip()]
+                out_text = "\n".join(o for o in outs if o)
+                out_bytes = doc_translate.docx_rebuild(data, outs)
+                self.q.put(("doc_done", True, (out_text, det, target, text, pairs, sl, tl,
+                                               out_bytes)))
+                return
             if ext == ".srt":
                 blocks = doc_translate.srt_parse(text)
                 if not blocks:
@@ -3927,7 +4691,8 @@ class App:
         if not ok:
             self.status.configure(text="文档翻译失败：%s" % payload)
             return
-        out_text, det, target, src_text, pairs, sl, tl = payload
+        out_bytes = payload[7] if len(payload) > 7 else None
+        out_text, det, target, src_text, pairs, sl, tl = payload[:7]
         path = getattr(self, "_doc_path", "")
         # 译文载入主窗口（前部）+ 存历史（kind="doc"，原文/译文各存前 2000 字，
         # 免得整篇大文档把 history.db 撑大）。
@@ -3941,18 +4706,24 @@ class App:
                          self.engine.get(), "doc", sl, tl)
         self._hist_update_info()
         # 保存路径：默认原文旁加 -译文 后缀；用户取消也不丢结果（已在主窗口里）。
+        # PDF 的译文是纯文本，保存成 -译文.txt（不写回 PDF）。
         saved = ""
         if path:
             base, ext = os.path.splitext(path)
+            save_ext = ".txt" if ext.lower() == ".pdf" else ext
             save = filedialog.asksaveasfilename(
                 title="保存译文", initialdir=os.path.dirname(path) or ".",
-                initialfile=os.path.basename(base + "-译文" + ext),
-                defaultextension=ext,
-                filetypes=[("文档", "*" + ext), ("所有文件", "*.*")])
+                initialfile=os.path.basename(base + "-译文" + save_ext),
+                defaultextension=save_ext,
+                filetypes=[("文档", "*" + save_ext), ("所有文件", "*.*")])
             if save:
                 try:
-                    with open(save, "w", encoding="utf-8") as f:
-                        f.write(out_text)
+                    if out_bytes is not None:
+                        with open(save, "wb") as f:
+                            f.write(out_bytes)
+                    else:
+                        with open(save, "w", encoding="utf-8") as f:
+                            f.write(out_text)
                     saved = save
                 except Exception as e:      # noqa: BLE001
                     self.status.configure(text="文档已翻好，但保存失败：%s" % e)
@@ -4004,6 +4775,52 @@ class App:
         self._set_src(text[:MAX_LEN])
         self.show_window()
         self.translate_now()
+
+    # ---- v2.8 粘贴图片翻译：剪贴板图片 → 临时 BMP → 系统 OCR → 翻译 ----
+    def _translate_clipboard_image(self):
+        if not IS_WIN:
+            self.status.configure(text="粘贴图片翻译只在 Windows 上可用（需要系统 OCR）")
+            return
+        if not ocr_win.ocr_available():
+            self.status.configure(text="粘贴图片翻译需要 Windows 系统 OCR（winocr.ps1 缺失或没有 PowerShell 5.1）")
+            return
+        try:
+            dib = clip_image.get_clipboard_dib()
+        except Exception:      # noqa: BLE001
+            dib = None
+        if not dib:
+            self.status.configure(text="剪贴板里没有图片")
+            return
+        try:
+            bmp = clip_image.dib_to_bmp(dib)
+        except Exception as e:      # noqa: BLE001
+            self.status.configure(text="剪贴板里的图片读不出来：%s" % e)
+            return
+        try:
+            fd, tmp = tempfile.mkstemp(suffix=".bmp", prefix="rt_clip_")
+            with os.fdopen(fd, "wb") as f:
+                f.write(bmp)
+        except Exception as e:      # noqa: BLE001
+            self.status.configure(text="写临时图片失败：%s" % e)
+            return
+        self.status.configure(text="正在识别剪贴板图片文字…")
+        # OCR 语言在 Tk 线程里读好再传进去：worker 线程里不能碰 Tk 控件。
+        threading.Thread(target=self._clip_image_worker, args=(tmp, self._ocr_lang()),
+                         daemon=True).start()
+
+    def _clip_image_worker(self, path, lang):
+        """剪贴板图片 OCR（后台线程）：认完删临时文件，结果走 image_ocr 复用图片翻译的后续。"""
+        try:
+            text = ocr_win.ocr_image(path, lang=lang)
+        except Exception as e:      # noqa: BLE001
+            self.q.put(("image_ocr", False, str(e)[:300], path))
+        else:
+            self.q.put(("image_ocr", True, (text or "").strip(), path))
+        finally:
+            try:
+                os.remove(path)
+            except Exception:      # noqa: BLE001
+                pass
 
     # ---- v2.6 语音输入（Windows 自带语音识别，15 秒超时） ----
     def _stt_lang(self):
@@ -4223,8 +5040,10 @@ class App:
     def _start_hotkey(self):
         main_l, pointer_l, shot_l = self.hotkey_main_label, self.hotkey_pointer_label, self.hotkey_shot_label
         replace_l = self.hotkey_replace_label
-        ok_text = ("选中文字后按 %s 翻译；指针放在文字上按 %s 就地取词；按 %s 截图翻译；按 %s 翻译并替换原文；Esc 隐藏到托盘"
-                   % (main_l, pointer_l, shot_l, replace_l)) if IS_WIN else \
+        clip_l = self.hotkey_clip_label
+        ok_text = ("选中文字后按 %s 翻译；指针放在文字上按 %s 就地取词；按 %s 截图翻译；按 %s 翻译并替换原文；"
+                   "按 %s 翻译剪贴板里的图片；Esc 隐藏到托盘"
+                   % (main_l, pointer_l, shot_l, replace_l, clip_l)) if IS_WIN else \
                   ("选中文字后按 %s 翻译，或按 %s 在指针旁显示译文；Esc 隐藏窗口" % (main_l, pointer_l))
         if IS_WIN:
             try:
@@ -4233,6 +5052,7 @@ class App:
                 pok = getattr(start_hotkey_win, "pointer_ok", False)
                 sok = getattr(start_hotkey_win, "shot_ok", False)
                 rok = getattr(start_hotkey_win, "replace_ok", False)
+                cok = getattr(start_hotkey_win, "clip_ok", False)
                 missing = []
                 if not ok:
                     missing.append(main_l)
@@ -4242,6 +5062,8 @@ class App:
                     missing.append(shot_l)
                 if not rok:
                     missing.append(replace_l)
+                if not cok:
+                    missing.append(clip_l)
                 if not missing:
                     self.hint.configure(text=ok_text)
                 else:
@@ -4257,7 +5079,8 @@ class App:
             self.hk = keyboard.GlobalHotKeys({pynput_spec(specs["hotkey_main"]): lambda: self.q.put(("hotkey", 1)),
                                               pynput_spec(specs["hotkey_pointer"]): lambda: self.q.put(("hotkey", 2)),
                                               pynput_spec(specs["hotkey_shot"]): lambda: self.q.put(("hotkey", 3)),
-                                              pynput_spec(specs["hotkey_replace"]): lambda: self.q.put(("hotkey", 4))})
+                                              pynput_spec(specs["hotkey_replace"]): lambda: self.q.put(("hotkey", 4)),
+                                              pynput_spec(specs["hotkey_clip"]): lambda: self.q.put(("hotkey", 5))})
             self.hk.daemon = True
             self.hk.start()
             self.hint.configure(text=ok_text)
@@ -4271,6 +5094,9 @@ class App:
         if which == 4:
             self._on_replace_hotkey()
             return
+        if which == 5:
+            self._translate_clipboard_image()
+            return
         if self.grabbing:
             return
         pointer = (which == 2)
@@ -4282,6 +5108,11 @@ class App:
             self.grab_xy = self.root.winfo_pointerxy()
             self.grab_scope = SCOPE_CODES.get(self.scope_cb.get(), "word")
             self.grab_plan = []
+        # OCR 语言/屏幕范围在 Tk 线程里读好：_pointer_grab_win 在 worker 线程里，
+        # 不能碰 Tk 控件（v2.7 修复，见 _ocr_pick）。
+        self._grab_ocr_lang = self._ocr_lang()
+        self._grab_bounds = screen_bounds() or (0, 0, self.root.winfo_screenwidth(),
+                                                self.root.winfo_screenheight())
         self.grabbing = True
         self.old_clip = self._get_clip()
         self.root.clipboard_clear()
@@ -4299,7 +5130,10 @@ class App:
             # 整行 / 整段：先用截图 OCR 取，不依赖软件支持选词、也不会点击任何东西；
             # OCR 没取到才退回三击选中。
             try:
-                self._pointer_text = self._ocr_pick(self.grab_xy, self.grab_scope)
+                self._pointer_text = self._ocr_pick(
+                    self.grab_xy, self.grab_scope,
+                    getattr(self, "_grab_ocr_lang", None),
+                    getattr(self, "_grab_bounds", None))
             except Exception:
                 self._pointer_text = None
             if self._pointer_text:
@@ -4319,7 +5153,10 @@ class App:
             # 按钮、菜单、标签这类「选不中」的文字：光标不是「I」形，复制不到任何东西 ——
             # 改用截屏 OCR 取指针处的单词（不点击，不会误触按钮）。
             try:
-                self._pointer_text = self._ocr_pick(self.grab_xy, self.grab_scope)
+                self._pointer_text = self._ocr_pick(
+                    self.grab_xy, self.grab_scope,
+                    getattr(self, "_grab_ocr_lang", None),
+                    getattr(self, "_grab_bounds", None))
             except Exception:
                 self._pointer_text = None
 
@@ -4434,6 +5271,8 @@ class App:
                     self._on_image_ocr(msg[1], msg[2], msg[3])
                 elif kind == "stt_done":
                     self._on_stt_done(msg[1], msg[2])
+                elif kind == "update_result":
+                    self._on_update_result(msg[1], msg[2], msg[3])
                 elif kind == "hover_ocr":
                     _, word, xy, ibeam = msg
                     if word:
@@ -4445,6 +5284,10 @@ class App:
                         self.grab_scope = SCOPE_CODES.get(self.scope_cb.get(), "word")
                         self.grab_plan = []
                         self._no_ocr = True         # 刚 OCR 过没取到，别再 OCR 一遍
+                        self._grab_ocr_lang = self._ocr_lang()
+                        self._grab_bounds = screen_bounds() or (
+                            0, 0, self.root.winfo_screenwidth(),
+                            self.root.winfo_screenheight())
                         self.grabbing = True
                         self.old_clip = self._get_clip()
                         self.root.clipboard_clear()
@@ -4480,8 +5323,12 @@ class App:
                             warn += " · 来自历史记录"
                         else:
                             self._hist_save_main(my, det, target, "离线" if fb else eng)
+                        # v2.8：状态栏末尾加原文 / 译文字数
+                        counts = format_status_counts(sum(len(s) for s, _ in pairs),
+                                                      sum(len(d) for _, d in pairs))
                         self.status.configure(
-                            text="%s → %s%s · %s%s" % (lang_name(det), lang_name(target), extra, eng, warn))
+                            text="%s → %s%s · %s%s · %s" % (lang_name(det), lang_name(target), extra, eng, warn,
+                                                            counts))
                         # v2.5 自动复制：只对主窗口的翻译生效（_req[4] == "main"）。
                         # 气泡 / 小窗口 / 悬停 / 截图不走这里（它们的 kind 是 pointer/hover/shot，
                         # 或直接走 _bubble_worker），所以不会误复制。last_clip 是护栏：
@@ -4555,7 +5402,11 @@ def main():
     if "--selftest" in sys.argv:
         sys.exit(run_selftest())
     enable_dpi_awareness()
-    if not acquire_single_instance():
+    # v2.8 单实例：Windows 用命名互斥体，非 Windows 用文件锁；已有实例在跑
+    # 就唤起它的主窗口并退出。检查本身绝不能阻止启动（single_instance 内部 fail-open）。
+    # _single 必须留在 main 的局部变量里：App().run() 期间它一直活着，锁才一直占着。
+    _single = single_instance.ensure_single_instance()
+    if _single is None:
         return
     try:
         App().run()

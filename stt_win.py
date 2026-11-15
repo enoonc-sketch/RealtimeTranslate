@@ -82,6 +82,29 @@ try {
 """
 
 
+def _no_window_kwargs():
+    """起子进程时不弹黑窗：CREATE_NO_WINDOW + STARTUPINFO 藏窗口，双保险。
+
+    只有 CREATE_NO_WINDOW 时个别机器仍会闪黑窗（2.6.0 修完用户真机仍报），
+    再补 STARTUPINFO（STARTF_USESHOWWINDOW + SW_HIDE）压住。
+    非 Windows 返回 {}；Linux 上没有 subprocess.STARTUPINFO 时只给
+    creationflags（POSIX 下这两个参数都被忽略，不影响运行）。
+    """
+    if not IS_WIN:
+        return {}
+    kw = {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+    try:
+        si_cls = getattr(subprocess, "STARTUPINFO", None)
+        if si_cls is not None:
+            si = si_cls()
+            si.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+            si.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+            kw["startupinfo"] = si
+    except Exception:
+        pass
+    return kw
+
+
 def build_command(out_file, script_file, lang_code, timeout=DEFAULT_TIMEOUT):
     """拼出识别命令（纯函数，便于测试）：命令里只有两个临时文件路径、
     culture、超时秒数。非 Windows 返回 None。"""
@@ -118,8 +141,7 @@ def recognize(lang_code, timeout=DEFAULT_TIMEOUT):
         if cmd is None:
             return "unavailable", ""
         kwargs = {"capture_output": True, "timeout": timeout + 10}
-        if IS_WIN:
-            kwargs["creationflags"] = 0x08000000       # CREATE_NO_WINDOW：不弹黑窗
+        kwargs.update(_no_window_kwargs())       # 不弹黑窗（双保险，见 _no_window_kwargs）
         try:
             proc = subprocess.run(cmd, **kwargs)
         except subprocess.TimeoutExpired:

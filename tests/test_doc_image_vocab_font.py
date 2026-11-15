@@ -85,11 +85,57 @@ try:
 finally:
     dt.filedialog = real_fd
 
-# ---- 3. 不支持的文档扩展名 ----
-dt.filedialog.askopenfilename = lambda *a, **k: os.path.join(tmp, "x.docx")
+# ---- 3. v2.7：.docx 现在支持（走通一次）；v2.8：.pdf 也支持（输出 -译文.txt） ----
+import zipfile
+docx_path = os.path.join(tmp, "x.docx")
+with zipfile.ZipFile(docx_path, "w") as z:
+    z.writestr("word/document.xml", b'<w:document xmlns:w="urn:docx"><w:body><w:p><w:r><w:t>Hello world</w:t></w:r></w:p><w:p><w:r><w:t>Good morning</w:t></w:r></w:p></w:body></w:document>')
+    z.writestr("[Content_Types].xml", b"<Types/>")
+docx_out = os.path.join(tmp, "x-\u8bd1\u6587.docx")
+dt.filedialog.askopenfilename = lambda *a, **k: docx_path
+dt.filedialog.asksaveasfilename = lambda *a, **k: docx_out
 try:
     app._translate_doc_file()
-    ok("docx rejected with status", "只支持 .txt / .md / .srt" in app.status.cget("text"))
+    ok("doc docx finishes", pump(5, lambda: os.path.exists(docx_out)))
+    import doc_translate as _d
+    with zipfile.ZipFile(docx_out) as z:
+        _texts = _d.docx_paragraph_texts(z.read("word/document.xml"))
+    ok("doc docx translates paragraphs", _texts == ["\u8bd1:Hello world", "\u8bd1:Good morning"])
+finally:
+    dt.filedialog = real_fd
+
+# v2.8 PDF：一页带 Tj 文字 → 翻成 -译文.txt；一页没文字 → 提示改用截图翻译
+def _mini_pdf(body):
+    stream = b"BT /F1 12 Tf 72 720 Td " + body + b" Tj ET\n"
+    head = (b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+            b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R"
+            b"/Resources<</Font<</F1 5 0 R>>>>>>endobj\n")
+    tail = (b"endstream\nendobj\n"
+            b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"
+            b"trailer<</Root 1 0 R>>\n%%EOF\n")
+    return head + b"4 0 obj<</Length %d>>stream\n" % len(stream) + stream + tail
+
+
+pdf_path = os.path.join(tmp, "x.pdf")
+open(pdf_path, "wb").write(_mini_pdf(b"(Hello PDF world)"))
+pdf_out = os.path.join(tmp, "x-\u8bd1\u6587.txt")
+dt.filedialog.askopenfilename = lambda *a, **k: pdf_path
+dt.filedialog.asksaveasfilename = lambda *a, **k: pdf_out
+try:
+    app._translate_doc_file()
+    ok("doc pdf finishes as txt", pump(5, lambda: os.path.exists(pdf_out)))
+    ok("doc pdf translates text",
+       open(pdf_out, encoding="utf-8").read() == "\u8bd1:Hello PDF world")
+finally:
+    dt.filedialog = real_fd
+empty_pdf = os.path.join(tmp, "empty.pdf")
+open(empty_pdf, "wb").write(_mini_pdf(b""))
+dt.filedialog.askopenfilename = lambda *a, **k: empty_pdf
+try:
+    app._translate_doc_file()
+    ok("pdf with no text points at screenshot translation",
+       "\u622a\u56fe\u7ffb\u8bd1" in app.status.cget("text"))
 finally:
     dt.filedialog = real_fd
 

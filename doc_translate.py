@@ -1,6 +1,6 @@
 """文档翻译 — 纯函数，不碰界面、不碰网络、不碰 Windows。
 
-支持 .txt / .md / .srt：
+支持 .txt / .md / .srt / .docx：
 - .txt / .md：按段落（连续的非空行）分块翻译，空行与段落结构原样保留
   （.md 的标题、列表行按段落走，不解析 Markdown 语法，只保证翻完
   结构不变、标记符号不丢）。
@@ -12,17 +12,21 @@
 Pot 是 GPL-3.0，本项目只借鉴功能清单）。
 """
 
+import io
 import os
 import re
+import zipfile
+from xml.sax.saxutils import escape as _xml_escape
+from xml.sax.saxutils import unescape as _xml_unescape
 
-SUPPORTED_DOC_EXTS = {".txt", ".md", ".srt"}
+SUPPORTED_DOC_EXTS = {".txt", ".md", ".srt", ".docx"}
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 _TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}( .*)?$")
 
 
 def supported_doc_ext(path):
-    """是不是支持的文档扩展名（.txt / .md / .srt，不区分大小写）。"""
+    """是不是支持的文档扩展名（.txt / .md / .srt / .docx，不区分大小写）。"""
     return os.path.splitext(str(path or ""))[1].lower() in SUPPORTED_DOC_EXTS
 
 
@@ -151,3 +155,115 @@ def srt_translate(text, fn, progress=None):
         if progress:
             progress(i + 1, len(blocks))
     return srt_rebuild(blocks)
+
+
+# ---------------------------------------------------------------- DOCX
+# 只用标准库 zipfile：.docx 就是个 zip，word/document.xml 里是正文。
+# 不用 ElementTree 重写整份 XML（它会改命名空间前缀、丢掉一些细节）：
+# 直接在原始 XML 文本上按段落替换 <w:t> 的内容，其余字节原样保留，
+# 所以样式、图片、页眉页脚、其他部件都不会动。
+_P_RE = re.compile(r"<w:p\b.*?</w:p>", re.DOTALL)
+_T_RE = re.compile(r"(<w:t[^>]*>)(.*?)(</w:t>)", re.DOTALL)
+
+
+def docx_paragraph_texts(xml_bytes):
+    """从 word/document.xml 的原始字节里读出每段的文字（按段落顺序）。
+
+    一段 = 一个 <w:p>…</w:p>；段内所有 <w:t> 的文字拼起来就是段落文字。
+    空段落也保留（返回空串），段数与原文一致。
+    """
+    xml = (xml_bytes or b"").decode("utf-8", errors="replace")
+    texts = []
+    for m in _P_RE.finditer(xml):
+        parts = [_xml_unescape(t) for _, t, _ in _T_RE.findall(m.group(0))]
+        texts.append("".join(parts))
+    return texts
+
+
+def docx_replace_texts(xml_bytes, new_texts):
+    """把每段的译文写回 word/document.xml：译文放进该段第一个 <w:t>，
+    其余 <w:t> 清空；段落之外的所有字节原样保留。
+
+    new_texts 与 docx_paragraph_texts 的段数必须一致，否则抛 ValueError。
+    """
+    xml = (xml_bytes or b"").decode("utf-8", errors="replace")
+    paras = list(_P_RE.finditer(xml))
+    if len(new_texts) != len(paras):
+        raise ValueError("段落数对不上：原文 %d 段，译文 %d 段"
+                         % (len(paras), len(new_texts)))
+    out, pos = [], 0
+    for m, new in zip(paras, new_texts):
+        out.append(xml[pos:m.start()])
+        block = m.group(0)
+        # 第一个 <w:t> 放译文，其余清空
+        state = {"first": True}
+        def _repl(mm):
+            if state["first"]:
+                state["first"] = False
+                return mm.group(1) + _xml_escape(new) + mm.group(3)
+            return mm.group(1) + mm.group(3)
+        out.append(_T_RE.sub(_repl, block))
+        pos = m.end()
+    out.append(xml[pos:])
+    return "".join(out).encode("utf-8")
+
+
+def docx_translate_bytes(data, fn, progress=None):
+    """翻译整个 .docx 文件（字节进、字节出）：fn(段落文字) -> 译文。
+
+    空段落不翻译、原样保留；其他 zip 条目（样式、图片、页眉页脚等）
+    按原压缩方式原样复制。不是合法的 .docx（解不开 zip / 没有
+    word/document.xml）时抛 ValueError / zipfile.BadZipFile。
+    """
+    try:
+        zin = zipfile.ZipFile(io.BytesIO(data or b""))
+    except zipfile.BadZipFile:
+        raise ValueError("不是合法的 .docx 文件（解不开 zip）")
+    try:
+        names = zin.namelist()
+        if "word/document.xml" not in names:
+            raise ValueError("不是合法的 .docx 文件（缺少 word/document.xml）")
+        xml = zin.read("word/document.xml")
+        texts = docx_paragraph_texts(xml)
+        done = []
+        for i, t in enumerate(texts):
+            done.append(t if not t.strip() else fn(t))
+            if progress:
+                progress(i + 1, len(texts))
+        return docx_rebuild(data, done)
+    finally:
+        zin.close()
+
+
+def docx_document_xml(data):
+    """从 .docx 字节里取出 word/document.xml 的原始字节。"""
+    try:
+        zin = zipfile.ZipFile(io.BytesIO(data or b""))
+    except zipfile.BadZipFile:
+        raise ValueError("不是合法的 .docx 文件（解不开 zip）")
+    try:
+        if "word/document.xml" not in zin.namelist():
+            raise ValueError("不是合法的 .docx 文件（缺少 word/document.xml）")
+        return zin.read("word/document.xml")
+    finally:
+        zin.close()
+
+
+def docx_rebuild(data, translated):
+    """按 translated（与 docx_paragraph_texts 一一对应）重建整个 .docx。
+
+    其他 zip 条目按原压缩方式原样复制。
+    """
+    zin = zipfile.ZipFile(io.BytesIO(data or b""))
+    try:
+        xml = zin.read("word/document.xml")
+        new_xml = docx_replace_texts(xml, translated)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                payload = new_xml if item.filename == "word/document.xml" \
+                    else zin.read(item.filename)
+                zout.writestr(item, payload)
+        return buf.getvalue()
+    finally:
+        zin.close()
