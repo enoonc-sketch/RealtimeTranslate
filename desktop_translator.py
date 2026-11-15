@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-实时翻译 — 桌面独立版 v2.7，Windows / macOS / Linux(X11)
+实时翻译 — 桌面独立版 v2.10，Windows / macOS / Linux(X11)
 
 功能
   1. 输入即译：窗口里打字或粘贴，停顿约 0.35 秒自动翻译
@@ -47,6 +47,10 @@
      跑就唤起它）、设置导出 / 导入（JSON，导入前先全量校验）、PDF 翻译
      （标准库提取正文，输出是 -译文.txt；扫描版 PDF 请用截图翻译）、
      状态栏显示原文 / 译文字数
+ 17. v2.10：整窗翻译（Ctrl+Alt+W，指针下的整个菜单 / 窗口一次翻完）、
+     「点 ×」可选最小化到任务栏、点「–」可选收进托盘、卸载时询问是否删除数据库、
+     大文件卡死修复（后台读取 / 解析、可取消、线性合并断行、译文框只显示前一部分、
+     PDF 防压缩炸弹、文件大小上限）
 """
 import base64
 import collections
@@ -83,6 +87,7 @@ import clip_image
 import settings_io
 import single_instance
 import tempfile
+import zlib
 
 try:
     import tts_win
@@ -114,11 +119,13 @@ REPLACE_LABEL = "Ctrl+Alt+R"
 PYNPUT_REPLACE = "<ctrl>+<alt>+r"
 CLIP_LABEL = "Ctrl+Shift+V"
 PYNPUT_CLIP = "<ctrl>+<shift>+v"
+WINDOW_LABEL = "Ctrl+Alt+W"           # v2.10 整窗翻译
 # 默认全局快捷键（配置键名 → 默认组合；用户可在高级设置里改，保存后重启生效）
 DEFAULT_HOTKEYS = {"hotkey_main": "ctrl+alt+t", "hotkey_pointer": "ctrl+alt+d",
                    "hotkey_shot": "ctrl+alt+s", "hotkey_replace": "ctrl+alt+r",
-                   "hotkey_clip": "ctrl+shift+v"}
-HOTKEY_KEYS = ("hotkey_main", "hotkey_pointer", "hotkey_shot", "hotkey_replace", "hotkey_clip")
+                   "hotkey_clip": "ctrl+shift+v", "hotkey_window": "ctrl+alt+w"}
+HOTKEY_KEYS = ("hotkey_main", "hotkey_pointer", "hotkey_shot", "hotkey_replace", "hotkey_clip",
+               "hotkey_window")
 # Windows RegisterHotKey 的修饰键位（和 start_hotkey_win 里的常量一致）
 _MOD_BITS = {"ctrl": 0x2, "alt": 0x1, "shift": 0x4, "win": 0x8}
 _MOD_NAMES = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win"}
@@ -193,9 +200,9 @@ def pynput_spec(spec):
 
 
 def validate_hotkey_cfg(cfg):
-    """校验配置里的五个快捷键：非法或重复的逐个回落到默认值，绝不抛异常。
+    """校验配置里的六个快捷键：非法或重复的逐个回落到默认值，绝不抛异常。
 
-    返回新的 dict（只含 HOTKEY_KEYS 里的五个键）。
+    返回新的 dict（只含 HOTKEY_KEYS 里的六个键）。
     重复按主窗口 → 指针取词 → 截图翻译 → 翻译并替换 → 粘贴图片翻译的顺序判定：
     先出现的保留，后出现的回默认。
     """
@@ -221,9 +228,11 @@ POPUP_CODES = {v: k for k, v in POPUP_NAMES.items()}
 SHOT_NAMES = {"overlay": "盖在截图上", "main": "显示在主窗口"}                                  # 截图翻译结果怎么显示
 SHOT_CODES = {v: k for k, v in SHOT_NAMES.items()}
 MINI_SIZE = {"mini_w": (160, 800, 320), "mini_h": (60, 500, 110)}   # 小窗口宽 / 高：(最小, 最大, 默认)
-CLOSE_NAMES = {"tray": "隐藏到托盘", "quit": "直接退出"}      # 点窗口 × 时
+CLOSE_NAMES = {"tray": "隐藏到托盘", "taskbar": "最小化到任务栏", "quit": "直接退出"}      # 点窗口 × 时（v2.10 加「最小化到任务栏」）
 CLOSE_CODES = {v: k for k, v in CLOSE_NAMES.items()}
-__version__ = "2.9.0"
+MINIMIZE_NAMES = {"taskbar": "留在任务栏", "tray": "收进托盘"}        # 点窗口 – 最小化时（v2.10）
+MINIMIZE_CODES = {v: k for k, v in MINIMIZE_NAMES.items()}
+__version__ = "2.11.0"
 APP_TITLE = "实时翻译"
 RUN_VALUE = "RealtimeTranslate"
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -310,13 +319,15 @@ DEFAULTS = {
     "engine": "Google", "auto_offline": True,
     "pointer": True, "pointer_scope": "word", "pack_mirror": "",
     "hover": True, "hover_ms": 800,
-    "close_action": "tray", "tray_tip": True,
+    "close_action": "tray", "tray_tip": True, "minimize_action": "taskbar",
+    "hover_window": False, "live_interval": 3,      # v2.11：悬停整窗翻译、实时刷新间隔（秒）
     "history_on": True, "history_max": 2000, "history_reuse": False,
     "popup_mode": "bubble", "mini_w": 320, "mini_h": 110, "shot_mode": "overlay",
     # v2.5：朗读语速（-10~10，默认 0）、自动复制译文（默认关）、自定义全局快捷键
     "tts_rate": 0, "auto_copy": False,
     "hotkey_main": "ctrl+alt+t", "hotkey_pointer": "ctrl+alt+d", "hotkey_shot": "ctrl+alt+s",
     "hotkey_replace": "ctrl+alt+r", "hotkey_clip": "ctrl+shift+v",
+    "hotkey_window": "ctrl+alt+w",      # v2.10：整窗翻译
     # v2.6：界面字号（10~18，默认 11）
     "font_size": 11,
     # v2.7：深色外观（默认浅色）、术语表（默认空）、每天自动检查更新（默认开）、上次检查日期
@@ -803,10 +814,12 @@ def split_long(s, limit=CHUNK):
         out.append(cur)
     final = []
     for o in out:
-        while len(o) > limit:
-            final.append(o[:limit])
-            o = o[limit:]
-        final.append(o)
+        if len(o) > limit:
+            # v2.10：按下标切，不再 o = o[limit:] 反复复制剩余部分（超长单行 O(n²)，会卡死）
+            for i in range(0, len(o), limit):
+                final.append(o[i:i + limit])
+        else:
+            final.append(o)
     return final
 
 
@@ -857,25 +870,115 @@ def _cjk(c):
     return "\u3400" <= c <= "\u9fff"
 
 
+REFLOW_MAX = 1500        # 合并断行后一段最长多少字：再长就另起一段（v2.10）
+
+
 def to_units(text, reflow):
-    """拆成行；reflow 时把被硬换行打断的句子合并（保留标题、列表、空行）。"""
+    """拆成行；reflow 时把被硬换行打断的句子合并（保留标题、列表、空行）。
+
+    v2.10：合并时用列表攒、最后一次性 join（以前每并一行就复制一遍整段，
+    一个没有句号的大文件会退化成 O(n²) 并合并成一整块，卡死）；
+    并给合并后的段长封顶（REFLOW_MAX），超过就另起一段。
+    """
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     out = []
+    cur, cur_len, last = None, 0, ""
+
+    def close():
+        nonlocal cur
+        if cur is not None:
+            out.append("".join(cur))
+            cur = None
+
     for ln in lines:
         s = ln.strip()
         if not s:
+            close()
             if out and out[-1] != "":
                 out.append("")
             continue
-        if (reflow and out and out[-1] and len(out[-1]) >= 45
-                and not out[-1].endswith(_END) and not _BULLET.match(s)):
-            glue = "" if (_cjk(out[-1][-1]) and _cjk(s[0])) else " "
-            out[-1] = out[-1] + glue + s
+        if (reflow and cur is not None and cur_len >= 45 and cur_len < REFLOW_MAX
+                and last not in _END and not _BULLET.match(s)):
+            glue = "" if (_cjk(last) and _cjk(s[0])) else " "
+            cur.append(glue)
+            cur.append(s)
+            cur_len += len(glue) + len(s)
+            last = s[-1]
         else:
-            out.append(s)
+            close()
+            cur, cur_len, last = [s], len(s), s[-1]
+    close()
     while out and out[-1] == "":
         out.pop()
     return out
+
+
+DOC_BATCH = 64           # 文档翻译每批提交多少段给线程池
+DOC_CONFIRM_SECS = 60    # 预估超过这么多秒（或下面的段数）就先问一句再翻（v2.11）
+DOC_CONFIRM_SEGS = 2000
+_SEC_PER_REQ_ONLINE = 0.5     # 在线引擎每个请求的经验耗时（秒），WORKERS 个并发
+_SEC_PER_REQ_OFFLINE = 1.2    # 离线引擎每段的经验耗时（秒），按串行算
+
+
+def estimate_doc_seconds(segs, chars, engine):
+    """文档翻译预估耗时（秒，纯函数）：请求数 ≈ 段数 + 每 CHUNK 字多一个请求。
+    只是量级估计：网速、引擎限流、CPU 都会影响，界面上写的是「约」。"""
+    reqs = max(0, int(segs)) + max(0, int(chars)) // CHUNK
+    if engine == "离线":
+        return reqs * _SEC_PER_REQ_OFFLINE
+    return reqs * _SEC_PER_REQ_ONLINE / WORKERS
+
+
+def fmt_duration(sec):
+    sec = max(0, int(sec))
+    if sec < 60:
+        return "约 %d 秒" % max(1, sec)
+    if sec < 3600:
+        return "约 %d 分钟" % math.ceil(sec / 60.0)
+    return "约 %.1f 小时" % (sec / 3600.0)
+
+
+
+def translate_many(texts, sl, tl, engine, progress=None, cancelled=None):
+    """并发翻译一批文本，按原顺序返回译文列表（v2.10）。
+
+    和旧的 ThreadPoolExecutor.map 相比：
+    - 分批提交（DOC_BATCH 段一批），不再一次把几万个任务塞进线程池；
+    - 任何一段失败 / 用户取消，其余排队的任务立刻快速退出，
+      不会再傻等剩下每一段各自超时重试（那就是「点了没反应、像死机」）；
+    - 优先把真正的错误（而不是「cancelled」）抛给调用方。
+    """
+    n = len(texts)
+    results = [None] * n
+    if not n:
+        return results
+    abort = threading.Event()
+    counter = itertools.count(1)
+
+    def work(i):
+        if abort.is_set() or (cancelled and cancelled()):
+            raise RuntimeError("cancelled")
+        try:
+            results[i] = translate_unit(texts[i], sl, tl, engine, cancelled)
+        except BaseException:
+            abort.set()
+            raise
+        if progress:
+            progress(next(counter), n)
+
+    with ThreadPoolExecutor(WORKERS) as ex:
+        for start in range(0, n, DOC_BATCH):
+            futs = [ex.submit(work, i) for i in range(start, min(n, start + DOC_BATCH))]
+            first = None
+            for f in futs:
+                try:
+                    f.result()
+                except BaseException as e:      # noqa: BLE001
+                    if first is None or (str(first) == "cancelled" and str(e) != "cancelled"):
+                        first = e
+            if first is not None:
+                raise first
+    return results
 
 
 def translate_doc(text, sl, tl, smart, reflow, engine, progress, cancelled):
@@ -890,29 +993,26 @@ def translate_doc(text, sl, tl, smart, reflow, engine, progress, cancelled):
 
     det, target, src_lang = sl, tl, sl
     if sl == "auto":
-        det = cached(" ".join(texts)[:300], "auto", tl, engine)[1]
+        sample, n = [], 0
+        for t in texts:                 # 只取开头约 300 字做语言检测，不拼整篇
+            sample.append(t)
+            n += len(t) + 1
+            if n >= 300:
+                break
+        det = cached(" ".join(sample)[:300], "auto", tl, engine)[1]
         src_lang = det
         if smart and base(det) == base(tl):
             target = alt_target(tl)
-    counter = itertools.count(1)
-
-    def work(u):
-        if cancelled():
-            raise RuntimeError("cancelled")
-        r = translate_unit(u, src_lang, target, engine, cancelled)
-        progress(next(counter), len(texts))
-        return r
-
-    with ThreadPoolExecutor(WORKERS) as ex:
-        results = iter(list(ex.map(work, texts)))
+    outs = translate_many(texts, src_lang, target, engine, progress, cancelled)
+    results = iter(outs)
     pairs = [("", "") if not u else (u, next(results)) for u in units]
     return pairs, det, target
 
 
 # ---------------------------------------------------------------- Windows 全局热键
 def start_hotkey_win(q, specs=None):
-    """Windows 全局热键：注册五个组合键（主窗口 / 指针取词 / 截图翻译 /
-    翻译并替换 / 粘贴图片翻译）。
+    """Windows 全局热键：注册六个组合键（主窗口 / 指针取词 / 截图翻译 /
+    翻译并替换 / 粘贴图片翻译 / 整窗翻译）。
 
     specs 是 {"hotkey_main": "ctrl+alt+t", ...} 这类配置，不传（None）就用
     默认组合；非法组合逐个回落到默认，绝不抛异常。返回主窗口热键是否注册成功。
@@ -921,7 +1021,7 @@ def start_hotkey_win(q, specs=None):
     import ctypes.wintypes
     user32 = ctypes.windll.user32
     ready, state = threading.Event(), {"ok": False, "pointer_ok": False, "shot_ok": False,
-                                        "replace_ok": False, "clip_ok": False}
+                                        "replace_ok": False, "clip_ok": False, "window_ok": False}
     parsed = {}
     for i, key in enumerate(HOTKEY_KEYS, start=1):
         raw = (specs or {}).get(key, DEFAULT_HOTKEYS[key]) if isinstance(specs, dict) else DEFAULT_HOTKEYS[key]
@@ -933,12 +1033,12 @@ def start_hotkey_win(q, specs=None):
 
     def loop():
         MOD_NOREPEAT = 0x4000
-        names = ("ok", "pointer_ok", "shot_ok", "replace_ok", "clip_ok")
+        names = ("ok", "pointer_ok", "shot_ok", "replace_ok", "clip_ok", "window_ok")
         for i, (mods, vk) in parsed.items():
             state[names[i - 1]] = bool(user32.RegisterHotKey(None, i, mods | MOD_NOREPEAT, vk))
         ready.set()
         if not (state["ok"] or state["pointer_ok"] or state["shot_ok"] or state["replace_ok"]
-                or state["clip_ok"]):
+                or state["clip_ok"] or state["window_ok"]):
             return
         msg = ctypes.wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
@@ -951,6 +1051,7 @@ def start_hotkey_win(q, specs=None):
     start_hotkey_win.shot_ok = state["shot_ok"]
     start_hotkey_win.replace_ok = state["replace_ok"]
     start_hotkey_win.clip_ok = state["clip_ok"]
+    start_hotkey_win.window_ok = state["window_ok"]
     return state["ok"]
 
 
@@ -1037,9 +1138,11 @@ def tray_menu_items(snap, is_win=True):
     shot_label = snap.get("hotkey_shot") or SCREENSHOT_LABEL
     pointer_label = snap.get("hotkey_pointer") or POINTER_LABEL
     replace_label = snap.get("hotkey_replace") or REPLACE_LABEL
+    window_label = snap.get("hotkey_window") or WINDOW_LABEL
     items = [
         {"id": "show", "label": "显示主窗口(&S)", "default": True},
         {"id": "shot", "label": "截图翻译(&C)　%s" % shot_label},
+        {"id": "window", "label": "整窗翻译(&W)　%s" % window_label},
         {"id": "clip", "label": "翻译剪贴板内容(&V)"},
         {"id": "replace", "label": "翻译并替换原文(&R)　%s" % replace_label},
         {"sep": True},
@@ -1539,6 +1642,15 @@ class App:
         self.hover_since = 0.0
         self.hover_fired = False
         self.shot_win = None
+        self.live_on = False                    # v2.11：实时刷新整窗翻译
+        self._live_job = None
+        self._live_busy = False
+        self._live_rect = None
+        self._live_crc = None
+        self._live_msg = None
+        self._hover_win_rect = None             # v2.11：悬停整窗翻译上一次翻的窗口范围
+        self._doc_busy = False                  # v2.10：文档翻译进行中（防重复点击）
+        self._doc_cancel = threading.Event()    # v2.10：「取消翻译」
         self._tts_kind = None          # 正在朗读的是原文（"src"）还是译文（"dst"），用于再点一次停止
 
         self.root = tk.Tk()
@@ -1563,6 +1675,7 @@ class App:
 
         self.last_clip = self._get_clip()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Unmap>", self._on_unmap)
         self.root.bind("<Escape>", lambda e: (self.bubble.close(), self.mini.close(), self._close_shot_overlay(),
                                               self.hide_window()))
         self.root.after(100, self._poll)
@@ -1604,6 +1717,13 @@ class App:
         cfg["hover_ms"] = max(300, min(cfg["hover_ms"], 3000))
         if cfg.get("close_action") not in CLOSE_NAMES:
             cfg["close_action"] = "tray"
+        cfg["hover_window"] = bool(cfg.get("hover_window", False))
+        try:
+            cfg["live_interval"] = max(2, min(int(cfg.get("live_interval", 3)), 30))
+        except Exception:
+            cfg["live_interval"] = 3
+        if cfg.get("minimize_action") not in MINIMIZE_NAMES:
+            cfg["minimize_action"] = "taskbar"
         cfg["tray_tip"] = bool(cfg.get("tray_tip", True))
         if cfg.get("popup_mode") not in POPUP_NAMES:
             cfg["popup_mode"] = "bubble"
@@ -1670,24 +1790,48 @@ class App:
         log_crash(text)
         self.status.configure(text="发生内部错误，详见 %s" % CRASH_LOG)
 
+    def _tray_alive(self):
+        return getattr(self, "tray", None) is not None and self.tray.is_running()
+
+    def _hide_to_tray(self, tip=True):
+        """藏到托盘（withdraw，任务栏不留窗口，点托盘图标找回）。没有托盘返回 False。"""
+        if not self._tray_alive():
+            return False
+        self.root.withdraw()
+        if tip and self.cfg.get("tray_tip", True) and not self.cfg.get("tray_tip_shown"):
+            # 第一次隐藏时弹一次气泡，告诉用户程序没退出、在哪找回
+            self.cfg["tray_tip_shown"] = True
+            try:
+                self.tray.notify(APP_TITLE, "已隐藏到托盘。单击托盘图标显示窗口，右键可切换取词选项或退出。")
+            except Exception:
+                pass                # 气泡只是提示，失败不能影响隐藏窗口
+            self._save()
+        return True
+
     def hide_window(self, tip=True):
-        # 有托盘时隐藏到托盘（withdraw，任务栏不留窗口，点托盘图标找回）；
-        # 没托盘时才最小化——旧版 withdraw 后没有托盘图标，窗口就找不回来了。
-        if getattr(self, "tray", None) is not None and self.tray.is_running():
-            self.root.withdraw()
-            if tip and self.cfg.get("tray_tip", True) and not self.cfg.get("tray_tip_shown"):
-                # 第一次隐藏时弹一次气泡，告诉用户程序没退出、在哪找回
-                self.cfg["tray_tip_shown"] = True
-                try:
-                    self.tray.notify(APP_TITLE, "已隐藏到托盘。单击托盘图标显示窗口，右键可切换取词选项或退出。")
-                except Exception:
-                    pass                # 气泡只是提示，失败不能影响隐藏窗口
-                self._save()
-        else:
+        # v2.10：「点 ×」选了「最小化到任务栏」→ 直接最小化，窗口留在任务栏；
+        # 否则有托盘时隐藏到托盘；没托盘时才最小化——旧版 withdraw 后没有托盘图标，
+        # 窗口就找不回来了。
+        if self.cfg.get("close_action", "tray") == "taskbar":
+            self.root.iconify()
+        elif not self._hide_to_tray(tip):
             self.root.iconify()
 
+    def _on_unmap(self, e):
+        """点标题栏「–」最小化时：设置里选了「收进托盘」就把窗口藏进托盘（默认留在任务栏）。"""
+        if e.widget is not self.root or self.cfg.get("minimize_action", "taskbar") != "tray":
+            return
+        self.root.after(30, self._minimize_to_tray)
+
+    def _minimize_to_tray(self):
+        try:
+            if self.root.state() == "iconic" and self._tray_alive():
+                self._hide_to_tray(tip=True)
+        except Exception:
+            pass
+
     def _on_close(self):
-        # 点 ×：按「高级设置 → 常规」里的选择：直接退出，或有托盘就隐藏到托盘
+        # 点 ×：按「高级设置 → 常规」里的选择：直接退出 / 最小化到任务栏 / 隐藏到托盘
         # （真正退出走托盘右键菜单 / 主界面「退出」按钮）
         if self.cfg.get("close_action", "tray") == "quit":
             self.quit()
@@ -1726,6 +1870,13 @@ class App:
             return REPLACE_LABEL
 
     @property
+    def hotkey_window_label(self):
+        try:
+            return hotkey_label(self.cfg.get("hotkey_window", DEFAULT_HOTKEYS["hotkey_window"]))
+        except ValueError:
+            return WINDOW_LABEL
+
+    @property
     def hotkey_clip_label(self):
         try:
             return hotkey_label(self.cfg.get("hotkey_clip", DEFAULT_HOTKEYS["hotkey_clip"]))
@@ -1747,6 +1898,7 @@ class App:
                 "hotkey_shot": self.hotkey_shot_label,
                 "hotkey_replace": self.hotkey_replace_label,
                 "hotkey_clip": self.hotkey_clip_label,
+                "hotkey_window": self.hotkey_window_label,
             }
             tray = getattr(self, "tray", None)
             if tray is not None and tray.is_running():
@@ -1787,6 +1939,9 @@ class App:
                 self.status.configure(text="剪贴板里没有文字")
         elif cid == "replace":
             self._on_replace_hotkey()
+        elif cid == "window":
+            # 从托盘菜单点的时候指针在任务栏上：给 3 秒把指针移到目标菜单 / 窗口
+            self.window_translate(delay_ms=3000)
         elif cid == "settings":
             self.show_window()
             self.open_settings()
@@ -1945,6 +2100,21 @@ class App:
         ttk.Button(btns, text="粘贴图片翻译", command=self._translate_clipboard_image).pack(side="left")
         ttk.Button(btns, text="🎤 语音输入", command=self.start_voice_input).pack(side="left")
         ttk.Button(btns, text="退出", command=self.quit).pack(side="right")
+        # v2.10：第二行按钮（第一行已经很满）：整窗翻译 + 文档翻译的「取消翻译」（平时隐藏）
+        btns2 = ttk.Frame(root)
+        btns2.pack(fill="x", padx=12, pady=(4, 0))
+        ttk.Button(btns2, text="整窗翻译（3 秒后翻指针下的菜单 / 窗口）",
+                   command=lambda: self.window_translate(delay_ms=3000)).pack(side="left")
+        self.doc_cancel_btn = ttk.Button(btns2, text="取消翻译", command=self._cancel_doc)
+        self.live_var = tk.BooleanVar(value=False)
+        self.live_int_var = tk.StringVar(value=str(self.cfg.get("live_interval", 3)))
+        ttk.Checkbutton(btns2, text="实时刷新", variable=self.live_var,
+                        command=self._on_live_toggle).pack(side="left", padx=(12, 0))
+        lcb = ttk.Combobox(btns2, textvariable=self.live_int_var, values=["2", "3", "5", "10"], width=3)
+        lcb.pack(side="left", padx=(4, 0))
+        lcb.bind("<<ComboboxSelected>>", lambda e: self._on_live_interval())
+        lcb.bind("<Return>", lambda e: self._on_live_interval())
+        ttk.Label(btns2, text="秒").pack(side="left")
 
         # —— 选项区：常用开关留在主窗口，其余按用途归类放进「高级设置」 ——
         self.top_var = tk.BooleanVar(value=self.cfg["top"])
@@ -1961,6 +2131,7 @@ class App:
         self.pointer_var = tk.BooleanVar(value=bool(self.cfg.get("pointer", True)))
         self.hover_var = tk.BooleanVar(value=bool(self.cfg.get("hover", True)))
         self.hover_ms_var = tk.IntVar(value=int(self.cfg.get("hover_ms", 800)))
+        self.hover_win_var = tk.BooleanVar(value=bool(self.cfg.get("hover_window", False)))
         self.tray_tip_var = tk.BooleanVar(value=bool(self.cfg.get("tray_tip", True)))
         self.history_on_var = tk.BooleanVar(value=bool(self.cfg.get("history_on", True)))
         self.history_reuse_var = tk.BooleanVar(value=bool(self.cfg.get("history_reuse", False)))
@@ -2074,8 +2245,16 @@ class App:
         self.close_cb.pack(side="left")
         self.close_cb.bind("<<ComboboxSelected>>", lambda e: self._save())
         ttk.Label(f, text="选「隐藏到托盘」时程序继续在后台运行，快捷键和取词照常可用；"
-                          "没有托盘图标（被安全软件拦截）时会改为最小化。",
+                          "选「最小化到任务栏」时窗口缩到任务栏、点任务栏图标就能还原（Esc 也一样）；"
+                          "没有托盘图标（被安全软件拦截）时「隐藏到托盘」会改为最小化。",
                   foreground="#5b6676", wraplength=500, justify="left").pack(anchor="w", padx=(0, 0), pady=(2, 0))
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(10, 0))
+        ttk.Label(row, text="点窗口 – 最小化：").pack(side="left")
+        self.min_cb = ttk.Combobox(row, values=list(MINIMIZE_NAMES.values()), state="readonly", width=10)
+        self.min_cb.set(MINIMIZE_NAMES.get(self.cfg.get("minimize_action", "taskbar"), "留在任务栏"))
+        self.min_cb.pack(side="left")
+        self.min_cb.bind("<<ComboboxSelected>>", lambda e: self._save())
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(14, 0))
         ttk.Label(row, text="界面字号：").pack(side="left")
@@ -2148,6 +2327,9 @@ class App:
             "把鼠标放在文字上按快捷键，取到指针处的文字并翻译（按钮、菜单上的字也能取）。")
         check(f, "悬停取词（鼠标停住自动取词）", self.hover_var, self._on_pointer_opt,
               "鼠标在文字、按钮、菜单上停住后自动取词；鼠标压在本程序的原文 / 译文框或弹窗上时不触发。")
+        check(f, "悬停时翻译整个窗口（代替取词）", self.hover_win_var, self._on_pointer_opt,
+              "开启「悬停取词」后，鼠标在菜单 / 窗口上停住就整窗翻译（用下面的悬停等待，最少 1.2 秒）；"
+              "同一个窗口只翻一次，指针离开再回来才会重翻。")
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(14, 0))
         ttk.Label(row, text="取词范围：").pack(side="left")
@@ -2285,17 +2467,20 @@ class App:
         self.hotkey_shot_var = tk.StringVar(value=self.hotkey_shot_label)
         self.hotkey_replace_var = tk.StringVar(value=self.hotkey_replace_label)
         self.hotkey_clip_var = tk.StringVar(value=self.hotkey_clip_label)
+        self.hotkey_window_var = tk.StringVar(value=self.hotkey_window_label)
         for text, var, presets in (
                 ("翻译选中的文字：", self.hotkey_main_var,
                  ["Ctrl+Alt+T", "Ctrl+Shift+T", "Alt+Shift+T", "Ctrl+Alt+Q", "Ctrl+Shift+Q", "Win+Alt+T"]),
                 ("指针取词：", self.hotkey_pointer_var,
-                 ["Ctrl+Alt+D", "Ctrl+Shift+D", "Alt+Shift+D", "Ctrl+Alt+W", "Ctrl+Shift+W", "Win+Alt+D"]),
+                 ["Ctrl+Alt+D", "Ctrl+Shift+D", "Alt+Shift+D", "Ctrl+Alt+P", "Ctrl+Shift+P", "Win+Alt+D"]),
                 ("截图翻译：", self.hotkey_shot_var,
                  ["Ctrl+Alt+S", "Ctrl+Shift+S", "Alt+Shift+S", "Ctrl+Alt+A", "Ctrl+Shift+A", "Win+Alt+S"]),
                 ("翻译并替换原文：", self.hotkey_replace_var,
                  ["Ctrl+Alt+R", "Ctrl+Shift+R", "Alt+Shift+R", "Ctrl+Alt+Y", "Ctrl+Shift+Y", "Win+Alt+R"]),
                 ("粘贴图片翻译：", self.hotkey_clip_var,
-                 ["Ctrl+Shift+V", "Ctrl+Alt+V", "Alt+Shift+V", "Ctrl+Shift+B", "Win+Alt+V"])):
+                 ["Ctrl+Shift+V", "Ctrl+Alt+V", "Alt+Shift+V", "Ctrl+Shift+B", "Win+Alt+V"]),
+                ("整窗翻译：", self.hotkey_window_var,
+                 ["Ctrl+Alt+W", "Ctrl+Shift+W", "Alt+Shift+W", "Ctrl+Alt+M", "Win+Alt+W"])):
             row = ttk.Frame(f)
             row.pack(anchor="w", pady=(4, 0))
             ttk.Label(row, text=text, width=16).pack(side="left")
@@ -2379,9 +2564,11 @@ class App:
             self.about_hotkey_label.configure(
                 text="%s　翻译选中的文字\n%s　指针取词（指针处的单词 / 整行 / 整段）\n"
                      "%s　截图翻译（框选屏幕任意区域）\n%s　翻译并替换原文（选中文字翻完直接替换回原处）\n"
-                     "%s　粘贴图片翻译（剪贴板里的图片 → 系统 OCR → 翻译）\nEsc　隐藏窗口 / 关闭气泡"
+                     "%s　粘贴图片翻译（剪贴板里的图片 → 系统 OCR → 翻译）\n"
+                     "%s　整窗翻译（指针放在菜单 / 窗口上，整个窗口一次翻完）\nEsc　隐藏窗口 / 关闭气泡"
                      % (self.hotkey_main_label, self.hotkey_pointer_label,
-                        self.hotkey_shot_label, self.hotkey_replace_label, self.hotkey_clip_label))
+                        self.hotkey_shot_label, self.hotkey_replace_label, self.hotkey_clip_label,
+                        self.hotkey_window_label))
         except Exception:
             pass
         try:
@@ -2401,7 +2588,8 @@ class App:
                          ("hotkey_pointer", self.hotkey_pointer_var),
                          ("hotkey_shot", self.hotkey_shot_var),
                          ("hotkey_replace", self.hotkey_replace_var),
-                         ("hotkey_clip", self.hotkey_clip_var)):
+                         ("hotkey_clip", self.hotkey_clip_var),
+                         ("hotkey_window", self.hotkey_window_var)):
             vals[key] = var.get().strip()
         seen = set()
         for key, spec in vals.items():
@@ -2435,6 +2623,7 @@ class App:
             self.hotkey_shot_var.set(self.hotkey_shot_label)
             self.hotkey_replace_var.set(self.hotkey_replace_label)
             self.hotkey_clip_var.set(self.hotkey_clip_label)
+            self.hotkey_window_var.set(self.hotkey_window_label)
         except Exception:
             pass
 
@@ -2832,7 +3021,11 @@ class App:
         self.auto_off_var.set(d["auto_offline"]); self.pointer_var.set(d["pointer"]); self.hover_var.set(d["hover"])
         self.scope_cb.set(SCOPE_NAMES[d["pointer_scope"]])
         self.hover_ms_var.set(d["hover_ms"]); self.cfg["hover_ms"] = d["hover_ms"]
-        self.close_cb.set(CLOSE_NAMES[d["close_action"]]); self.tray_tip_var.set(d["tray_tip"])
+        self.hover_win_var.set(d.get("hover_window", False))
+        self.live_int_var.set(str(d.get("live_interval", 3))); self.cfg["live_interval"] = d.get("live_interval", 3)
+        self.close_cb.set(CLOSE_NAMES.get(d["close_action"], CLOSE_NAMES["tray"]))
+        self.min_cb.set(MINIMIZE_NAMES.get(d.get("minimize_action"), MINIMIZE_NAMES["taskbar"]))
+        self.tray_tip_var.set(d["tray_tip"])
         self.history_on_var.set(d["history_on"]); self.history_reuse_var.set(d["history_reuse"])
         self.history_max_var.set(d["history_max"]); self.cfg["history_max"] = d["history_max"]
         self.history.max_items = d["history_max"]
@@ -2873,7 +3066,11 @@ class App:
         self.auto_off_var.set(d["auto_offline"]); self.pointer_var.set(d["pointer"]); self.hover_var.set(d["hover"])
         self.scope_cb.set(SCOPE_NAMES[d["pointer_scope"]])
         self.hover_ms_var.set(d["hover_ms"]); self.cfg["hover_ms"] = d["hover_ms"]
-        self.close_cb.set(CLOSE_NAMES[d["close_action"]]); self.tray_tip_var.set(d["tray_tip"])
+        self.hover_win_var.set(d.get("hover_window", False))
+        self.live_int_var.set(str(d.get("live_interval", 3))); self.cfg["live_interval"] = d.get("live_interval", 3)
+        self.close_cb.set(CLOSE_NAMES.get(d["close_action"], CLOSE_NAMES["tray"]))
+        self.min_cb.set(MINIMIZE_NAMES.get(d.get("minimize_action"), MINIMIZE_NAMES["taskbar"]))
+        self.tray_tip_var.set(d["tray_tip"])
         self.history_on_var.set(d["history_on"]); self.history_reuse_var.set(d["history_reuse"])
         self.history_max_var.set(d["history_max"]); self.cfg["history_max"] = d["history_max"]
         self.history.max_items = d["history_max"]
@@ -3733,6 +3930,7 @@ class App:
     def _on_pointer_opt(self):
         self.cfg["pointer_scope"] = SCOPE_CODES.get(self.scope_cb.get(), "word")
         self.cfg["hover"] = self.hover_var.get()
+        self.cfg["hover_window"] = self.hover_win_var.get()
         self.hover_fired = False
         self._save()
 
@@ -3861,10 +4059,16 @@ class App:
             return
         if self.hover_fired:
             return
-        if (now - self.hover_since) * 1000 < self.cfg.get("hover_ms", 800):
+        wait = self.cfg.get("hover_ms", 800)
+        if self.hover_win_var.get():
+            wait = max(wait, 1200)
+        if (now - self.hover_since) * 1000 < wait:
             return
         self.hover_fired = True
-        self._on_hover(pos)
+        if self.hover_win_var.get():
+            self._on_hover_window(pos)
+        else:
+            self._on_hover(pos)
 
     def _on_hover(self, pos):
         self.grab_mode = "hover"
@@ -4015,16 +4219,17 @@ class App:
             pass
 
     def _shot_worker(self, rect, xy, lang=None, sl="auto", tl="zh-CN",
-                     smart=True, engine="Google"):
+                     smart=True, engine="Google", ocr_scale=1, ui_mode=False, live=False):
         x, y, w, h = rect
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
             tmp = os.path.join(DATA_DIR, "shot.bmp")
             time.sleep(0.15)      # 等框选层彻底消失，否则会把黑框也截进去
-            if self.cfg.get("shot_mode", "overlay") == "overlay":
-                self._shot_overlay_worker(rect, xy, tmp, lang, sl, tl, smart, engine)
+            if live or self.cfg.get("shot_mode", "overlay") == "overlay":
+                self._shot_overlay_worker(rect, xy, tmp, lang, sl, tl, smart, engine,
+                                          ocr_scale=ocr_scale, ui_mode=ui_mode, live=live)
                 return
-            screen_win.capture_file(tmp, x, y, w, h)
+            screen_win.capture_file(tmp, x, y, w, h, scale=ocr_scale)
             try:
                 text = ocr_win.ocr_image(tmp, lang=lang)
             finally:
@@ -4037,11 +4242,29 @@ class App:
             self.q.put(("shot_ocr", False, str(e)[:300], xy))
 
     def _shot_overlay_worker(self, rect, xy, tmp, lang=None, sl="auto",
-                             tl="zh-CN", smart=True, engine="Google"):
-        """截图 → OCR 行 → 按段翻译 → 交给界面线程把译文盖在截图上。"""
+                             tl="zh-CN", smart=True, engine="Google",
+                             ocr_scale=1, ui_mode=False, live=False):
+        """截图 → OCR 行 → 按段翻译 → 交给界面线程把译文盖在截图上。
+
+        v2.10（整窗翻译）：ocr_scale > 1 时拿放大后的图去 OCR（菜单 / 按钮的小号字
+        放大 2 倍才认得准），认出来的坐标再缩回原图尺寸，盖层仍用 1:1 的截图；
+        ui_mode 时菜单项 / 按钮这类短行逐行翻，不并成一整句。"""
         x, y, w, h = rect
         cw, ch, bgra = screen_win.capture_region(x, y, w, h)
-        screen_win.save_bmp(tmp, cw, ch, bgra)
+        if live:
+            # 实时刷新：画面和上一轮完全一样就直接复用上次的译文层，不再 OCR / 翻译
+            crc = zlib.crc32(bgra)
+            if crc == self._live_crc and self._live_msg is not None:
+                self.q.put(self._live_msg)
+                return
+            self._live_crc = crc
+        scale = ocr_scale if ocr_scale and ocr_scale > 1 else 1
+        if scale > 1:
+            sw, sh, sbgra = screen_win.capture_region(x, y, w, h, scale=scale)
+            screen_win.save_bmp(tmp, sw, sh, sbgra)
+            del sbgra
+        else:
+            screen_win.save_bmp(tmp, cw, ch, bgra)
         try:
             lines = ocr_win.ocr_lines(tmp, lang=lang)
         finally:
@@ -4049,10 +4272,14 @@ class App:
                 os.remove(tmp)
             except Exception:
                 pass
+        if scale > 1:
+            lines = [dict(ln, x=int(ln["x"] / scale), y=int(ln["y"] / scale),
+                          w=max(1, int(round(ln["w"] / float(scale)))),
+                          h=max(1, int(round(ln["h"] / float(scale))))) for ln in lines]
         if not lines:
             self.q.put(("shot_ocr", True, "", xy))        # 没认出字：走原来的提示
             return
-        groups = ocr_win.group_paragraphs(lines)
+        groups = ocr_win.group_ui_lines(lines) if ui_mode else ocr_win.group_paragraphs(lines)
         texts = [ocr_win.join_lines([lines[k]["text"] for k in idxs]) for idxs in groups]
         det_box = {"det": sl, "target": tl}
 
@@ -4073,7 +4300,164 @@ class App:
             boxes.append({"x": bx, "y": by, "w": bw, "h": bh, "src": src_t, "dst": dst_t, "ok": ok,
                           "bg": bg, "fg": screen_win.text_color_for(bg)})
         png = screen_win.bgra_to_png(cw, ch, bgra)
-        self.q.put(("shot_overlay", rect, png, boxes, det_box["det"], det_box["target"], engine))
+        msg = ("shot_overlay", rect, png, boxes, det_box["det"], det_box["target"], engine, live)
+        if live:
+            self._live_msg = msg
+        self.q.put(msg)
+
+    # ---- v2.10 整窗翻译：指针放在菜单 / 对话框 / 软件窗口上，整个窗口一次翻完
+    def window_translate(self, delay_ms=0):
+        """整窗翻译：不用框选。热键（默认 Ctrl+Alt+W）按下时，指针下面的整个
+        顶层窗口——下拉菜单、右键菜单、对话框、整个软件界面——一次截下来，
+        系统 OCR 识别后整窗翻译，译文盖在原位（点一下复制全部，右键 / Esc 关闭）。
+
+        热键不会抢焦点，所以下拉菜单还开着的时候也能翻；delay_ms > 0 是给
+        「从主窗口按钮 / 托盘菜单触发」用的：先等几秒，让你把指针移到目标上。"""
+        if not IS_WIN:
+            self.status.configure(text="整窗翻译只支持 Windows")
+            return
+        if getattr(self, "shot_win", None) is not None or self.grabbing:
+            return
+        if not ocr_win.ocr_available():
+            self.status.configure(text="整窗翻译需要 Windows 系统 OCR（没找到 PowerShell / OCR 组件）")
+            return
+        if delay_ms > 0:
+            self.bubble.close()
+            self.mini.close()
+            self.status.configure(text="%d 秒后翻译指针下的窗口，请把指针移到要翻译的菜单 / 窗口上…"
+                                  % max(1, delay_ms // 1000))
+            try:
+                self.root.iconify()              # 别让本程序窗口挡在目标前面
+            except Exception:
+                pass
+            self.root.after(delay_ms, self._window_translate_now)
+            return
+        self._window_translate_now()
+
+    def _window_target(self, pos):
+        """指针 pos 下要翻译的窗口范围（已夹到屏幕内）；找不到 / 太小返回 None 并写状态栏。"""
+        rect = screen_win.window_rect_at(pos[0], pos[1], skip_pid=os.getpid())
+        if rect is None:
+            self.status.configure(text="没找到指针下的窗口：请把指针放在要翻译的菜单 / 窗口上再试")
+            return None
+        bounds = screen_bounds() or (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        rect = screen_win.clamp_region(rect[0], rect[1], rect[2], rect[3], bounds)
+        if rect[2] < 20 or rect[3] < 20:
+            self.status.configure(text="指针下的窗口太小，没法翻译")
+            return None
+        return rect
+
+    def _start_window_worker(self, rect, pos, live=False):
+        sl, tl = self._codes()
+        # 菜单 / 对话框这类不大的窗口放大 2 倍再 OCR，小号界面字才认得准；整屏大窗口不放大（太慢）
+        scale = 2 if rect[2] * rect[3] <= 1400000 else 1
+        self.status.configure(text="正在识别并翻译整个窗口（%d×%d）…" % (rect[2], rect[3]))
+        threading.Thread(target=self._shot_worker,
+                         args=(rect, pos, self._ocr_lang(), sl, tl, self.smart_var.get(),
+                               self.engine.get(), scale, True, live),
+                         daemon=True).start()
+
+    def _window_translate_now(self):
+        self.bubble.close()
+        self.mini.close()
+        self._close_shot_overlay()
+        pos = self.root.winfo_pointerxy()
+        rect = self._window_target(pos)
+        if rect is None:
+            return
+        self._start_window_worker(rect, pos)
+
+    # ---- v2.11 悬停整窗翻译：鼠标在窗口上停住就整窗翻，同一个窗口只翻一次
+    def _on_hover_window(self, pos):
+        try:
+            if self.root.winfo_containing(pos[0], pos[1]) is not None:
+                return                      # 指针在本程序自己的窗口上：不翻
+        except Exception:
+            pass
+        rect = screen_win.window_rect_at(pos[0], pos[1], skip_pid=os.getpid())
+        if rect is None:
+            return
+        last = self._hover_win_rect
+        if last is not None and last == rect:
+            return                          # 还是刚翻过的那个窗口：不重复
+        self._hover_win_rect = rect
+        rect = self._window_target(pos)
+        if rect is not None:
+            self.mini.hide_for_capture()
+            self._start_window_worker(rect, pos)
+
+    # ---- v2.11 实时刷新：每隔几秒重新翻译同一个窗口，译文层点击穿透，可以照常操作软件
+    def _on_live_interval(self):
+        try:
+            v = max(2, min(int(self.live_int_var.get()), 30))
+        except Exception:
+            v = self.cfg.get("live_interval", 3)
+        self.live_int_var.set(str(v))
+        self.cfg["live_interval"] = v
+        self._save()
+
+    def _on_live_toggle(self):
+        if self.live_var.get():
+            if not IS_WIN:
+                self.live_var.set(False)
+                self.status.configure(text="实时刷新只支持 Windows")
+                return
+            self._on_live_interval()
+            self.status.configure(text="3 秒后开始实时翻译指针下的窗口，请把指针移到目标上…")
+            try:
+                self.root.iconify()
+            except Exception:
+                pass
+            self.root.after(3000, self.live_start)
+        else:
+            self.live_stop()
+
+    def live_start(self):
+        if not self.live_var.get() or self.live_on:
+            return
+        if not ocr_win.ocr_available():
+            self.live_var.set(False)
+            self.status.configure(text="实时刷新需要 Windows 系统 OCR（没找到 PowerShell / OCR 组件）")
+            return
+        self._close_shot_overlay()
+        rect = self._window_target(self.root.winfo_pointerxy())
+        if rect is None:
+            self.live_var.set(False)
+            return
+        self.live_on, self._live_rect, self._live_busy = True, rect, False
+        self._live_crc = self._live_msg = None
+        self._live_tick()
+
+    def live_stop(self):
+        self.live_on = False
+        self._live_busy = False
+        self.live_var.set(False)
+        if self._live_job is not None:
+            try:
+                self.root.after_cancel(self._live_job)
+            except Exception:
+                pass
+            self._live_job = None
+        self._close_shot_overlay()
+        self.status.configure(text="已停止实时刷新")
+
+    def _live_tick(self):
+        self._live_job = None
+        if not self.live_on:
+            return
+        if self._live_busy or getattr(self, "shot_win", None) is not None or self.grabbing:
+            self._live_job = self.root.after(500, self._live_tick)
+            return
+        self._live_busy = True
+        self._close_shot_overlay()          # 截图前先撤掉上一层译文，否则会把译文也截进去
+        self._start_window_worker(self._live_rect, self.root.winfo_pointerxy(), live=True)
+
+    def _live_done(self):
+        """一轮翻译（成功 / 没认出字 / 出错）结束：隔 live_interval 秒再来一轮。"""
+        self._live_busy = False
+        if self.live_on and self._live_job is None:
+            sec = max(2, int(self.cfg.get("live_interval", 3)))
+            self._live_job = self.root.after(sec * 1000, self._live_tick)
 
     # ---- 截图翻译：译文盖在截图上
     def _close_shot_overlay(self):
@@ -4085,7 +4469,7 @@ class App:
             except Exception:
                 pass
 
-    def _show_shot_overlay(self, rect, png, boxes, det, target, engine):
+    def _show_shot_overlay(self, rect, png, boxes, det, target, engine, live=False):
         """在原来框选的位置开一个无边框置顶窗：底图是截图，每一段原文上盖一块「背景色 + 译文」。
 
         左键点一下复制全部译文；右键 / Esc 关闭。译文比原文长时，盖块向下延伸。"""
@@ -4123,7 +4507,9 @@ class App:
             bb = canvas.bbox(tid)
             if bb and bb[3] + pad > by + bh + pad:        # 放不下：把盖块向下延伸，别露出下面的原文
                 canvas.coords(rid, bx - pad, by - pad, bx + bw + pad, min(h, bb[3] + pad))
-        tip = canvas.create_text(w - 6, h - 4, anchor="se", text="点击复制译文 · 右键 / Esc 关闭",
+        tip = canvas.create_text(w - 6, h - 4, anchor="se",
+                                 text=("实时刷新中 · 再按 %s 停止" % self.hotkey_window_label) if live
+                                 else "点击复制译文 · 右键 / Esc 关闭",
                                  font=(family, -11), fill="#ffffff")
         tb = canvas.bbox(tip)
         if tb:
@@ -4142,6 +4528,15 @@ class App:
         canvas.bind("<Button-3>", lambda e: self._close_shot_overlay())
         win.bind("<Escape>", lambda e: self._close_shot_overlay())
         self.shot_overlay = win
+        if live:
+            # 点击穿透、不抢焦点：不挡下面的软件；不写主窗口、不存历史（每几秒一次会刷屏）
+            win.update_idletasks()
+            screen_win.make_click_through(win.winfo_id())
+            self.status.configure(text="实时刷新中（每 %d 秒）：%s → %s · 再按 %s 或取消「实时刷新」停止"
+                                  % (self.cfg.get("live_interval", 3), lang_name(det), lang_name(target),
+                                     self.hotkey_window_label))
+            self._live_done()
+            return
         try:
             win.focus_force()
         except Exception:
@@ -4161,6 +4556,11 @@ class App:
 
     def _on_shot_ocr(self, ok, text, xy):
         text = (text or "").strip()
+        if self.live_on:                     # 实时刷新中：没认出字 / 出错就静默等下一轮
+            if not ok:
+                self.status.configure(text="实时刷新：本轮失败（%s），稍后重试" % text[:60])
+            self._live_done()
+            return
         if not ok:
             self.status.configure(text="截图 OCR 失败：%s" % text)
             return
@@ -4299,8 +4699,10 @@ class App:
             geometry=self.root.geometry(), engine=self.engine.get(),
             auto_offline=AUTO_OFFLINE, pointer=self.pointer_var.get(),
             hover=self.hover_var.get(), hover_ms=self.cfg.get("hover_ms", 800),
+            hover_window=self.hover_win_var.get(), live_interval=self.cfg.get("live_interval", 3),
             pointer_scope=SCOPE_CODES.get(self.scope_cb.get(), "word"),
             close_action=CLOSE_CODES.get(self.close_cb.get(), "tray"),
+            minimize_action=MINIMIZE_CODES.get(self.min_cb.get(), "taskbar"),
             popup_mode=POPUP_CODES.get(self.popup_cb.get(), "bubble"),
             shot_mode=SHOT_CODES.get(self.shot_cb.get(), "overlay"),
             tray_tip=self.tray_tip_var.get(),
@@ -4379,20 +4781,43 @@ class App:
     def plain_result(self):
         return "\n".join(d for _, d in self.pairs).strip()
 
+    RENDER_MAX_CHARS = 150000        # 译文框最多显示多少字；其余在内存里，复制 / 保存仍是全文
+
     def render(self):
         t = self.dst
         th = theme_colors(bool(self.cfg.get("dark_mode", False)))
         t.configure(state="normal", foreground=th["text_fg"])
         t.delete("1.0", "end")
         bi = self.bi_var.get()
-        for s, d in self.pairs:
-            if not s and not d:
-                t.insert("end", "\n")
-            elif bi:
-                t.insert("end", s + "\n", "src")
-                t.insert("end", d + "\n\n")
-            else:
-                t.insert("end", d + "\n")
+        used, shown = 0, 0
+        if not bi:
+            # 一次 insert：几万段逐段 insert 会让 Tk 卡住几十秒（「未响应」）
+            chunk = []
+            for s_, d in self.pairs:
+                line = "\n" if (not s_ and not d) else d + "\n"
+                if used + len(line) > self.RENDER_MAX_CHARS:
+                    break
+                chunk.append(line)
+                used += len(line)
+                shown += 1
+            t.insert("end", "".join(chunk))
+        else:
+            for s_, d in self.pairs:
+                if not s_ and not d:
+                    if used + 1 > self.RENDER_MAX_CHARS:
+                        break
+                    t.insert("end", "\n")
+                    used += 1
+                else:
+                    if used + len(s_) + len(d) + 3 > self.RENDER_MAX_CHARS:
+                        break
+                    t.insert("end", s_ + "\n", "src")
+                    t.insert("end", d + "\n\n")
+                    used += len(s_) + len(d) + 3
+                shown += 1
+        if shown < len(self.pairs):
+            t.insert("end", "\n……（窗口里只显示前 %d 段，后面还有 %d 段没有显示；"
+                            "「复制译文」和保存的文件里是完整译文）\n" % (shown, len(self.pairs) - shown))
         t.configure(state="disabled")
 
     def _get_clip(self):
@@ -4573,6 +4998,9 @@ class App:
 
     # ---- v2.6 文档翻译（.txt / .md / .srt） ----
     def _translate_doc_file(self):
+        if getattr(self, "_doc_busy", False):
+            self.status.configure(text="已经有一份文档在翻译，可点「取消翻译」再选新的")
+            return
         path = filedialog.askopenfilename(
             title="选择要翻译的文档",
             filetypes=[("文档", "*.txt *.md *.srt *.docx *.pdf"), ("文本", "*.txt"),
@@ -4581,84 +5009,132 @@ class App:
         if not path:
             return
         ext = os.path.splitext(path)[1].lower()
-        if ext == ".pdf":
-            # v2.8 PDF：标准库提取正文，输出是 -译文.txt（不写回 PDF）。
-            try:
-                text = pdf_translate.extract_pdf_text(path)
-            except Exception as e:      # noqa: BLE001
-                self.status.configure(text="打不开文档：%s" % e)
-                return
-            if len(text.strip()) < pdf_translate.PDF_TRANSLATE_MIN_CHARS:
-                self.status.configure(
-                    text="这个 PDF 几乎没有可提取的文字，可能是扫描件 / 图片型 PDF，请改用截图翻译（框选后识别）")
-                return
-            self._doc_bytes = None
-            self._doc_path = path
-            self.status.configure(text="正在翻译文档…")
-            sl, tl = self._codes()
-            threading.Thread(target=self._doc_worker,
-                             args=(path, text, sl, tl, self.engine.get(),
-                                   self.smart_var.get(), self.reflow_var.get(), None),
-                             daemon=True).start()
-            return
-        if not doc_translate.supported_doc_ext(path):
+        if ext != ".pdf" and not doc_translate.supported_doc_ext(path):
             self.status.configure(text="只支持 .txt / .md / .srt / .docx / .pdf 文档")
             return
-        self._doc_bytes = None
+        # v2.10：只在界面线程里做「看大小 + 问一句」，读文件、解析 docx / pdf 全部放后台线程。
+        # 旧版在这里同步读整个文件并解析，大文件会让窗口「未响应」。
         try:
-            if ext == ".docx":
-                with open(path, "rb") as f:
-                    self._doc_bytes = f.read()
-                text = "\n\n".join(doc_translate.docx_paragraph_texts(
-                    doc_translate.docx_document_xml(self._doc_bytes)))
-            else:
-                with open(path, "r", encoding="utf-8-sig") as f:
-                    text = f.read()
-        except Exception as e:
+            size = os.path.getsize(path)
+        except OSError as e:
             self.status.configure(text="打不开文档：%s" % e)
             return
-        if not text.strip():
-            self.status.configure(text="文档是空的")
+        limit = doc_translate.size_limit_for(ext)
+        if size > limit:
+            self.status.configure(text="文件太大（%.1f MB），上限 %d MB，请拆成几份再翻译"
+                                  % (size / 1048576.0, limit // 1048576))
             return
+        self._doc_busy = True
+        self._doc_cancel.clear()
+        self.doc_cancel_btn.pack(side="left", padx=6)
+        self.status.configure(text="正在读取文档…")
         self._doc_path = path
-        self.status.configure(text="正在翻译文档…")
         # 语言/引擎/选项在 Tk 线程里读好再传进去：worker 线程里不能碰 Tk 控件。
         sl, tl = self._codes()
         threading.Thread(target=self._doc_worker,
-                         args=(path, text, sl, tl, self.engine.get(),
-                               self.smart_var.get(), self.reflow_var.get(),
-                               self._doc_bytes),
+                         args=(path, sl, tl, self.engine.get(),
+                               self.smart_var.get(), self.reflow_var.get()),
                          daemon=True).start()
 
-    def _doc_worker(self, path, text, sl, tl, engine, smart, reflow, data=None):
-        """文档翻译（后台线程）：.srt 只翻正文，.txt/.md/.pdf 按段落翻整篇，
-        .docx 按段落翻并重建文件。"""
-        ext = os.path.splitext(path)[1].lower()
+    def _doc_confirm(self, segs, chars, engine, cancelled):
+        """（后台线程）估算耗时；不大就直接开翻，否则让界面线程问用户，等回答。"""
+        secs = estimate_doc_seconds(segs, chars, engine)
+        if segs < DOC_CONFIRM_SEGS and secs < DOC_CONFIRM_SECS:
+            return True
+        box = {"ev": threading.Event(), "ok": False}
+        self.q.put(("doc_confirm", segs, chars, secs, box))
+        while not box["ev"].wait(0.2):
+            if cancelled():
+                return False
+        return box["ok"]
+
+    def _on_doc_confirm(self, segs, chars, secs, box):
         try:
+            box["ok"] = messagebox.askyesno(
+                "翻译前确认", "这份文档约 %d 段、%d 字，预计%s（在线按每段一个请求估算，实际受网速和限流影响）。\n"
+                              "翻译中可随时点「取消翻译」。现在开始吗？" % (segs, chars, fmt_duration(secs)),
+                parent=self.root)
+        finally:
+            box["ev"].set()
+
+    def _cancel_doc(self):
+        """取消正在进行的文档翻译：后台线程下一段开始前就会退出。"""
+        if getattr(self, "_doc_busy", False):
+            self._doc_cancel.set()
+            self.status.configure(text="正在取消文档翻译…")
+
+    def _doc_finish_ui(self):
+        self._doc_busy = False
+        try:
+            self.doc_cancel_btn.pack_forget()
+        except Exception:
+            pass
+
+    def _doc_worker(self, path, sl, tl, engine, smart, reflow):
+        """文档翻译（后台线程）：读文件 / 解析 → 翻译 → 把结果放进队列。
+
+        .srt 只翻正文，.txt/.md/.pdf 按段落翻整篇，.docx 按段落翻并重建文件。
+        所有重活（读文件、解析、翻译）都在这里，界面线程只收进度和结果。"""
+        ext = os.path.splitext(path)[1].lower()
+        cancelled = self._doc_cancel.is_set
+        last = [0.0]
+        t_start = [time.time()]
+
+        def prog(d, n):
+            # 进度节流：最多每 0.25 秒一条（旧版每段一条，几万段会把消息队列塞满）
+            now = time.time()
+            if d >= n or now - last[0] >= 0.25:
+                last[0] = now
+                eta = (now - t_start[0]) / d * (n - d) if d >= 5 else None   # 剩余时间
+                self.q.put(("doc_prog", d, n, eta))
+
+        def go(segs, chars):
+            """翻之前先估时间：段数多或预计久就问用户，不想翻就当取消。"""
+            ok_ = self._doc_confirm(segs, chars, engine, cancelled)
+            t_start[0] = time.time()
+            return ok_
+
+        try:
+            data = None
+            if ext == ".pdf":
+                text = pdf_translate.extract_pdf_text(path)
+                if len(text.strip()) < pdf_translate.PDF_TRANSLATE_MIN_CHARS:
+                    self.q.put(("doc_done", False,
+                                "这个 PDF 几乎没有可提取的文字，可能是扫描件 / 图片型 PDF，"
+                                "请改用截图翻译（框选后识别）"))
+                    return
+            elif ext == ".docx":
+                with open(path, "rb") as f:
+                    data = f.read()
+                texts_docx = doc_translate.docx_paragraph_texts(doc_translate.docx_document_xml(data))
+                text = "\n\n".join(texts_docx)
+            else:
+                text = doc_translate.read_text_file(path)
+            if not text.strip():
+                self.q.put(("doc_done", False, "文档是空的"))
+                return
+            if cancelled():
+                raise RuntimeError("cancelled")
+            self.q.put(("doc_prog", 0, 0))
             if ext == ".docx":
-                if data is None:
-                    raise ValueError("没有读到 .docx 文件内容")
-                texts = doc_translate.docx_paragraph_texts(
-                    doc_translate.docx_document_xml(data))
-                if not any(t.strip() for t in texts):
+                texts = texts_docx
+                idx = [i for i, t in enumerate(texts) if t.strip()]
+                if not idx:
                     self.q.put(("doc_done", False, "文档里没有可翻译的文字"))
                     return
-                first_i = next(i for i, t in enumerate(texts) if t.strip())
-                first, det, target = translate(texts[first_i], sl, tl, smart, engine,
-                                               cancelled=lambda: False)
+                if not go(len(idx), sum(len(texts[i]) for i in idx)):
+                    raise RuntimeError("cancelled")
+                first, det, target = translate(texts[idx[0]], sl, tl, smart, engine, cancelled=cancelled)
                 outs = [""] * len(texts)
-                outs[first_i] = first
-                for i, t in enumerate(texts):
-                    if not t.strip() or i == first_i:
-                        continue
-                    self.q.put(("doc_prog", i + 1, len(texts)))
-                    outs[i] = translate_unit(t, det, target, engine,
-                                             cancelled=lambda: False)
+                outs[idx[0]] = first
+                rest = idx[1:]
+                for i, o in zip(rest, translate_many([texts[i] for i in rest], det, target, engine,
+                                                     prog, cancelled)):
+                    outs[i] = o
                 pairs = [(t, o) for t, o in zip(texts, outs) if t.strip()]
                 out_text = "\n".join(o for o in outs if o)
                 out_bytes = doc_translate.docx_rebuild(data, outs)
-                self.q.put(("doc_done", True, (out_text, det, target, text, pairs, sl, tl,
-                                               out_bytes)))
+                self.q.put(("doc_done", True, (out_text, det, target, text, pairs, sl, tl, out_bytes)))
                 return
             if ext == ".srt":
                 blocks = doc_translate.srt_parse(text)
@@ -4666,30 +5142,36 @@ class App:
                     self.q.put(("doc_done", False, "没有解析到字幕块"))
                     return
                 src_texts = [b["text"] for b in blocks]
-                first, det, target = translate(src_texts[0], sl, tl, smart, engine,
-                                               cancelled=lambda: False)
-                outs = [first]
-                for i, t in enumerate(src_texts[1:], start=2):
-                    self.q.put(("doc_prog", i, len(blocks)))
-                    outs.append(translate_unit(t, det, target, engine,
-                                               cancelled=lambda: False))
+                if not go(len(src_texts), sum(len(t) for t in src_texts)):
+                    raise RuntimeError("cancelled")
+                first, det, target = translate(src_texts[0], sl, tl, smart, engine, cancelled=cancelled)
+                outs = [first] + translate_many(src_texts[1:], det, target, engine, prog, cancelled)
                 pairs = list(zip(src_texts, outs))
                 for b, o in zip(blocks, outs):
                     b["text"] = o
                 out_text = doc_translate.srt_rebuild(blocks)
             else:
-                pairs, det, target = translate_doc(
-                    text, sl, tl, smart, reflow, engine,
-                    progress=lambda d, n: self.q.put(("doc_prog", d, n)),
-                    cancelled=lambda: False)
+                _units = [u for u in to_units(text, reflow) if u]
+                if not go(len(_units), sum(len(u) for u in _units)):
+                    raise RuntimeError("cancelled")
+                del _units
+                pairs, det, target = translate_doc(text, sl, tl, smart, reflow, engine,
+                                                   progress=prog, cancelled=cancelled)
                 out_text = "\n".join(d for _, d in pairs)
             self.q.put(("doc_done", True, (out_text, det, target, text, pairs, sl, tl)))
+        except MemoryError:
+            self.q.put(("doc_done", False, "内存不够，这个文件太大了，请拆成几份再翻译"))
         except Exception as e:      # noqa: BLE001
-            self.q.put(("doc_done", False, str(e)[:300]))
+            if str(e) == "cancelled" or cancelled():
+                self.q.put(("doc_done", False, "已取消文档翻译"))
+            else:
+                log_crash("doc_worker: %r" % (e,))
+                self.q.put(("doc_done", False, str(e)[:300]))
 
     def _on_doc_done(self, ok, payload):
+        self._doc_finish_ui()
         if not ok:
-            self.status.configure(text="文档翻译失败：%s" % payload)
+            self.status.configure(text=payload if payload.startswith("已取消") else "文档翻译失败：%s" % payload)
             return
         out_bytes = payload[7] if len(payload) > 7 else None
         out_text, det, target, src_text, pairs, sl, tl = payload[:7]
@@ -5020,6 +5502,7 @@ class App:
                 self.tray.stop()
         except Exception:
             pass
+        self.live_on = False
         try:
             self.bubble.close()
             self.mini.close()
@@ -5041,9 +5524,10 @@ class App:
         main_l, pointer_l, shot_l = self.hotkey_main_label, self.hotkey_pointer_label, self.hotkey_shot_label
         replace_l = self.hotkey_replace_label
         clip_l = self.hotkey_clip_label
+        window_l = self.hotkey_window_label
         ok_text = ("选中文字后按 %s 翻译；指针放在文字上按 %s 就地取词；按 %s 截图翻译；按 %s 翻译并替换原文；"
-                   "按 %s 翻译剪贴板里的图片；Esc 隐藏到托盘"
-                   % (main_l, pointer_l, shot_l, replace_l, clip_l)) if IS_WIN else \
+                   "按 %s 翻译剪贴板里的图片；指针放在菜单 / 窗口上按 %s 整窗翻译；Esc 隐藏窗口"
+                   % (main_l, pointer_l, shot_l, replace_l, clip_l, window_l)) if IS_WIN else \
                   ("选中文字后按 %s 翻译，或按 %s 在指针旁显示译文；Esc 隐藏窗口" % (main_l, pointer_l))
         if IS_WIN:
             try:
@@ -5053,6 +5537,7 @@ class App:
                 sok = getattr(start_hotkey_win, "shot_ok", False)
                 rok = getattr(start_hotkey_win, "replace_ok", False)
                 cok = getattr(start_hotkey_win, "clip_ok", False)
+                wok = getattr(start_hotkey_win, "window_ok", False)
                 missing = []
                 if not ok:
                     missing.append(main_l)
@@ -5064,6 +5549,8 @@ class App:
                     missing.append(replace_l)
                 if not cok:
                     missing.append(clip_l)
+                if not wok:
+                    missing.append(window_l)
                 if not missing:
                     self.hint.configure(text=ok_text)
                 else:
@@ -5080,7 +5567,8 @@ class App:
                                               pynput_spec(specs["hotkey_pointer"]): lambda: self.q.put(("hotkey", 2)),
                                               pynput_spec(specs["hotkey_shot"]): lambda: self.q.put(("hotkey", 3)),
                                               pynput_spec(specs["hotkey_replace"]): lambda: self.q.put(("hotkey", 4)),
-                                              pynput_spec(specs["hotkey_clip"]): lambda: self.q.put(("hotkey", 5))})
+                                              pynput_spec(specs["hotkey_clip"]): lambda: self.q.put(("hotkey", 5)),
+                                              pynput_spec(specs["hotkey_window"]): lambda: self.q.put(("hotkey", 6))})
             self.hk.daemon = True
             self.hk.start()
             self.hint.configure(text=ok_text)
@@ -5096,6 +5584,12 @@ class App:
             return
         if which == 5:
             self._translate_clipboard_image()
+            return
+        if which == 6:
+            if self.live_on:
+                self.live_stop()
+                return
+            self.window_translate()
             return
         if self.grabbing:
             return
@@ -5222,7 +5716,7 @@ class App:
 
     def _poll(self):
         try:
-            while True:
+            for _drain in range(300):          # v2.10：每轮最多处理 300 条，别让一大波消息把界面堵死
                 msg = self.q.get_nowait()
                 kind = msg[0]
                 if kind == "hotkey":
@@ -5263,8 +5757,16 @@ class App:
                     self._show_shot_overlay(*msg[1:])
                 elif kind == "shot_ocr":
                     self._on_shot_ocr(msg[1], msg[2], msg[3])
+                elif kind == "doc_confirm":
+                    self._on_doc_confirm(*msg[1:])
                 elif kind == "doc_prog":
-                    self.status.configure(text="正在翻译文档 %d/%d" % (msg[1], msg[2]))
+                    if getattr(self, "_doc_busy", False):
+                        if not msg[2]:
+                            self.status.configure(text="文档已读入，正在估算耗时…")
+                        else:
+                            eta = msg[3] if len(msg) > 3 else None
+                            self.status.configure(text="正在翻译文档 %d/%d%s" % (
+                                msg[1], msg[2], "，剩余%s" % fmt_duration(eta) if eta is not None else ""))
                 elif kind == "doc_done":
                     self._on_doc_done(msg[1], msg[2])
                 elif kind == "image_ocr":

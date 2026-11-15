@@ -133,9 +133,9 @@ empty_pdf = os.path.join(tmp, "empty.pdf")
 open(empty_pdf, "wb").write(_mini_pdf(b""))
 dt.filedialog.askopenfilename = lambda *a, **k: empty_pdf
 try:
-    app._translate_doc_file()
+    app._translate_doc_file()      # v2.10：读 / 解析在后台线程，提示通过队列回来，要等一下
     ok("pdf with no text points at screenshot translation",
-       "\u622a\u56fe\u7ffb\u8bd1" in app.status.cget("text"))
+       pump(5, lambda: "\u622a\u56fe\u7ffb\u8bd1" in app.status.cget("text")))
 finally:
     dt.filedialog = real_fd
 

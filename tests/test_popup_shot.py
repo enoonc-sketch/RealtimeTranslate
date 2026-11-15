@@ -218,7 +218,7 @@ app._shot_overlay_worker(rect, (100, 80), os.path.join(tmpd, "shot.bmp"))
 msgs = drain()
 ov = [m for m in msgs if m[0] == "shot_overlay"]
 ok("worker sends one shot_overlay message", len(ov) == 1)
-_, rc, png2, boxes, det, target, engine = ov[0]
+_, rc, png2, boxes, det, target, engine, _live = ov[0]
 ok("paragraphs translated: 2 boxes, first merges 2 lines",
    len(boxes) == 2 and boxes[0]["src"] == "Hello world second line here" and boxes[0]["dst"] == "译:Hello world second line here"
    and boxes[1]["dst"] == "译:Footer text")

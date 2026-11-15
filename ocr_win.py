@@ -290,3 +290,22 @@ def paragraph_box(lines, idxs):
     x1 = max(lines[k]["x"] + lines[k]["w"] for k in idxs)
     y1 = max(lines[k]["y"] + lines[k]["h"] for k in idxs)
     return x0, y0, x1 - x0, y1 - y0
+
+
+UI_SHORT_LINE = 28        # 平均每行少于这么多字：当作菜单 / 按钮栏 / 列表，逐行翻
+
+
+def group_ui_lines(lines):
+    """整窗翻译用的分组：先按段落分；某段里每行都很短（菜单项、按钮、列表项、
+    表头），就拆成一行一组各翻各的——否则相邻的菜单项会被当成一句话连起来翻。
+    成段的正文（行平均较长）仍按整段翻译，上下文完整。返回行下标列表的列表。
+    """
+    out = []
+    for idxs in group_paragraphs(lines):
+        if len(idxs) > 1:
+            avg = sum(len(lines[k]["text"]) for k in idxs) / float(len(idxs))
+            if avg < UI_SHORT_LINE:
+                out.extend([k] for k in idxs)
+                continue
+        out.append(idxs)
+    return out

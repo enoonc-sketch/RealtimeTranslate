@@ -63,7 +63,7 @@ out = dt.validate_hotkey_cfg({"hotkey_main": "bogus", "hotkey_pointer": "t",
 ok("invalid fall back to defaults",
    out == {"hotkey_main": "ctrl+alt+t", "hotkey_pointer": "ctrl+alt+d",
            "hotkey_shot": "ctrl+alt+s", "hotkey_replace": "ctrl+alt+r",
-           "hotkey_clip": "ctrl+shift+v"})
+           "hotkey_clip": "ctrl+shift+v", "hotkey_window": "ctrl+alt+w"})
 out = dt.validate_hotkey_cfg({"hotkey_main": "ctrl+alt+t",
                               "hotkey_pointer": "ctrl+alt+t",
                               "hotkey_shot": "ctrl+alt+s"})

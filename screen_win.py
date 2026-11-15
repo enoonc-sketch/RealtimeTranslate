@@ -1,6 +1,7 @@
 """Windows 截图 — 只用 Python 标准库 ctypes（GDI BitBlt），不用 Pillow。
 
 capture_region(x, y, w, h) -> (宽, 高, BGRA 字节串)，左上角原点。
+window_rect_at(x, y) -> 指针下顶层窗口 / 菜单的屏幕范围（整窗翻译用）。
 save_bmp(path, w, h, bgra) -> 写 32 位 BMP（纯 Python，不用 Pillow）。
 
 非 Windows 上 import 安全，capture_region 会抛 RuntimeError。
@@ -60,6 +61,98 @@ def get_cursor_pos():
     except Exception:
         pass
     return None
+
+
+def window_rect_at(x, y, skip_pid=None):
+    """指针 (x, y) 下面那个顶层窗口的屏幕范围（v2.10 整窗翻译用）。
+
+    返回 (左, 上, 宽, 高)；找不到 / 非 Windows 返回 None。
+    - 下拉菜单、右键菜单本身就是一个顶层窗口（类名 #32768），指针放在菜单上
+      得到的就是整个菜单；放在软件界面上得到的是整个软件窗口。
+    - 用 DWM 的「扩展边框」取可见范围，避免 Win10/11 窗口外面那圈透明阴影。
+    - skip_pid：不取这个进程的窗口（本程序自己的气泡 / 译文层）；
+      指针正压在这类窗口上时，改取它下面的窗口。
+    """
+    if not IS_WIN:
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        user32 = ctypes.windll.user32
+
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", wt.LONG), ("y", wt.LONG)]
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", wt.LONG), ("top", wt.LONG),
+                        ("right", wt.LONG), ("bottom", wt.LONG)]
+
+        user32.WindowFromPoint.restype = wt.HWND
+        user32.WindowFromPoint.argtypes = [POINT]
+        user32.GetAncestor.restype = wt.HWND
+        user32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+        user32.GetWindow.restype = wt.HWND
+        user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+        user32.IsWindowVisible.argtypes = [wt.HWND]
+        user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(RECT)]
+        user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+
+        GA_ROOT, GW_HWNDNEXT = 2, 2
+        hwnd = user32.WindowFromPoint(POINT(int(x), int(y)))
+        for _ in range(40):                       # 最多往下找 40 层，防死循环
+            if not hwnd:
+                return None
+            root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+            pid = wt.DWORD(0)
+            user32.GetWindowThreadProcessId(root, ctypes.byref(pid))
+            if skip_pid is not None and pid.value == skip_pid:
+                # 压在本程序自己的浮层上：沿 Z 序找下一个包含该点的可见窗口
+                nxt = user32.GetWindow(root, GW_HWNDNEXT)
+                while nxt:
+                    r = RECT()
+                    if (user32.IsWindowVisible(nxt) and user32.GetWindowRect(nxt, ctypes.byref(r))
+                            and r.left <= x < r.right and r.top <= y < r.bottom):
+                        break
+                    nxt = user32.GetWindow(nxt, GW_HWNDNEXT)
+                hwnd = nxt
+                continue
+            rect = RECT()
+            ok = False
+            try:
+                # DWMWA_EXTENDED_FRAME_BOUNDS = 9
+                ok = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                    root, 9, ctypes.byref(rect), ctypes.sizeof(rect)) == 0
+            except Exception:
+                ok = False
+            if not ok:
+                if not user32.GetWindowRect(root, ctypes.byref(rect)):
+                    return None
+            w, h = rect.right - rect.left, rect.bottom - rect.top
+            if w < 10 or h < 10:
+                return None
+            return rect.left, rect.top, w, h
+        return None
+    except Exception:
+        return None
+
+
+def make_click_through(tk_window_id):
+    """把一个 Tk 顶层窗口设成「鼠标点击穿透 + 不抢焦点」（实时刷新的译文层用），
+    这样盖在软件上的译文层不挡你继续操作下面的软件。成功返回 True，非 Windows / 失败返回 False。"""
+    if not IS_WIN:
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(tk_window_id) or tk_window_id
+        GWL_EXSTYLE = -20
+        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        # WS_EX_LAYERED 0x80000 | WS_EX_TRANSPARENT 0x20 | WS_EX_TOOLWINDOW 0x80 | WS_EX_NOACTIVATE 0x08000000
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | 0x80000 | 0x20 | 0x80 | 0x08000000)
+        return True
+    except Exception:
+        return False
 
 
 def capture_region(x, y, width, height, scale=1):

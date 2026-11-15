@@ -22,7 +22,8 @@ app.hide_window = lambda: hits.append(1)      # Xvfb 无窗口管理器，无法
 r.focus_force(); pump(0.2); r.event_generate("<Escape>"); pump(0.3)
 import inspect
 _src = inspect.getsource(dt.App.hide_window)
-ok3 = bool(hits) and "iconify" in _src and "root.withdraw()" in _src and "tray" in _src
+_tray_src = inspect.getsource(dt.App._hide_to_tray)      # v2.10：藏到托盘的 withdraw 挪进了 _hide_to_tray
+ok3 = bool(hits) and "iconify" in _src and "root.withdraw()" in _tray_src and "tray" in _src
 print("Esc -> hide_window called:", bool(hits))
 app.show_window(); pump(0.3)
 # engine list / error path

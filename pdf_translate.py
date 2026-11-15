@@ -30,16 +30,27 @@ _DELIMS = b" \t\r\n\f\x00()<>[]{}/%"
 _WS = b" \t\r\n\f\x00"
 
 
-def _inflate(raw):
-    """解 Flate 流：先按 zlib 包一层试，再按裸 deflate 试，都不行就抛错。"""
-    try:
-        obj = zlib.decompressobj()
-        out = obj.decompress(raw)
+# v2.10：单个流解压后最多 32 MB、整份 PDF 累计最多 256 MB 的内容流；
+# 超过就放弃该流（按原字节处理）。旧版 decompress() 不设上限，一个带大量
+# 图片 / 压缩炸弹的 PDF 会把内存吃光，程序直接卡死或闪退。
+MAX_STREAM_BYTES = 32 * 1024 * 1024
+MAX_TOTAL_BYTES = 256 * 1024 * 1024
+MAX_PDF_BYTES = 200 * 1024 * 1024
+
+
+def _inflate(raw, limit=MAX_STREAM_BYTES):
+    """解 Flate 流：先按 zlib 包一层试，再按裸 deflate 试，都不行就抛错。
+    解压结果超过 limit 字节时抛 ValueError（不再继续吃内存）。"""
+    def _run(obj):
+        out = obj.decompress(raw, limit + 1)
+        if len(out) > limit:
+            raise ValueError("流解压后过大，已放弃")
         return out
+    try:
+        return _run(zlib.decompressobj())
     except zlib.error:
         pass
-    obj = zlib.decompressobj(-15)
-    return obj.decompress(raw)
+    return _run(zlib.decompressobj(-15))
 
 
 # ------------------------------------------------------------------ CMap
@@ -356,12 +367,21 @@ def _extract_from_content(data, cmap):
 
 
 # ------------------------------------------------------------------ 流提取
-_STREAM_RE = re.compile(rb"stream(\r\n|\n|\r)")
+# (?<!end)：别把 endstream 的后半截也当成 stream 的开头（旧版会把下一个对象——常常是整张图片——当正文流再处理一遍）
+_STREAM_RE = re.compile(rb"(?<!end)stream(\r\n|\n|\r)")
 _FLATE_RE = re.compile(rb"/Fl(ateDecode)?[\s\[/]")
 
 
+_BINARY_HINT_RE = re.compile(rb"/Subtype\s*/(Image|Type1C|CIDFontType0C|OpenType)|/FontFile|/Type\s*/(XObject|ObjStm|XRef)")
+
+
 def _iter_stream_payloads(data):
-    """逐个找出 stream…endstream 段；FlateDecode 的先解压，解不开就用原字节。"""
+    """逐个找出 stream…endstream 段；FlateDecode 的先解压，解不开就用原字节。
+
+    v2.10：图片 / 字体文件 / 对象流这类二进制流不含正文，直接跳过
+    （以前也解压，一份带几百张图的 PDF 能解出几 GB）；累计解压量封顶。
+    """
+    total = 0
     for m in _STREAM_RE.finditer(data):
         start = m.end()
         end = data.find(b"endstream", start)
@@ -369,21 +389,35 @@ def _iter_stream_payloads(data):
             end = data.find(b"endobj", start)
             if end < 0:
                 end = len(data)
-        raw = data[start:end]
         window = data[max(0, m.start() - 1024):m.start()]
+        # 流的字典在 stream 关键字前面：取最后一个 obj 之后的那段，免得把上一个对象的标记算进来
+        cut = window.rfind(b" obj")
+        dict_part = window[cut:] if cut >= 0 else window
+        if _BINARY_HINT_RE.search(dict_part):
+            continue
+        raw = data[start:end]
         payload = raw
-        if b"FlateDecode" in window or _FLATE_RE.search(window):
+        if b"FlateDecode" in dict_part or _FLATE_RE.search(dict_part):
             try:
                 payload = _inflate(raw)
             except Exception:
                 payload = raw
+        total += len(payload)
+        if total > MAX_TOTAL_BYTES:
+            return
         yield payload
 
 
 def _extract_pdf_text_bytes(data):
     payloads = list(_iter_stream_payloads(data or b""))
-    cmap_text = b"\n".join(payloads) + b"\n" + (data or b"")
-    cmap = _parse_cmap(cmap_text.decode("latin-1", errors="replace"))
+    # CMap 只可能在含 beginbfchar / beginbfrange 的流里（或文件明文里）；
+    # 以前把所有流 + 整个文件拼成一份巨大字符串再 decode，内存是文件的好几倍。
+    cmap_parts = [p for p in payloads if b"beginbf" in p]
+    if b"beginbf" in (data or b""):
+        cmap_parts.append(data)
+    cmap_text = b"\n".join(cmap_parts)
+    cmap = _parse_cmap(cmap_text.decode("latin-1", errors="replace")) if cmap_parts else {}
+    del cmap_text, cmap_parts
     parts = []
     for payload in payloads:
         try:
@@ -404,6 +438,8 @@ def extract_pdf_text(path_or_bytes):
         if isinstance(path_or_bytes, (bytes, bytearray)):
             data = bytes(path_or_bytes)
         elif isinstance(path_or_bytes, (str, os.PathLike)):
+            if os.path.getsize(path_or_bytes) > MAX_PDF_BYTES:
+                return ""
             with open(path_or_bytes, "rb") as f:
                 data = f.read()
         else:

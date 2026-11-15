@@ -27,7 +27,7 @@
    建独立虚拟环境 → 下载语言包到 `offline_models\` → 打包 → **自动自检**（真正加载模型翻译一句）
 4. 得到 `dist\RealtimeTranslateOffline\`，里面的 `RealtimeTranslate.exe` 可直接运行，整个文件夹可复制给别人
 5. 做成安装向导：安装 [Inno Setup 6](https://jrsoftware.org/isdl.php)，运行 `build_installer.bat offline`
-   → `Output\RealtimeTranslate_Offline_Setup_v2.9.0.exe`
+   → `Output\RealtimeTranslate_Offline_Setup_v2.11.0.exe`
 
 **语言包下载不下来？**（`argos-net.com` 在部分网络下不通）
 用浏览器 / 代理从 [索引](https://github.com/argosopentech/argospm-index)（`index.json` 的 `links` 字段）下载 `.argosmodel`，
@@ -341,6 +341,21 @@
 
 **组件在线安装已验证（Linux）**：用真实 PyPI 的最新版组件，下载 → 校验 → 解压 → 加进路径，在**不带任何第三方包的纯净 Python** 里成功 import 并翻译（`tests\real_runtime_check.py`，需联网）；
 本地假 PyPI 测试覆盖：选版本（跳过其他系统 / musl / 预发布 / 被撤回 / Python 不匹配）、SHA 校验失败、zip-slip、取消回滚与续传、重装整体替换、32 位拒绝；界面：询问 / 失败重试 / 取消 / 装好免重启。
+
+**v2.11 未能验证（Windows 专有，请首次使用时实测）**
+- **实时刷新的点击穿透**：译文层用 `WS_EX_TRANSPARENT | WS_EX_NOACTIVATE` 设成点击穿透，沙箱只验证了调用路径；
+  真机上请确认译文层不挡鼠标、每轮刷新时的闪烁程度可接受（画面没变化时会复用上次译文，不重复识别）。
+- **悬停整窗翻译**：鼠标停住 ≥1.2 秒触发，同一窗口只翻一次；多显示器 / 高分屏下窗口范围是否准确需实测。
+- **文档预估耗时**：每请求 0.5 秒（在线，4 并发）/ 1.2 秒（离线）是经验值，实际会偏差，界面上写的是「约」。
+
+**v2.10 未能验证（Windows 专有，请首次使用时实测）**
+- **整窗翻译**：`Ctrl+Alt+W` 注册；`WindowFromPoint` + DWM 扩展边框取到的窗口范围是否正好是菜单 / 窗口
+  （含高分屏、多显示器、菜单阴影）；下拉菜单开着时热键是否照常触发；2 倍放大后系统 OCR 对小号界面字的识别效果。
+  找不到窗口 / 识别不出字时状态栏会写明原因。
+- **卸载询问删库**：`installer.iss` 末尾新增 `[Code]` 段（`CurUninstallStepChanged`），沙箱里没有 Inno Setup，
+  **没有真实编译 / 卸载过**。请编译一次安装包后在真机上试：选「是」应删掉 `%APPDATA%\RealtimeTranslate`，
+  选「否」应保留，`/VERYSILENT` 卸载应保留。脚本文件已加 UTF-8 BOM，保证中文提示不乱码。
+- **任务栏最小化**：`close_action = taskbar` 走 Tk 的 `iconify()`；沙箱 Xvfb 没有窗口管理器，只验证了调用路径，没验证真实最小化。
 
 **v2.4 未能验证（Windows 专有，请首次使用时实测）**
 - **托盘**：`Shell_NotifyIconW` 加图标、左键双击显示、右键菜单、资源管理器重启后

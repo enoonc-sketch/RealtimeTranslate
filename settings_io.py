@@ -15,9 +15,9 @@ FORMAT_VERSION = 1
 
 _STR_KEYS = frozenset([
     "sl", "tl", "geometry", "engine", "pack_mirror", "pointer_scope",
-    "close_action", "popup_mode", "shot_mode",
+    "close_action", "minimize_action", "popup_mode", "shot_mode",
     "hotkey_main", "hotkey_pointer", "hotkey_shot", "hotkey_replace",
-    "hotkey_clip",
+    "hotkey_clip", "hotkey_window",
     "update_last_check",
     "proxy_host", "proxy_user", "tts_voice",
 ])
@@ -25,16 +25,16 @@ _BOOL_KEYS = frozenset([
     "top", "watch", "smart", "bilingual", "reflow", "show_src",
     "auto_offline", "pointer", "hover", "tray_tip",
     "history_on", "history_reuse", "auto_copy", "dark_mode", "update_auto",
-    "proxy_enabled",
+    "proxy_enabled", "hover_window",
 ])
 _INT_KEYS = frozenset([
     "history_max", "mini_w", "mini_h", "hover_ms", "tts_rate", "font_size",
-    "proxy_port",
+    "proxy_port", "live_interval",
 ])
 # 热键只要求是非空字符串，这里不解析组合键。
 _HOTKEY_KEYS = frozenset([
     "hotkey_main", "hotkey_pointer", "hotkey_shot", "hotkey_replace",
-    "hotkey_clip",
+    "hotkey_clip", "hotkey_window",
 ])
 # 注意：proxy_pass（代理密码）刻意不在上面任何一张表里——设置导出时
 # _check_value 认不出它，永远不写进导出的 JSON；导入时则按 defaults
@@ -48,6 +48,7 @@ _CLAMPS = {
     "mini_w": (1, None),
     "mini_h": (1, None),
     "proxy_port": (0, 65535),
+    "live_interval": (2, 30),
 }
 
 _TOP_KEYS = frozenset(["app", "version", "config", "glossary"])

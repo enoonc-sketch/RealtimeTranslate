@@ -25,6 +25,63 @@ SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 _TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}( .*)?$")
 
 
+# v2.10：大文件保护。超过上限直接拒绝（给出明确提示），不再把整个文件读进内存后卡死。
+MAX_TEXT_BYTES = 50 * 1024 * 1024        # .txt / .md / .srt
+MAX_DOCX_BYTES = 100 * 1024 * 1024       # .docx 压缩包本身
+MAX_DOCX_XML_BYTES = 200 * 1024 * 1024   # word/document.xml 解压后（防压缩炸弹）
+MAX_PDF_BYTES = 200 * 1024 * 1024        # .pdf（与 pdf_translate.MAX_PDF_BYTES 一致）
+LARGE_DOC_BYTES = 5 * 1024 * 1024        # 超过这个大小先问一句再翻
+
+
+def size_limit_for(ext):
+    """按扩展名返回文件大小上限（字节）。"""
+    ext = (ext or "").lower()
+    if ext == ".pdf":
+        return MAX_PDF_BYTES
+    if ext == ".docx":
+        return MAX_DOCX_BYTES
+    return MAX_TEXT_BYTES
+
+
+def decode_text(raw):
+    """字节 → 文本：UTF-8(带/不带 BOM) → UTF-16(带 BOM) → GB18030 → 宽松 UTF-8。
+    旧版只认 UTF-8，GBK 编码的中文 txt / srt 会直接「打不开文档」。"""
+    raw = raw or b""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return raw.decode("gb18030")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", errors="replace")
+
+
+def read_text_file(path, max_bytes=MAX_TEXT_BYTES):
+    """读文本文档；超过 max_bytes 抛 ValueError（消息可直接给用户看）。"""
+    size = os.path.getsize(path)
+    if size > max_bytes:
+        raise ValueError("文件太大（%.1f MB），上限 %d MB，请拆成几份再翻译"
+                         % (size / 1048576.0, max_bytes // 1048576))
+    with open(path, "rb") as f:
+        return decode_text(f.read())
+
+
+def _check_docx_zip(zin):
+    """docx 压缩包里 document.xml 解压后太大就拒绝（压缩炸弹）。"""
+    try:
+        info = zin.getinfo("word/document.xml")
+    except KeyError:
+        return
+    if info.file_size > MAX_DOCX_XML_BYTES:
+        raise ValueError("文档正文太大（解压后 %.0f MB），已拒绝处理" % (info.file_size / 1048576.0))
+
+
 def supported_doc_ext(path):
     """是不是支持的文档扩展名（.txt / .md / .srt / .docx，不区分大小写）。"""
     return os.path.splitext(str(path or ""))[1].lower() in SUPPORTED_DOC_EXTS
@@ -223,6 +280,7 @@ def docx_translate_bytes(data, fn, progress=None):
         names = zin.namelist()
         if "word/document.xml" not in names:
             raise ValueError("不是合法的 .docx 文件（缺少 word/document.xml）")
+        _check_docx_zip(zin)
         xml = zin.read("word/document.xml")
         texts = docx_paragraph_texts(xml)
         done = []
@@ -244,6 +302,7 @@ def docx_document_xml(data):
     try:
         if "word/document.xml" not in zin.namelist():
             raise ValueError("不是合法的 .docx 文件（缺少 word/document.xml）")
+        _check_docx_zip(zin)
         return zin.read("word/document.xml")
     finally:
         zin.close()
@@ -256,6 +315,7 @@ def docx_rebuild(data, translated):
     """
     zin = zipfile.ZipFile(io.BytesIO(data or b""))
     try:
+        _check_docx_zip(zin)
         xml = zin.read("word/document.xml")
         new_xml = docx_replace_texts(xml, translated)
         buf = io.BytesIO()

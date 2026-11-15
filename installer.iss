@@ -1,4 +1,4 @@
-; Inno Setup 脚本 — 生成带卸载功能的安装向导（需 Inno Setup 6.x）
+﻿; Inno Setup 脚本 — 生成带卸载功能的安装向导（需 Inno Setup 6.x）
 ;   标准版：需先有 RealtimeTranslate.exe（build_exe.bat 生成）          →  iscc installer.iss
 ;   离线版：需先有 dist\RealtimeTranslateOffline\（build_offline.bat 生成） →  iscc /DOFFLINE=1 installer.iss
 ;   两个版本使用同一个 AppId：互相覆盖升级，开始菜单/自启项/设置通用。
@@ -8,7 +8,7 @@
 ; 放到本文件同目录（或 Inno Setup 的 Languages 目录）。找不到时自动回退为英文向导，不会编译失败。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.9.0"
+  #define MyAppVersion "2.11.0"
 #endif
 #define MyAppName "实时翻译"
 #ifdef OFFLINE
@@ -88,6 +88,32 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
-[UninstallDelete]
-; 程序设置保存在 %APPDATA%\RealtimeTranslate（config.json / crash.log）
-Type: filesandordirs; Name: "{userappdata}\RealtimeTranslate"
+; v2.10：不再无条件删除 %APPDATA%\RealtimeTranslate。
+; 那个目录里有翻译历史数据库（history.db）、设置（config.json）、
+; 用户导入 / 下载的离线语言包（models）等，用户重装 / 升级时往往还想留着，
+; 所以卸载最后一步（见下面 [Code]）弹窗问一句：删不删。
+
+[Code]
+// 卸载收尾：询问是否同时删除用户数据（翻译历史数据库、设置、离线语言包）。
+//   选「是」：整个数据目录删除，无法恢复；
+//   选「否」（默认按钮）：保留，以后重装能接着用；
+//   静默卸载（/SILENT /VERYSILENT）或 /SUPPRESSMSGBOXES：一律保留，绝不静默删用户数据。
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  DataDir, Msg: String;
+begin
+  if CurUninstallStep <> usPostUninstall then
+    Exit;
+  DataDir := ExpandConstant('{userappdata}\RealtimeTranslate');
+  if not DirExists(DataDir) then
+    Exit;
+  if UninstallSilent then
+    Exit;
+  Msg := '是否同时删除「实时翻译」的用户数据？' + #13#10 + #13#10 +
+         '包括：翻译历史记录数据库、程序设置、术语表、已导入 / 下载的离线语言包。' + #13#10 +
+         '位置：' + DataDir + #13#10 + #13#10 +
+         '选「是」：全部删除，无法恢复。' + #13#10 +
+         '选「否」：保留这些数据，以后重新安装可以继续使用。';
+  if MsgBox(Msg, mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+    DelTree(DataDir, True, True, True);
+end;
