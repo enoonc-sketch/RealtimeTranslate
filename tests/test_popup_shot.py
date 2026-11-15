@@ -241,7 +241,8 @@ texts = [cv.itemcget(i, "text") for i in cv.find_all() if cv.type(i) == "text"]
 ok("canvas has the screenshot image + cover rectangles + translated text",
    "image" in types and types.count("rectangle") >= 2 and "译:Hello world second line here" in texts and "译:Footer text" in texts)
 ok("translated text drawn inside the original paragraph area",
-   all(cv.bbox(i)[0] >= 15 and cv.bbox(i)[2] <= cw for i in cv.find_all() if cv.type(i) == "text"))
+   all(cv.bbox(i)[0] >= 15 and cv.bbox(i)[2] <= cw for i in cv.find_all()
+       if cv.type(i) == "text" and cv.itemcget(i, "text").startswith("译:")))
 ok("main window synced + history saved as screenshot",
    "Hello world" in app.src.get("1.0", "end") and app.history.find(
        "Hello world second line here\nFooter text", *app._codes()) is not None
@@ -249,16 +250,23 @@ ok("main window synced + history saved as screenshot",
 ok("hover is blocked while overlay is shown", app._hover_blocked((0, 0)) is True)
 copied = []
 app._set_clip = lambda t: copied.append(t)
-cv.event_generate("<Button-1>", x=50, y=50)
+# v2.12：单击一块是加入术语表，双击才是复制全部（两次快速按下，Tk 会把第二次认成双击）
+cv.event_generate("<ButtonPress-1>", x=50, y=50)
+app.root.update(); time.sleep(0.05)
+cv.event_generate("<ButtonPress-1>", x=50, y=50)
 app.root.update()
-ok("left click copies all translated text and closes", copied == ["译:Hello world second line here\n译:Footer text"]
+ok("double click copies all translated text and closes", copied == ["译:Hello world second line here\n译:Footer text"]
    and app.shot_overlay is None)
 app._show_shot_overlay(rc, png2, boxes, det, target, engine)
 app.root.update()
 cv = [w for w in walk(app.shot_overlay) if w.winfo_class() == "Canvas"][0]
 cv.event_generate("<Button-3>", x=5, y=5)
 app.root.update()
-ok("right click closes overlay", app.shot_overlay is None)
+ok("right click opens a menu instead of closing", app.shot_overlay is not None
+   and getattr(app, "_overlay_menu", None) is not None)
+app._overlay_menu.invoke("关闭")
+app.root.update()
+ok("menu Close closes the overlay", app.shot_overlay is None)
 # 一段翻译失败不拖垮整张图
 def flaky(text, sl, tl, smart, engine, cancelled=None):
     if "Footer" in text:

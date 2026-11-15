@@ -220,7 +220,7 @@ ok("installer asks before deleting data",
    and "DelTree(DataDir" in iss)
 ok("default button is No, silent uninstall keeps data",
    "MB_DEFBUTTON2" in iss and "UninstallSilent" in iss)
-ok("installer version bumped", '#define MyAppVersion "2.11.0"' in iss and dt.__version__ == "2.11.0")
+ok("installer version bumped", '#define MyAppVersion "2.12.0"' in iss and dt.__version__ == "2.12.0")
 
 # ======================================================================
 # 5. 界面：关闭 / 最小化 / 整窗翻译 / 大文档 / 取消

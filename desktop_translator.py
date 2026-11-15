@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-实时翻译 — 桌面独立版 v2.10，Windows / macOS / Linux(X11)
+实时翻译 — 桌面独立版 v2.12，Windows / macOS / Linux(X11)
 
 功能
   1. 输入即译：窗口里打字或粘贴，停顿约 0.35 秒自动翻译
@@ -51,19 +51,28 @@
      「点 ×」可选最小化到任务栏、点「–」可选收进托盘、卸载时询问是否删除数据库、
      大文件卡死修复（后台读取 / 解析、可取消、线性合并断行、译文框只显示前一部分、
      PDF 防压缩炸弹、文件大小上限）
+ 18. v2.11：悬停整窗翻译（鼠标停住就整窗翻，同一窗口只翻一次）、文档翻译前预估耗时
+     （段数 ≥2000 或预估 ≥60 秒才先问）、实时刷新（每隔几秒重翻同一窗口，译文层点击穿透）
+ 19. v2.12：诊断信息一键复制（版本号 / 系统 / DPI / OCR / 各热键注册状态）、看门狗
+     （界面线程卡死自动记各线程调用栈）、整窗翻译按窗口记忆缓存（同一菜单秒出）、
+     整窗结果导出 CSV 对照表、译文层点一块加入术语表
 """
 import base64
 import collections
+import csv
+import hashlib
 import itertools
 import json
 import math
 import os
+import platform
 import queue
 import re
 import socket
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 import urllib.error
 import urllib.parse
@@ -232,7 +241,7 @@ CLOSE_NAMES = {"tray": "隐藏到托盘", "taskbar": "最小化到任务栏", "q
 CLOSE_CODES = {v: k for k, v in CLOSE_NAMES.items()}
 MINIMIZE_NAMES = {"taskbar": "留在任务栏", "tray": "收进托盘"}        # 点窗口 – 最小化时（v2.10）
 MINIMIZE_CODES = {v: k for k, v in MINIMIZE_NAMES.items()}
-__version__ = "2.11.0"
+__version__ = "2.12.0"
 APP_TITLE = "实时翻译"
 RUN_VALUE = "RealtimeTranslate"
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -244,6 +253,7 @@ else:
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 HISTORY_PATH = os.path.join(DATA_DIR, "history.db")
 CRASH_LOG = os.path.join(DATA_DIR, "crash.log")
+WATCHDOG_LOG = os.path.join(DATA_DIR, "watchdog.log")   # v2.12：看门狗记界面卡死时的各线程调用栈
 USER_MODELS_DIR = os.path.join(DATA_DIR, "models")      # 用户自己导入 / 在线下载的离线语言包
 
 
@@ -623,6 +633,245 @@ class HoverCache:
 
     def clear(self):
         self._store.clear()
+
+
+# ---------------------------------------------------------------- v2.12 诊断信息
+_HOTKEY_CN = {"hotkey_main": "翻译选中的文字", "hotkey_pointer": "指针取词",
+              "hotkey_shot": "截图翻译", "hotkey_replace": "翻译并替换原文",
+              "hotkey_clip": "粘贴图片翻译", "hotkey_window": "整窗翻译"}
+
+
+def os_version_text():
+    """操作系统版本（一行纯文本；任何平台都不抛异常）。"""
+    try:
+        if IS_WIN:
+            return "Windows %s %s" % (platform.release(), platform.version())
+        return "%s %s" % (platform.system(), platform.release())
+    except Exception:
+        return "不可用"
+
+
+def dpi_scale_text():
+    """主显示器 DPI 缩放（如 "150%"；非 Windows / 取不到时写"不可用"，不崩）。"""
+    if not IS_WIN:
+        return "不可用（非 Windows）"
+    try:
+        import ctypes
+        try:
+            dpi = ctypes.windll.user32.GetDpiForSystem()
+        except Exception:
+            hdc = ctypes.windll.user32.GetDC(0)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)     # LOGPIXELSX
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+        if dpi and dpi > 0:
+            return "%d%%" % round(dpi * 100 / 96)
+    except Exception:
+        pass
+    return "不可用"
+
+
+def build_diag_text(info):
+    """把诊断信息 dict 拼成可粘贴的纯文本。
+
+    info 的键：version / python / os / dpi / ocr / hotkeys（[(中文名, 组合键, 状态)]）。
+    缺哪个键就写"不可用"，从不抛异常——诊断本身不能成为新的崩溃源。
+    """
+    info = info or {}
+    hotkeys = info.get("hotkeys") or []
+    lines = ["实时翻译 诊断信息",
+             "应用版本：实时翻译 v%s" % (info.get("version") or "不可用"),
+             "Python：%s" % (info.get("python") or "不可用"),
+             "操作系统：%s" % (info.get("os") or "不可用"),
+             "DPI 缩放：%s" % (info.get("dpi") or "不可用"),
+             "OCR：%s" % (info.get("ocr") or "不可用"),
+             "热键："]
+    if not hotkeys:
+        lines.append("  （无热键状态）")
+    for item in hotkeys:
+        try:
+            name, spec, status = item[0], item[1], item[2]
+        except Exception:
+            continue
+        lines.append("  %s %s：%s" % (name, spec, status))
+    return "\n".join(lines)
+
+
+def collect_diag_info(app):
+    """从运行中的 App 收集诊断信息（每项探测都单独 try，缺失写"不可用"）。
+
+    热键状态来自 _start_hotkey 启动时记下的注册结果（见 _hotkey_status）：
+    已注册 / 未注册（被占用）/ 不可用（还没启动或该平台不支持）。
+    """
+    try:
+        ocr = "可用" if ocr_win.ocr_available() else "不可用（未找到 PowerShell / OCR 组件）"
+    except Exception:
+        ocr = "不可用"
+    status = getattr(app, "_hotkey_status", None) or {}
+    hotkeys = []
+    cfg = getattr(app, "cfg", {}) or {}
+    for key in HOTKEY_KEYS:
+        spec = cfg.get(key, DEFAULT_HOTKEYS[key])
+        label = hotkey_label(spec)
+        if key not in status:
+            st = "不可用"
+        elif status[key]:
+            st = "已注册"
+        else:
+            st = "未注册（被占用）"
+        hotkeys.append((_HOTKEY_CN.get(key, key), label, st))
+    return {"version": __version__,
+            "python": sys.version.split()[0] if sys.version else "不可用",
+            "os": os_version_text(),
+            "dpi": dpi_scale_text(),
+            "ocr": ocr,
+            "hotkeys": hotkeys}
+
+
+# ---------------------------------------------------------------- v2.12 看门狗
+class Watchdog:
+    """界面线程卡死自动记调用栈（crash.log 只记异常，这里补"没崩但卡住"的情况）。
+
+    界面线程（Tk 主循环）每轮 _poll 都调 beat() 更新心跳；本线程每 interval 秒
+    检查一次，心跳超过 threshold 秒没更新就判定卡死，用 sys._current_frames()
+    把当时所有线程的调用栈写进 watchdog.log。一次卡死只记一次，恢复后复位，
+    卡死期间不刷屏。开销：每秒一次时间比较 + 一次浮点赋值，可忽略。
+    beat()/check_once() 都可单独测，不依赖 Tk。
+    """
+
+    def __init__(self, log_path, threshold=5.0, interval=1.0):
+        self.log_path = log_path
+        self.threshold = threshold
+        self.interval = interval
+        self._last_beat = time.time()
+        self._reported = False
+        self._stop = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+
+    @property
+    def running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def beat(self):
+        with self._lock:
+            self._last_beat = time.time()
+
+    def start(self):
+        if self.running:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="watchdog")
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        t = self._thread
+        if t is not None:
+            t.join(timeout=2.0)
+        self._thread = None
+
+    def _loop(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self.check_once()
+            except Exception:
+                pass
+
+    def check_once(self, now=None):
+        now = time.time() if now is None else now
+        with self._lock:
+            last = self._last_beat
+        if now - last > self.threshold:
+            if not self._reported:
+                self._reported = True
+                self._dump(now - last)
+        else:
+            self._reported = False
+
+    def _dump(self, stalled_for):
+        try:
+            frames = sys._current_frames()
+            head = ("[%s] WATCHDOG v%s 界面线程超过 %.1f 秒无响应，当前各线程调用栈：\n"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), __version__, stalled_for))
+            parts = [head]
+            for tid, frame in sorted(frames.items()):
+                th = None
+                for t in threading.enumerate():
+                    if t.ident == tid:
+                        th = t
+                        break
+                name = th.name if th is not None else "?"
+                parts.append("线程 %s (id=%s):\n" % (name, tid))
+                parts.extend(traceback.format_stack(frame))
+                parts.append("\n")
+            parent = os.path.dirname(self.log_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write("".join(parts) + "\n")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- v2.12 整窗翻译按窗口记忆缓存
+class WindowShotCache:
+    """整窗翻译的 OCR + 译文缓存（只放内存，不落盘；上限 50 条 LRU）。
+
+    键 = 窗口范围 + 整图 BGRA 字节的 SHA256（取前 32 位 hex）：工业软件界面
+    文字基本固定，同一菜单每次截到的像素是字节级相同的，精确哈希命中可靠；
+    刻意不用下采样/模糊哈希——长得像的两个菜单绝不能互相串结果。
+    命中时跳过 OCR 与翻译、直接出上次的结果；像素或范围变了就重新识别。
+    """
+
+    def __init__(self, max_items=50):
+        self.max_items = max_items
+        self._store = collections.OrderedDict()
+
+    @staticmethod
+    def key(rect, bgra):
+        blob = (bgra or b"") + ("%d,%d,%d,%d" % (rect[0], rect[1], rect[2], rect[3])).encode()
+        return hashlib.sha256(blob).hexdigest()[:32]
+
+    def get(self, rect, bgra):
+        k = self.key(rect, bgra)
+        msg = self._store.get(k)
+        if msg is None:
+            return None
+        self._store.move_to_end(k)
+        return msg
+
+    def put(self, rect, bgra, msg):
+        k = self.key(rect, bgra)
+        self._store[k] = msg
+        self._store.move_to_end(k)
+        while len(self._store) > self.max_items:
+            self._store.popitem(last=False)
+
+    def __len__(self):
+        return len(self._store)
+
+
+def export_window_pairs_csv(pairs, path):
+    """把整窗翻译的 (原文, 译文) 写成 CSV 对照表：UTF-8 带 BOM（Excel 直接打开
+    不乱码），列头 原文/译文。含逗号 / 换行 / 中文的字段由 csv 模块自动加引号，
+    不会断行。返回写出的行数（不含列头）。"""
+    rows = [[str(s or ""), str(d or "")] for s, d in (pairs or [])]
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["原文", "译文"])
+        w.writerows(rows)
+    return len(rows)
+
+
+def overlay_block_at(boxes, x, y):
+    """译文层上 (x, y) 点落在第几块译文上（没有返回 None）。"""
+    for i, b in enumerate(boxes or []):
+        try:
+            if b["x"] <= x < b["x"] + b["w"] and b["y"] <= y < b["y"] + b["h"]:
+                return i
+        except Exception:
+            continue
+    return None
 
 
 _ms_token = {"value": "", "ts": 0.0}
@@ -1649,6 +1898,9 @@ class App:
         self._live_crc = None
         self._live_msg = None
         self._hover_win_rect = None             # v2.11：悬停整窗翻译上一次翻的窗口范围
+        self._window_cache = WindowShotCache()  # v2.12：整窗翻译按窗口记忆缓存（内存，50 条 LRU）
+        self._hotkey_status = {}                # v2.12：启动时各热键的注册结果（诊断信息用）
+        self._watchdog = None                   # v2.12：界面卡死看门狗（root 建好后启动）
         self._doc_busy = False                  # v2.10：文档翻译进行中（防重复点击）
         self._doc_cancel = threading.Event()    # v2.10：「取消翻译」
         self._tts_kind = None          # 正在朗读的是原文（"src"）还是译文（"dst"），用于再点一次停止
@@ -1678,6 +1930,8 @@ class App:
         self.root.bind("<Unmap>", self._on_unmap)
         self.root.bind("<Escape>", lambda e: (self.bubble.close(), self.mini.close(), self._close_shot_overlay(),
                                               self.hide_window()))
+        self._watchdog = Watchdog(WATCHDOG_LOG)   # v2.12：界面线程卡死自动记调用栈
+        self._watchdog.start()
         self.root.after(100, self._poll)
         self.root.after(600, self._watch_clip)
         self.root.after(1500, self._warmup)
@@ -2100,21 +2354,13 @@ class App:
         ttk.Button(btns, text="粘贴图片翻译", command=self._translate_clipboard_image).pack(side="left")
         ttk.Button(btns, text="🎤 语音输入", command=self.start_voice_input).pack(side="left")
         ttk.Button(btns, text="退出", command=self.quit).pack(side="right")
-        # v2.10：第二行按钮（第一行已经很满）：整窗翻译 + 文档翻译的「取消翻译」（平时隐藏）
+        # v2.11：整窗翻译 / 实时刷新 / 悬停整窗等进阶功能放在「高级设置 → 取词」，主窗口保持简洁；
+        # 这一行平时是空的，只在文档翻译进行中显示「取消翻译」。
         btns2 = ttk.Frame(root)
-        btns2.pack(fill="x", padx=12, pady=(4, 0))
-        ttk.Button(btns2, text="整窗翻译（3 秒后翻指针下的菜单 / 窗口）",
-                   command=lambda: self.window_translate(delay_ms=3000)).pack(side="left")
+        btns2.pack(fill="x", padx=12)
         self.doc_cancel_btn = ttk.Button(btns2, text="取消翻译", command=self._cancel_doc)
         self.live_var = tk.BooleanVar(value=False)
         self.live_int_var = tk.StringVar(value=str(self.cfg.get("live_interval", 3)))
-        ttk.Checkbutton(btns2, text="实时刷新", variable=self.live_var,
-                        command=self._on_live_toggle).pack(side="left", padx=(12, 0))
-        lcb = ttk.Combobox(btns2, textvariable=self.live_int_var, values=["2", "3", "5", "10"], width=3)
-        lcb.pack(side="left", padx=(4, 0))
-        lcb.bind("<<ComboboxSelected>>", lambda e: self._on_live_interval())
-        lcb.bind("<Return>", lambda e: self._on_live_interval())
-        ttk.Label(btns2, text="秒").pack(side="left")
 
         # —— 选项区：常用开关留在主窗口，其余按用途归类放进「高级设置」 ——
         self.top_var = tk.BooleanVar(value=self.cfg["top"])
@@ -2171,6 +2417,10 @@ class App:
                         command=self._on_pointer_opt).pack(side="left")
         ttk.Checkbutton(o2, text="悬停取词", variable=self.hover_var,
                         command=self._on_pointer_opt).pack(side="left", padx=10)
+        # v2.11：「跟随指针的小窗口」以前只能在高级设置的下拉框里选，这里放一个开关（和下拉框同步）
+        self.mini_follow_var = tk.BooleanVar(value=self.cfg.get("popup_mode") == "mini")
+        ttk.Checkbutton(o2, text="小窗跟随指针", variable=self.mini_follow_var,
+                        command=self._on_mini_follow).pack(side="left")
         ttk.Button(o2, text="高级设置…", command=self.open_settings).pack(side="right")
         ttk.Button(o2, text="翻译历史…", command=self.open_history).pack(side="right", padx=(0, 6))
         self.fav_btn = ttk.Button(o2, text="☆ 收藏", command=self.favorite_current)
@@ -2348,6 +2598,27 @@ class App:
         sp.bind("<FocusOut>", lambda e: self._on_hover_ms())
         ttk.Label(row, text="毫秒（300 ~ 3000，鼠标停住多久后自动取词）", foreground="#5b6676").pack(side="left", padx=6)
 
+        # —— v2.11 整窗翻译（进阶）：整个菜单 / 对话框 / 软件窗口一次翻完 ——
+        ttk.Separator(f).pack(fill="x", pady=(16, 8))
+        ttk.Label(f, text="整窗翻译", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(6, 0))
+        ttk.Button(row, text="整窗翻译（3 秒后翻指针下的窗口）",
+                   command=lambda: self._settings_then(lambda: self.window_translate(delay_ms=3000))
+                   ).pack(side="left")
+        ttk.Label(row, text="或按 %s" % self.hotkey_window_label, foreground="#5b6676").pack(side="left", padx=8)
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(8, 0))
+        ttk.Checkbutton(row, text="实时刷新", variable=self.live_var,
+                        command=lambda: self._settings_then(self._on_live_toggle)).pack(side="left")
+        lcb = ttk.Combobox(row, textvariable=self.live_int_var, values=["2", "3", "5", "10"], width=3)
+        lcb.pack(side="left", padx=(8, 0))
+        lcb.bind("<<ComboboxSelected>>", lambda e: self._on_live_interval())
+        lcb.bind("<Return>", lambda e: self._on_live_interval())
+        ttk.Label(row, text="秒（每隔几秒重新翻译）", foreground="#5b6676").pack(side="left", padx=6)
+        ttk.Label(f, text="实时刷新：译文层点击穿透，可以照常操作下面的软件；再按整窗热键或取消勾选停止。",
+                  foreground="#5b6676", wraplength=500, justify="left").pack(anchor="w", pady=(2, 0))
+
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(14, 0))
         ttk.Label(row, text="取词结果显示：").pack(side="left")
@@ -2499,6 +2770,13 @@ class App:
         self.update_label.pack(side="left", padx=8)
         check(f, "每天启动时自动检查更新", self.update_auto_var, self._save,
               "每天只查一次；有新版才告诉你，从不自动下载、从不自动安装。")
+        ttk.Label(f, text="诊断信息：", font=self.ui_font).pack(anchor="w", pady=(16, 2))
+        row = ttk.Frame(f)
+        row.pack(anchor="w")
+        ttk.Button(row, text="复制诊断信息", command=self._copy_diag_info).pack(side="left")
+        ttk.Label(row, text="一键复制版本号、系统版本、DPI 缩放、OCR 是否可用和各热键注册状态；"
+                            "报「某个热键没反应」时直接把这段贴出来定位，不用来回问。",
+                  foreground="#5b6676", wraplength=420, justify="left").pack(side="left", padx=8)
 
         bar = ttk.Frame(win)
         bar.pack(fill="x", padx=10, pady=(0, 10))
@@ -2517,11 +2795,26 @@ class App:
             win.after(300, lambda: win.attributes("-topmost", False))
         win.focus_force()
 
+    def _settings_then(self, fn):
+        """从高级设置里点整窗翻译 / 实时刷新：先收起设置窗口（别挡住目标），再执行。"""
+        try:
+            self.settings_win.withdraw()
+        except Exception:
+            pass
+        fn()
+
     def close_settings(self):
         self.settings_win.withdraw()
 
+    def _on_mini_follow(self):
+        """主窗口的「小窗跟随指针」开关：开 = 取词结果用跟随指针的小窗口，关 = 气泡。"""
+        self.popup_cb.set(POPUP_NAMES["mini" if self.mini_follow_var.get() else "bubble"])
+        self._on_popup_opt()
+
     def _on_popup_opt(self):
         self._save()
+        if hasattr(self, "mini_follow_var"):
+            self.mini_follow_var.set(self.cfg.get("popup_mode") == "mini")
         if self.cfg.get("popup_mode") != "mini":
             self.mini.close()
         if self.cfg.get("popup_mode") != "bubble":
@@ -2897,6 +3190,67 @@ class App:
         self.status.configure(text="术语表已导出 %d 对到 %s" % (
             len(self.cfg.get("glossary", [])), path))
 
+    # ------------------------------------------------ v2.12 诊断信息 / 术语沉淀 / 对照表导出
+    def _copy_diag_info(self):
+        """设置 → 关于里的「复制诊断信息」：版本号、系统版本、DPI 缩放、OCR 是否可用、
+        各热键注册状态，一键进剪贴板。任何一项探测失败都只写"不可用"，不弹窗、不崩。"""
+        try:
+            text = build_diag_text(collect_diag_info(self))
+            self._set_clip(text)
+            self.last_clip = text
+            self.status.configure(text="诊断信息已复制到剪贴板")
+        except Exception as e:      # noqa: BLE001  诊断本身绝不能拖垮主流程
+            try:
+                self.status.configure(text="诊断信息复制失败：%s" % str(e)[:60])
+            except Exception:
+                pass
+
+    def add_glossary_pair(self, src, dst):
+        """把一对原文→译文加进术语表（复用 glossary.py 的清洗与上限）。
+
+        已有的不重复加；太长（>40 字）或为空的拒绝。成功返回 True 并保存设置，
+        失败返回 False（调用方自行写状态栏，不弹窗）。"""
+        src, dst = (src or "").strip(), (dst or "").strip()
+        if not src or not dst:
+            return False
+        pairs = list(self.cfg.get("glossary", []))
+        if any(s == src for s, _ in pairs):
+            return False
+        clean = glossary.sanitize_pairs(pairs + [[src, dst]])
+        if [src, dst] not in clean:
+            return False
+        self.cfg["glossary"] = clean
+        glossary.set_active(clean)
+        try:
+            self._refresh_glossary_text()
+        except Exception:
+            pass
+        self._save()
+        self.status.configure(text="已加入术语表：%s = %s" % (src, dst))
+        return True
+
+    def _export_shot_csv(self, pairs=None):
+        """把整窗翻译的 (原文, 译文) 导出成 CSV 对照表（UTF-8 带 BOM，Excel 直接打开）。
+
+        pairs 默认取最近一次整窗/截图翻译的段；取消时只写状态栏，不弹窗。"""
+        if pairs is None:
+            pairs = list(getattr(self, "pairs", []) or [])
+        if not pairs:
+            self.status.configure(text="没有可导出的整窗翻译结果")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出对照表", initialfile="window-translate.csv", defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("所有文件", "*.*")])
+        if not path:
+            self.status.configure(text="已取消导出对照表")
+            return
+        try:
+            n = export_window_pairs_csv(pairs, path)
+        except Exception as e:      # noqa: BLE001  导出失败只写状态栏，不弹窗、不崩
+            self.status.configure(text="导出对照表失败：%s" % str(e)[:60])
+            return
+        self.status.configure(text="对照表已导出 %d 行到 %s" % (n, path))
+
     # ------------------------------------------------ v2.7 检查更新
     def _check_update_manual(self):
         """设置页「检查更新」：一定查一次，结果写在设置页与状态栏。"""
@@ -3030,6 +3384,7 @@ class App:
         self.history_max_var.set(d["history_max"]); self.cfg["history_max"] = d["history_max"]
         self.history.max_items = d["history_max"]
         self.popup_cb.set(POPUP_NAMES[d["popup_mode"]]); self.shot_cb.set(SHOT_NAMES[d["shot_mode"]])
+        self.mini_follow_var.set(d["popup_mode"] == "mini")
         self.mini_w_var.set(d["mini_w"]); self.mini_h_var.set(d["mini_h"])
         self.cfg["mini_w"], self.cfg["mini_h"] = d["mini_w"], d["mini_h"]
         self.tts_rate_var.set(d["tts_rate"]); self.cfg["tts_rate"] = d["tts_rate"]
@@ -3075,6 +3430,7 @@ class App:
         self.history_max_var.set(d["history_max"]); self.cfg["history_max"] = d["history_max"]
         self.history.max_items = d["history_max"]
         self.popup_cb.set(POPUP_NAMES[d["popup_mode"]]); self.shot_cb.set(SHOT_NAMES[d["shot_mode"]])
+        self.mini_follow_var.set(d["popup_mode"] == "mini")
         self.mini_w_var.set(d["mini_w"]); self.mini_h_var.set(d["mini_h"])
         self.cfg["mini_w"], self.cfg["mini_h"] = d["mini_w"], d["mini_h"]
         # v2.5：朗读语速、自动复制、自定义快捷键也恢复默认
@@ -4258,6 +4614,18 @@ class App:
                 self.q.put(self._live_msg)
                 return
             self._live_crc = crc
+        # v2.12：整窗翻译按窗口记忆缓存——同一窗口、同一画面直接用上次的 OCR + 译文，
+        # 不再 OCR / 翻译。键是窗口范围 + 整图 SHA256（精确哈希，不会把两个像的菜单串起来）。
+        # 实时刷新走上面自己的 crc 判断，不再进这套缓存；截图模式（ui_mode=False）不缓存。
+        _wcache = getattr(self, "_window_cache", None) if ui_mode and not live else None
+        if _wcache is not None:
+            try:
+                _hit = _wcache.get(rect, bgra)
+            except Exception:
+                _hit = None
+            if _hit is not None:
+                self.q.put(_hit)
+                return
         scale = ocr_scale if ocr_scale and ocr_scale > 1 else 1
         if scale > 1:
             sw, sh, sbgra = screen_win.capture_region(x, y, w, h, scale=scale)
@@ -4301,6 +4669,11 @@ class App:
                           "bg": bg, "fg": screen_win.text_color_for(bg)})
         png = screen_win.bgra_to_png(cw, ch, bgra)
         msg = ("shot_overlay", rect, png, boxes, det_box["det"], det_box["target"], engine, live)
+        if _wcache is not None:          # v2.12：本次结果写进窗口记忆缓存（只放内存）
+            try:
+                _wcache.put(rect, bgra, msg)
+            except Exception:
+                pass
         if live:
             self._live_msg = msg
         self.q.put(msg)
@@ -4309,7 +4682,8 @@ class App:
     def window_translate(self, delay_ms=0):
         """整窗翻译：不用框选。热键（默认 Ctrl+Alt+W）按下时，指针下面的整个
         顶层窗口——下拉菜单、右键菜单、对话框、整个软件界面——一次截下来，
-        系统 OCR 识别后整窗翻译，译文盖在原位（点一下复制全部，右键 / Esc 关闭）。
+        系统 OCR 识别后整窗翻译，译文盖在原位（v2.12 起：单击某一块加入术语表，
+        双击复制全部，右键出菜单，Esc 关闭）。
 
         热键不会抢焦点，所以下拉菜单还开着的时候也能翻；delay_ms > 0 是给
         「从主窗口按钮 / 托盘菜单触发」用的：先等几秒，让你把指针移到目标上。"""
@@ -4509,7 +4883,7 @@ class App:
                 canvas.coords(rid, bx - pad, by - pad, bx + bw + pad, min(h, bb[3] + pad))
         tip = canvas.create_text(w - 6, h - 4, anchor="se",
                                  text=("实时刷新中 · 再按 %s 停止" % self.hotkey_window_label) if live
-                                 else "点击复制译文 · 右键 / Esc 关闭",
+                                 else "点一块加入术语表 · 双击复制全部 · 右键更多 · Esc 关闭",
                                  font=(family, -11), fill="#ffffff")
         tb = canvas.bbox(tip)
         if tb:
@@ -4518,14 +4892,65 @@ class App:
         full = "\n".join(b["dst"] for b in boxes)
         src_full = "\n".join(b["src"] for b in boxes)
 
+        self._overlay_boxes = list(boxes)   # v2.12：当前译文层上的块（点一块加术语用）
+
         def copy_all(_e=None):
             self._set_clip(full)
             self.last_clip = full
             self.status.configure(text="已复制截图译文")
             self._close_shot_overlay()
 
-        canvas.bind("<Button-1>", copy_all)
-        canvas.bind("<Button-3>", lambda e: self._close_shot_overlay())
+        # v2.12 译文层交互（只在非实时刷新层生效；实时刷新层是点击穿透，本来就收不到点击）：
+        #   单击某一块 → 把这块的原文→译文加入术语表；
+        #   双击 → 复制全部译文（原来的"点一下复制全部"改到双击）；
+        #   右键 → 菜单：导出对照表 (CSV) / 关闭。Esc 照常关闭。
+        # 单击要等 250ms 再执行（等双击：双击到了就取消加术语、改复制全部），
+        # 和气泡的单击/双击区分是同一套做法。
+        self._overlay_click_after = None
+
+        def _cancel_pending_click():
+            if getattr(self, "_overlay_click_after", None) is not None:
+                try:
+                    self.root.after_cancel(self._overlay_click_after)
+                except Exception:
+                    pass
+                self._overlay_click_after = None
+
+        def on_click(e):
+            idx = overlay_block_at(boxes, e.x, e.y)
+            if idx is None:
+                return
+            _cancel_pending_click()
+
+            def _add():
+                self._overlay_click_after = None
+                b = boxes[idx]
+                try:
+                    if not self.add_glossary_pair(b["src"], b["dst"]):
+                        self.status.configure(text="已在术语表里：%s" % (b["src"] or "")[:30])
+                except Exception:
+                    pass
+
+            self._overlay_click_after = self.root.after(250, _add)
+
+        def on_double(e):
+            _cancel_pending_click()
+            copy_all()
+
+        def on_right(e):
+            _cancel_pending_click()
+            menu = tk.Menu(win, tearoff=0)
+            menu.add_command(label="导出对照表 (CSV)…",
+                             command=lambda: self._export_shot_csv())
+            menu.add_command(label="关闭", command=self._close_shot_overlay)
+            self._overlay_menu = menu
+            # 用 post() 而不用 tk_popup()：后者会阻塞事件循环等用户选完，
+            # 前者只把菜单贴出来就返回，点别处或选完即消失，行为一样、测试也测得了
+            menu.post(e.x_root, e.y_root)
+
+        canvas.bind("<Button-1>", on_click)
+        canvas.bind("<Double-Button-1>", on_double)
+        canvas.bind("<Button-3>", on_right)
         win.bind("<Escape>", lambda e: self._close_shot_overlay())
         self.shot_overlay = win
         if live:
@@ -5026,7 +5451,7 @@ class App:
             return
         self._doc_busy = True
         self._doc_cancel.clear()
-        self.doc_cancel_btn.pack(side="left", padx=6)
+        self.doc_cancel_btn.pack(side="left", pady=(4, 0))
         self.status.configure(text="正在读取文档…")
         self._doc_path = path
         # 语言/引擎/选项在 Tk 线程里读好再传进去：worker 线程里不能碰 Tk 控件。
@@ -5492,6 +5917,11 @@ class App:
 
     def quit(self):
         self._save()
+        try:                                      # v2.12：先停看门狗，别留后台线程
+            if getattr(self, "_watchdog", None) is not None:
+                self._watchdog.stop()
+        except Exception:
+            pass
         try:
             if tts_win is not None:
                 tts_win.stop()          # 正在朗读就停掉，别留一个 powershell 在后台读
@@ -5551,11 +5981,16 @@ class App:
                     missing.append(clip_l)
                 if not wok:
                     missing.append(window_l)
+                # v2.12：记下各热键的注册结果，诊断信息里报（被占用的也写清楚）
+                self._hotkey_status = {"hotkey_main": bool(ok), "hotkey_pointer": bool(pok),
+                                       "hotkey_shot": bool(sok), "hotkey_replace": bool(rok),
+                                       "hotkey_clip": bool(cok), "hotkey_window": bool(wok)}
                 if not missing:
                     self.hint.configure(text=ok_text)
                 else:
                     self.hint.configure(text="%s 已被其他程序占用，不可用；其余快捷键仍可用（高级设置 → 快捷键与关于里可改）" % " / ".join(missing))
             except Exception as e:
+                self._hotkey_status = {k: False for k in HOTKEY_KEYS}
                 self.hint.configure(text="全局快捷键启动失败：%s" % e)
             return
         if keyboard is None:
@@ -5571,8 +6006,10 @@ class App:
                                               pynput_spec(specs["hotkey_window"]): lambda: self.q.put(("hotkey", 6))})
             self.hk.daemon = True
             self.hk.start()
+            self._hotkey_status = {k: True for k in HOTKEY_KEYS}   # v2.12：诊断信息用
             self.hint.configure(text=ok_text)
         except Exception as e:
+            self._hotkey_status = {k: False for k in HOTKEY_KEYS}
             self.hint.configure(text="全局快捷键启动失败：%s" % e)
 
     def _on_hotkey(self, which=1):
@@ -5849,6 +6286,11 @@ class App:
         except queue.Empty:
             pass
         self._hover_check()
+        try:                                      # v2.12：每轮 poll 都给看门狗打一次心跳
+            if getattr(self, "_watchdog", None) is not None:
+                self._watchdog.beat()
+        except Exception:
+            pass
         self.root.after(100, self._poll)
 
     def run(self):
