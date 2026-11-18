@@ -14,9 +14,15 @@ Language.OCR*）。没装会报 OcrError，里面写明原因。
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+
+try:
+    import ocr_backends
+except Exception:      # noqa: BLE001
+    ocr_backends = None
 
 IS_WIN = sys.platform.startswith("win")
 
@@ -43,8 +49,52 @@ def find_powershell():
 
 
 def ocr_available():
-    return IS_WIN and find_powershell() is not None \
-        and os.path.isfile(_script_path())
+    """Windows：系统 OCR（PowerShell 5.1 + winocr.ps1）；macOS / Linux：tesseract 命令行（v2.13）。"""
+    if IS_WIN:
+        return find_powershell() is not None and os.path.isfile(_script_path())
+    return bool(ocr_backends and ocr_backends.available())
+
+
+# Windows OCR 要的是 BCP-47 标签：程序里的 zh-CN / en 等先换成系统语言包的写法。
+WIN_OCR_TAG = {
+    "zh-CN": "zh-Hans-CN", "zh-TW": "zh-Hant-TW", "en": "en-US", "ja": "ja-JP", "ko": "ko-KR",
+    "fr": "fr-FR", "de": "de-DE", "es": "es-ES", "ru": "ru-RU", "pt": "pt-BR", "it": "it-IT",
+    "ar": "ar-SA", "th": "th-TH", "vi": "vi-VN", "id": "id-ID", "hi": "hi-IN", "tr": "tr-TR",
+    "pl": "pl-PL", "nl": "nl-NL", "uk": "uk-UA", "sv": "sv-SE", "he": "he-IL",
+}
+
+# winocr.ps1 只吐 ASCII 错误码（它是无 BOM 文件，中文会在中文 Windows 上被当 GBK 读坏），这里翻成中文
+_OCR_MSG = {
+    "OCR_NO_LANG": "本机没有可用的 OCR 语言包。请到「设置 → 时间和语言 → 语言和区域」添加语言，"
+                   "并勾选「光学字符识别」。",
+    "OCR_PS_VERSION": "截图 OCR 需要 Windows PowerShell 5.1（powershell.exe），PowerShell 7 不支持系统 OCR。",
+    "OCR_WINRT": "无法加载 Windows 系统 OCR 组件（需要 Windows 10 及以上，且未被组策略 / 安全软件禁用）。",
+    "OCR_IMAGE": "图片打不开或格式不支持（支持 png / jpg / bmp / tif）。",
+    "OCR_RECOGNIZE": "系统 OCR 识别失败，请换一张图片或稍后重试。",
+}
+
+
+def explain_ps_error(err, code=None):
+    """把 PowerShell 的错误输出变成一句中文原因。认不出就原样截取末尾。"""
+    err = (err or "").strip()
+    m = re.search(r"(OCR_[A-Z_]+):\s*([^\r\n]*)", err)
+    if m:
+        base = _OCR_MSG.get(m.group(1), "")
+        detail = m.group(2).strip()
+        if base:
+            return base + ("（%s）" % detail[:160] if detail and m.group(1) in ("OCR_IMAGE", "OCR_WINRT") else "")
+    low = err.lower()
+    if "parsererror" in low or "unexpected token" in low or "missing the terminator" in low \
+            or "字符串" in err or "语法" in err:
+        return "winocr.ps1 解析失败（旧版脚本含中文，中文 Windows 会读坏）。请升级到 v2.13 及以上。"
+    if "executionpolicy" in low or "execution of scripts is disabled" in low or "禁止运行脚本" in err:
+        return "PowerShell 执行策略禁止运行脚本（程序已用 -ExecutionPolicy Bypass，可能被组策略强制覆盖）。"
+    if "constrainedlanguage" in low or "constrained language" in low:
+        return "PowerShell 处于「受限语言模式」（常见于 AppLocker / 企业安全策略），系统 OCR 无法运行。"
+    tail = err[-300:]
+    if code is not None:
+        return "OCR 失败（退出码 %s）%s" % (code, ("：" + tail) if tail else "")
+    return tail or "OCR 失败"
 
 
 def _no_window_kwargs():
@@ -77,10 +127,10 @@ def _run_ps(image_path, lang=None, want_json=False, timeout=60):
     script = _script_path()
     if not os.path.isfile(script):
         raise OcrError("找不到 winocr.ps1（打包时漏了该文件）")
-    cmd = [ps, "-NoProfile", "-ExecutionPolicy", "Bypass",
+    cmd = [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
            "-File", script, "-Path", os.path.abspath(image_path)]
-    if lang:
-        cmd += ["-Language", lang]
+    if lang and lang != "auto":
+        cmd += ["-Language", WIN_OCR_TAG.get(lang, lang)]
     if want_json:
         cmd += ["-Json"]
     try:
@@ -93,14 +143,42 @@ def _run_ps(image_path, lang=None, want_json=False, timeout=60):
     out = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
     err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
     if proc.returncode != 0:
-        raise OcrError(err[-500:] or "OCR 失败（退出码 %d）" % proc.returncode)
+        raise OcrError(explain_ps_error(err, proc.returncode))
     return out, err
 
 
 def ocr_image(image_path, lang=None, timeout=60):
     """识别一张图片，返回按行拼好的文字（没认出返回空串）。"""
+    if not IS_WIN:
+        data = _backend_data(image_path, lang, timeout)
+        return "\n".join(ln.get("text", "") for ln in data.get("lines", []) if ln.get("text"))
     out, _ = _run_ps(image_path, lang=lang, timeout=timeout)
     return out
+
+
+def _backend_data(image_path, lang, timeout):
+    """macOS / Linux：走 tesseract，结构和 winocr.ps1 -Json 一致。"""
+    if not (ocr_backends and ocr_backends.available()):
+        raise OcrError("未安装 tesseract：macOS 用 brew install tesseract tesseract-lang，"
+                       "Linux 用 sudo apt install tesseract-ocr tesseract-ocr-chi-sim")
+    try:
+        return ocr_backends.recognize(image_path, lang=lang, timeout=timeout)
+    except ocr_backends.BackendError as e:
+        raise OcrError(str(e))
+
+
+def _ocr_json(image_path, lang, timeout):
+    """统一取 {"lines": [...]}：Windows 走 PowerShell，其余走 tesseract。解析失败返回 {}。"""
+    if not IS_WIN:
+        return _backend_data(image_path, lang, timeout)
+    out, _ = _run_ps(image_path, lang=lang, want_json=True, timeout=timeout)
+    if not out:
+        return {}
+    try:
+        data = json.loads(out)
+    except Exception:      # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def ocr_words(image_path, lang=None, timeout=60):
@@ -108,16 +186,16 @@ def ocr_words(image_path, lang=None, timeout=60):
 
     悬停取词用：按光标位置挑离得最近的单词。
     """
-    out, _ = _run_ps(image_path, lang=lang, want_json=True, timeout=timeout)
-    if not out:
-        return []
-    try:
-        data = json.loads(out)
-    except Exception:
-        return []
+    data = _ocr_json(image_path, lang, timeout)
     words = []
-    for line in data.get("lines", []):
-        for w in line.get("words", []):
+    raw_lines = data.get("lines", []) or []
+    if isinstance(raw_lines, dict):                 # PowerShell 单元素有时不带数组括号
+        raw_lines = [raw_lines]
+    for line in raw_lines:
+        raw_words = line.get("words", []) or []
+        if isinstance(raw_words, dict):
+            raw_words = [raw_words]
+        for w in raw_words:
             words.append({"text": w.get("text", ""),
                           "x": int(w.get("x", 0)), "y": int(w.get("y", 0)),
                           "w": int(w.get("w", 0)), "h": int(w.get("h", 0))})
@@ -155,13 +233,7 @@ def ocr_lines(image_path, lang=None, timeout=60):
 
     行框由该行所有单词的框合并而成；text 用系统 OCR 给的整行文字。
     """
-    out, _ = _run_ps(image_path, lang=lang, want_json=True, timeout=timeout)
-    if not out:
-        return []
-    try:
-        data = json.loads(out)
-    except Exception:
-        return []
+    data = _ocr_json(image_path, lang, timeout)
     raw = data.get("lines", []) if isinstance(data, dict) else []
     if isinstance(raw, dict):               # PowerShell 单元素有时不带数组括号
         raw = [raw]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-实时翻译 — 桌面独立版 v2.12，Windows / macOS / Linux(X11)
+实时翻译 — 桌面独立版 v2.13，Windows / macOS / Linux(X11)
 
 功能
   1. 输入即译：窗口里打字或粘贴，停顿约 0.35 秒自动翻译
@@ -95,6 +95,7 @@ import pdf_translate
 import clip_image
 import settings_io
 import single_instance
+import ui_platform
 import tempfile
 import zlib
 
@@ -241,7 +242,7 @@ CLOSE_NAMES = {"tray": "隐藏到托盘", "taskbar": "最小化到任务栏", "q
 CLOSE_CODES = {v: k for k, v in CLOSE_NAMES.items()}
 MINIMIZE_NAMES = {"taskbar": "留在任务栏", "tray": "收进托盘"}        # 点窗口 – 最小化时（v2.10）
 MINIMIZE_CODES = {v: k for k, v in MINIMIZE_NAMES.items()}
-__version__ = "2.12.0"
+__version__ = "2.13.0"
 APP_TITLE = "实时翻译"
 RUN_VALUE = "RealtimeTranslate"
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -329,7 +330,7 @@ DEFAULTS = {
     "engine": "Google", "auto_offline": True,
     "pointer": True, "pointer_scope": "word", "pack_mirror": "",
     "hover": True, "hover_ms": 800,
-    "close_action": "tray", "tray_tip": True, "minimize_action": "taskbar",
+    "close_action": "taskbar", "tray_tip": True, "minimize_action": "taskbar",   # v2.13：点 × 默认最小化到任务栏
     "hover_window": False, "live_interval": 3,      # v2.11：悬停整窗翻译、实时刷新间隔（秒）
     "history_on": True, "history_max": 2000, "history_reuse": False,
     "popup_mode": "bubble", "mini_w": 320, "mini_h": 110, "shot_mode": "overlay",
@@ -1907,8 +1908,11 @@ class App:
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry(self.cfg.get("geometry") or DEFAULTS["geometry"])
-        self.root.minsize(520, 420)
+        # v2.13：保存的窗口大小 / 位置先夹进当前屏幕（小屏笔记本、换显示器、导入别台电脑的设置都不会跑到屏幕外）
+        _sw, _sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self.root.geometry(ui_platform.clamp_geometry(self.cfg.get("geometry") or DEFAULTS["geometry"], _sw, _sh)
+                           or DEFAULTS["geometry"])
+        self.root.minsize(min(420, _sw - 40), min(400, _sh - 80))
         try:
             if IS_WIN:
                 self.root.iconbitmap(resource_path("app.ico"))
@@ -1970,7 +1974,13 @@ class App:
             cfg["hover_ms"] = 800
         cfg["hover_ms"] = max(300, min(cfg["hover_ms"], 3000))
         if cfg.get("close_action") not in CLOSE_NAMES:
-            cfg["close_action"] = "tray"
+            cfg["close_action"] = DEFAULTS["close_action"]
+        # v2.13：旧版默认「点 × 隐藏到托盘」，窗口会从任务栏消失、很多人以为程序退出了。
+        # 老配置里还是旧默认值的，一次性改成「最小化到任务栏」（设置里 / 主窗口勾选框随时可改回去，只迁移一次）。
+        if not cfg.get("close_taskbar_migrated"):
+            if cfg.get("close_action") == "tray":
+                cfg["close_action"] = "taskbar"
+            cfg["close_taskbar_migrated"] = True
         cfg["hover_window"] = bool(cfg.get("hover_window", False))
         try:
             cfg["live_interval"] = max(2, min(int(cfg.get("live_interval", 3)), 30))
@@ -2066,10 +2076,35 @@ class App:
         # v2.10：「点 ×」选了「最小化到任务栏」→ 直接最小化，窗口留在任务栏；
         # 否则有托盘时隐藏到托盘；没托盘时才最小化——旧版 withdraw 后没有托盘图标，
         # 窗口就找不回来了。
-        if self.cfg.get("close_action", "tray") == "taskbar":
+        if self.cfg.get("close_action", "taskbar") == "taskbar":
             self.root.iconify()
         elif not self._hide_to_tray(tip):
             self.root.iconify()
+
+    def minimize_to_taskbar(self):
+        """v2.13：主窗口「— 最小化」按钮：无条件缩到任务栏（点任务栏图标还原），
+        不受「点 ×」「点 – 最小化」设置影响；同时收起气泡 / 小窗口 / 设置窗口，免得它们留在桌面上。"""
+        try:
+            self.bubble.close()
+            self.mini.close()
+            self.settings_win.withdraw()
+        except Exception:
+            pass
+        try:
+            self.root.iconify()
+        except Exception:
+            pass
+
+    def _on_close_taskbar(self):
+        """主窗口「点 × 最小化到任务栏」勾选框：勾上 = 点 × 缩到任务栏；取消 = 回到隐藏到托盘。"""
+        self.close_cb.set(CLOSE_NAMES["taskbar" if self.close_taskbar_var.get() else "tray"])
+        self._save()
+
+    def _sync_close_taskbar(self):
+        try:
+            self.close_taskbar_var.set(CLOSE_CODES.get(self.close_cb.get(), "tray") == "taskbar")
+        except Exception:
+            pass
 
     def _on_unmap(self, e):
         """点标题栏「–」最小化时：设置里选了「收进托盘」就把窗口藏进托盘（默认留在任务栏）。"""
@@ -2087,7 +2122,7 @@ class App:
     def _on_close(self):
         # 点 ×：按「高级设置 → 常规」里的选择：直接退出 / 最小化到任务栏 / 隐藏到托盘
         # （真正退出走托盘右键菜单 / 主界面「退出」按钮）
-        if self.cfg.get("close_action", "tray") == "quit":
+        if self.cfg.get("close_action", "taskbar") == "quit":
             self.quit()
         else:
             # 隐藏到托盘；托盘图标建不起来（被安全软件拦截）时改为最小化到任务栏 ——
@@ -2210,17 +2245,21 @@ class App:
         self._refresh_tray_state()
 
     def _fit_min_width(self):
-        # 选项 / 按钮行是横向排的，写死的 minsize(520) 比内容窄，窗口一缩小
-        # 右边的复选框、「范围」下拉、「退出」按钮就被裁掉。这里按各行实际
-        # 需要的宽度（随字体 / DPI 变化）算最小宽度，并把过窄的已存宽度撑开。
+        # v2.13：按钮 / 选项行现在会自动折行，最小宽度只要放得下「最宽的那一个控件」和两个下拉框行，
+        # 不再被一整排按钮撑到 900 像素（小屏放不下）。
         try:
             self.root.update_idletasks()
-            need = max(w.winfo_reqwidth() for w in self._fit_rows) + 2 * 12 + 4
-            min_w = max(520, need)
-            self.root.minsize(min_w, 420)
+            top, eng_frame = self._fit_rows[0], self._fit_rows[1]
+            need = max([top.winfo_reqwidth(), eng_frame.winfo_reqwidth()]
+                       + [f.min_width() for f in self._flows]) + 2 * 12 + 4
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            min_w = min(max(420, need), sw - 40)
+            self.root.minsize(min_w, min(400, sh - 80))
             m = re.match(r"^(\d+)x(\d+)(.*)$", str(self.root.geometry()))
             if m and int(m.group(1)) < min_w:
                 self.root.geometry("%dx%d%s" % (min_w, int(m.group(2)), m.group(3)))
+            for f in self._flows:
+                f.relayout()
         except Exception:
             pass
 
@@ -2255,12 +2294,10 @@ class App:
         return frame, txt
 
     def _build_ui(self):
-        if IS_WIN:
-            fam, base_size = "Microsoft YaHei UI", 11
-        elif IS_MAC:
-            fam, base_size = "PingFang SC", 13
-        else:
-            fam, base_size = "Noto Sans CJK SC", 11
+        # v2.13：字体按「本机实际装了哪个」挑（Windows 雅黑 / macOS 苹方 / Linux 思源·文泉驿…），
+        # 不再写死名字；ttk 主题、表格行高按系统和字号适配
+        fam, base_size = ui_platform.ui_family(self.root), ui_platform.base_size()
+        self._mono_family = ui_platform.mono_family(self.root)
         # v2.6 界面字号：默认 11（设置 → 常规里 10~18 可调，改完立刻生效）
         size = int(self.cfg.get("font_size", 11))
         self._font_family = fam
@@ -2270,12 +2307,8 @@ class App:
         self.font, self.ui_font = font, ui_font
         root = self.root
         style = ttk.Style()
-        try:
-            style.configure("TCombobox", padding=2)
-            style.configure("TButton", padding=(8, 3))
-            style.configure("TCheckbutton", padding=2)
-        except Exception:
-            pass
+        ui_platform.pick_theme(style)
+        ui_platform.apply_styles(root, fam, size)
 
         # —— 第一行：语言 + 引擎 ——
         top = ttk.Frame(root)
@@ -2318,7 +2351,7 @@ class App:
         self.paned, self.f1 = paned, f1
 
         ttk.Label(f1, text="原文").pack(anchor="w")
-        box, self.src = self._text_with_scroll(f1, height=7, font=font, undo=True)
+        box, self.src = self._text_with_scroll(f1, height=3, font=font, undo=True)
         box.pack(fill="both", expand=True, pady=(2, 6))
         self.src.bind("<<Modified>>", self._on_modified)
         self.src.bind("<Control-Return>", self._on_ctrl_enter)   # Ctrl+Enter 立即翻译，不用等 0.35 秒
@@ -2328,7 +2361,7 @@ class App:
         ttk.Label(row, text="译文").pack(side="left")
         self.status = ttk.Label(row, text="", foreground="#5b6676")
         self.status.pack(side="right")
-        box2, self.dst = self._text_with_scroll(f2, height=7, font=font, state="disabled")
+        box2, self.dst = self._text_with_scroll(f2, height=3, font=font, state="disabled")
         box2.pack(fill="both", expand=True, pady=(2, 6))
         self.dst.tag_configure("src", foreground="#6b7380")
         # v2.6 词典区：平时隐藏；只有 Google 引擎、单个词或短词组且响应里真有
@@ -2339,21 +2372,23 @@ class App:
         self.dict_label.pack(fill="x")
 
         # —— 按钮 ——
-        btns = ttk.Frame(root)
+        btns = ui_platform.FlowFrame(root)           # v2.13：放不下自动折行，不再把右边的按钮裁掉
         btns.pack(fill="x", padx=12, pady=(2, 0))
-        ttk.Button(btns, text="复制译文", command=self.copy_result).pack(side="left")
-        ttk.Button(btns, text="复制原文", command=self.copy_source).pack(side="left", padx=6)
-        ttk.Button(btns, text="🔊 原文", command=self.speak_source).pack(side="left")
-        ttk.Button(btns, text="🔊 译文", command=self.speak_result).pack(side="left", padx=6)
-        ttk.Button(btns, text="清空", command=self.clear).pack(side="left")
-        ttk.Button(btns, text="网络检查", command=self.open_netcheck).pack(side="left", padx=6)
-        ttk.Button(btns, text="离线语言包…", command=self._show_offline_packs).pack(side="left")
-        ttk.Button(btns, text="截图翻译", command=self.start_screenshot).pack(side="left", padx=6)
-        ttk.Button(btns, text="翻译文档…", command=self._translate_doc_file).pack(side="left")
-        ttk.Button(btns, text="翻译图片…", command=self._translate_image_file).pack(side="left", padx=6)
-        ttk.Button(btns, text="粘贴图片翻译", command=self._translate_clipboard_image).pack(side="left")
-        ttk.Button(btns, text="🎤 语音输入", command=self.start_voice_input).pack(side="left")
-        ttk.Button(btns, text="退出", command=self.quit).pack(side="right")
+        B = lambda text, cmd: btns.add(ttk.Button(btns, text=text, command=cmd))      # noqa: E731
+        B("复制译文", self.copy_result)
+        B("复制原文", self.copy_source)
+        B("🔊 原文", self.speak_source)
+        B("🔊 译文", self.speak_result)
+        B("清空", self.clear)
+        B("网络检查", self.open_netcheck)
+        B("离线语言包…", self._show_offline_packs)
+        B("截图翻译", self.start_screenshot)
+        B("翻译文档…", self._translate_doc_file)
+        B("翻译图片…", self._translate_image_file)
+        B("粘贴图片翻译", self._translate_clipboard_image)
+        B("🎤 语音输入", self.start_voice_input)
+        B("—  最小化", self.minimize_to_taskbar)      # v2.13：一键最小化到任务栏（不受「关闭 ×」设置影响）
+        B("退出", self.quit)
         # v2.11：整窗翻译 / 实时刷新 / 悬停整窗等进阶功能放在「高级设置 → 取词」，主窗口保持简洁；
         # 这一行平时是空的，只在文档翻译进行中显示「取消翻译」。
         btns2 = ttk.Frame(root)
@@ -2403,29 +2438,32 @@ class App:
         opts = ttk.LabelFrame(root, text="常用", padding=(8, 4))
         opts.pack(fill="x", padx=12, pady=(8, 0))
 
-        o1 = ttk.Frame(opts)
+        o1 = ui_platform.FlowFrame(opts)
         o1.pack(fill="x")
-        ttk.Checkbutton(o1, text="窗口置顶", variable=self.top_var, command=self._on_top).pack(side="left")
-        ttk.Checkbutton(o1, text="监听剪贴板", variable=self.watch_var, command=self._on_watch).pack(side="left", padx=10)
-        ttk.Checkbutton(o1, text="中英智能互译", variable=self.smart_var, command=self._retranslate).pack(side="left")
-        ttk.Checkbutton(o1, text="双语对照", variable=self.bi_var, command=self._on_bilingual).pack(side="left", padx=10)
-        ttk.Checkbutton(o1, text="显示原文", variable=self.show_src_var, command=self._on_show_src).pack(side="left")
+        o1.add(ttk.Checkbutton(o1, text="窗口置顶", variable=self.top_var, command=self._on_top))
+        o1.add(ttk.Checkbutton(o1, text="监听剪贴板", variable=self.watch_var, command=self._on_watch))
+        o1.add(ttk.Checkbutton(o1, text="中英智能互译", variable=self.smart_var, command=self._retranslate))
+        o1.add(ttk.Checkbutton(o1, text="双语对照", variable=self.bi_var, command=self._on_bilingual))
+        o1.add(ttk.Checkbutton(o1, text="显示原文", variable=self.show_src_var, command=self._on_show_src))
+        # v2.13：点 × 时最小化到任务栏（和高级设置 → 常规里的下拉框同步；以前只藏在设置里，找不到）
+        self.close_taskbar_var = tk.BooleanVar(value=self.cfg.get("close_action", "taskbar") == "taskbar")
+        o1.add(ttk.Checkbutton(o1, text="点 × 最小化到任务栏", variable=self.close_taskbar_var,
+                               command=self._on_close_taskbar))
 
-        o2 = ttk.Frame(opts)
+        o2 = ui_platform.FlowFrame(opts)
         o2.pack(fill="x", pady=(2, 0))
-        ttk.Checkbutton(o2, text="指针取词", variable=self.pointer_var,
-                        command=self._on_pointer_opt).pack(side="left")
-        ttk.Checkbutton(o2, text="悬停取词", variable=self.hover_var,
-                        command=self._on_pointer_opt).pack(side="left", padx=10)
+        o2.add(ttk.Checkbutton(o2, text="指针取词", variable=self.pointer_var, command=self._on_pointer_opt))
+        o2.add(ttk.Checkbutton(o2, text="悬停取词", variable=self.hover_var, command=self._on_pointer_opt))
         # v2.11：「跟随指针的小窗口」以前只能在高级设置的下拉框里选，这里放一个开关（和下拉框同步）
         self.mini_follow_var = tk.BooleanVar(value=self.cfg.get("popup_mode") == "mini")
-        ttk.Checkbutton(o2, text="小窗跟随指针", variable=self.mini_follow_var,
-                        command=self._on_mini_follow).pack(side="left")
-        ttk.Button(o2, text="高级设置…", command=self.open_settings).pack(side="right")
-        ttk.Button(o2, text="翻译历史…", command=self.open_history).pack(side="right", padx=(0, 6))
+        o2.add(ttk.Checkbutton(o2, text="小窗跟随指针", variable=self.mini_follow_var,
+                               command=self._on_mini_follow))
+        o2.add(ttk.Button(o2, text="生词本", command=self.open_vocab))
         self.fav_btn = ttk.Button(o2, text="☆ 收藏", command=self.favorite_current)
-        self.fav_btn.pack(side="right", padx=(0, 6))
-        ttk.Button(o2, text="生词本", command=self.open_vocab).pack(side="right", padx=(0, 6))
+        o2.add(self.fav_btn)
+        o2.add(ttk.Button(o2, text="翻译历史…", command=self.open_history))
+        o2.add(ttk.Button(o2, text="高级设置…", command=self.open_settings))
+        self._flows = (btns, o1, o2)
 
         self._build_settings_win()
 
@@ -2451,8 +2489,7 @@ class App:
         win = tk.Toplevel(self.root)
         win.withdraw()
         win.title("高级设置")
-        win.geometry("640x580")
-        win.minsize(600, 520)
+        ui_platform.fit_window(win, 660, 600, 440, 400, parent=self.root)     # v2.13：按屏幕收缩、居中
         win.protocol("WM_DELETE_WINDOW", self.close_settings)
         win.bind("<Escape>", lambda e: self.close_settings())
         try:
@@ -2468,17 +2505,20 @@ class App:
         self.settings_tabs = {}
 
         def tab(key, title):
-            f = ttk.Frame(nb, padding=14)
-            nb.add(f, text=title)
-            self.settings_tabs[key] = f
-            return f
+            # v2.13：每页放进可滚动容器——小屏 / 大字号 / 高缩放下内容比窗口高时可以滚，不再被截断
+            sf = ui_platform.ScrollFrame(nb, padding=14)
+            nb.add(sf, text=title)
+            self.settings_tabs[key] = sf
+            return sf.body
 
         def check(parent, text, var, cmd, note=None):
             cb = ttk.Checkbutton(parent, text=text, variable=var, command=cmd)
             cb.pack(anchor="w", pady=(6, 0))
             if note:
-                ttk.Label(parent, text=note, foreground="#5b6676", wraplength=500,
-                          justify="left").pack(anchor="w", padx=(26, 0))
+                lab = ttk.Label(parent, text=note, foreground="#5b6676", wraplength=500,
+                                justify="left")
+                lab.pack(anchor="w", padx=(26, 0))
+                ui_platform.autowrap(lab, pad=60)
             return cb
 
         # 常规
@@ -2491,9 +2531,9 @@ class App:
         row.pack(anchor="w", pady=(14, 0))
         ttk.Label(row, text="点窗口右上角 ×：").pack(side="left")
         self.close_cb = ttk.Combobox(row, values=list(CLOSE_NAMES.values()), state="readonly", width=10)
-        self.close_cb.set(CLOSE_NAMES.get(self.cfg.get("close_action", "tray"), "隐藏到托盘"))
+        self.close_cb.set(CLOSE_NAMES.get(self.cfg.get("close_action", "taskbar"), "最小化到任务栏"))
         self.close_cb.pack(side="left")
-        self.close_cb.bind("<<ComboboxSelected>>", lambda e: self._save())
+        self.close_cb.bind("<<ComboboxSelected>>", lambda e: (self._sync_close_taskbar(), self._save()))
         ttk.Label(f, text="选「隐藏到托盘」时程序继续在后台运行，快捷键和取词照常可用；"
                           "选「最小化到任务栏」时窗口缩到任务栏、点任务栏图标就能还原（Esc 也一样）；"
                           "没有托盘图标（被安全软件拦截）时「隐藏到托盘」会改为最小化。",
@@ -2600,7 +2640,7 @@ class App:
 
         # —— v2.11 整窗翻译（进阶）：整个菜单 / 对话框 / 软件窗口一次翻完 ——
         ttk.Separator(f).pack(fill="x", pady=(16, 8))
-        ttk.Label(f, text="整窗翻译", font=("Microsoft YaHei UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(f, text="整窗翻译", font=(self._font_family, 10, "bold")).pack(anchor="w")
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(6, 0))
         ttk.Button(row, text="整窗翻译（3 秒后翻指针下的窗口）",
@@ -2938,6 +2978,11 @@ class App:
         fam = getattr(self, "_font_family", self.font[0])
         self.font = (fam, size)
         self.ui_font = (fam, max(8, size - 1))
+        try:                                    # v2.13：表格行高 / 按钮字体跟着字号走，按钮行重新折行
+            ui_platform.apply_styles(self.root, fam, size)
+            self._fit_min_width()
+        except Exception:
+            pass
         for w in (getattr(self, "src", None), getattr(self, "dst", None)):
             try:
                 if w is not None:
@@ -3377,7 +3422,7 @@ class App:
         self.hover_ms_var.set(d["hover_ms"]); self.cfg["hover_ms"] = d["hover_ms"]
         self.hover_win_var.set(d.get("hover_window", False))
         self.live_int_var.set(str(d.get("live_interval", 3))); self.cfg["live_interval"] = d.get("live_interval", 3)
-        self.close_cb.set(CLOSE_NAMES.get(d["close_action"], CLOSE_NAMES["tray"]))
+        self.close_cb.set(CLOSE_NAMES.get(d["close_action"], CLOSE_NAMES["taskbar"])); self._sync_close_taskbar()
         self.min_cb.set(MINIMIZE_NAMES.get(d.get("minimize_action"), MINIMIZE_NAMES["taskbar"]))
         self.tray_tip_var.set(d["tray_tip"])
         self.history_on_var.set(d["history_on"]); self.history_reuse_var.set(d["history_reuse"])
@@ -3423,7 +3468,7 @@ class App:
         self.hover_ms_var.set(d["hover_ms"]); self.cfg["hover_ms"] = d["hover_ms"]
         self.hover_win_var.set(d.get("hover_window", False))
         self.live_int_var.set(str(d.get("live_interval", 3))); self.cfg["live_interval"] = d.get("live_interval", 3)
-        self.close_cb.set(CLOSE_NAMES.get(d["close_action"], CLOSE_NAMES["tray"]))
+        self.close_cb.set(CLOSE_NAMES.get(d["close_action"], CLOSE_NAMES["taskbar"])); self._sync_close_taskbar()
         self.min_cb.set(MINIMIZE_NAMES.get(d.get("minimize_action"), MINIMIZE_NAMES["taskbar"]))
         self.tray_tip_var.set(d["tray_tip"])
         self.history_on_var.set(d["history_on"]); self.history_reuse_var.set(d["history_reuse"])
@@ -3547,8 +3592,7 @@ class App:
     def _hist_build(self):
         win = tk.Toplevel(self.root)
         win.title("翻译历史")
-        win.geometry("780x540")
-        win.minsize(640, 420)
+        ui_platform.fit_window(win, 800, 560, 520, 380, parent=self.root)
         win.protocol("WM_DELETE_WINDOW", win.withdraw)
         win.bind("<Escape>", lambda e: win.withdraw())
         try:
@@ -3798,17 +3842,20 @@ class App:
     def _show_runtime_install(self):
         win = tk.Toplevel(self.root)
         win.title("下载离线翻译组件")
-        win.geometry("620x250")
+        ui_platform.fit_window(win, 640, 270, 420, 240, parent=self.root)
         win.transient(self.root)
         self.rt_win = win
         self.rt_busy, self.rt_cancel = True, False
         self._rt_speed = {"label": None, "t": 0.0, "done": 0, "v": 0.0}
-        ttk.Label(win, text="正在下载离线翻译组件（numpy、ctranslate2 等）。下载中途断网可再次点击，会接着下。",
-                  wraplength=580).pack(anchor="w", padx=12, pady=(14, 6))
+        _l = ttk.Label(win, text="正在下载离线翻译组件（numpy、ctranslate2 等）。下载中途断网可再次点击，会接着下。",
+                       wraplength=580)
+        _l.pack(anchor="w", padx=12, pady=(14, 6))
+        ui_platform.autowrap(_l)
         self.rt_bar = ttk.Progressbar(win, mode="determinate", maximum=100)
         self.rt_bar.pack(fill="x", padx=12)
         self.rt_msg = ttk.Label(win, text="正在连接 PyPI …", foreground="#5b6676", wraplength=580)
         self.rt_msg.pack(anchor="w", padx=12, pady=(4, 6))
+        ui_platform.autowrap(self.rt_msg)
         mrow = ttk.Frame(win)
         mrow.pack(fill="x", padx=12)
         ttk.Label(mrow, text="镜像（可选）").pack(side="left")
@@ -3910,11 +3957,13 @@ class App:
             return
         win = tk.Toplevel(self.root)
         win.title("离线语言包")
-        win.geometry("660x420")
+        ui_platform.fit_window(win, 680, 440, 460, 340, parent=self.root)
         win.transient(self.root)
         self.pack_win = win
-        ttk.Label(win, text="离线翻译使用 Argos 语言包（.argosmodel），在本机运行，不联网、不上传文字。",
-                  wraplength=520).pack(anchor="w", padx=12, pady=(12, 4))
+        _l = ttk.Label(win, text="离线翻译使用 Argos 语言包（.argosmodel），在本机运行，不联网、不上传文字。",
+                       wraplength=520)
+        _l.pack(anchor="w", padx=12, pady=(12, 4))
+        ui_platform.autowrap(_l)
         cols = ("pair", "ver", "src", "state")
         tv = ttk.Treeview(win, columns=cols, show="headings", height=10)
         for c, t, w in (("pair", "翻译方向", 120), ("ver", "版本", 70), ("src", "来源", 90), ("state", "状态", 220)):
@@ -3924,6 +3973,7 @@ class App:
         self.pack_tv = tv
         self.pack_msg = ttk.Label(win, text="", foreground="#5b6676", wraplength=520)
         self.pack_msg.pack(anchor="w", padx=12)
+        ui_platform.autowrap(self.pack_msg)
         row = ttk.Frame(win)
         row.pack(fill="x", padx=12, pady=10)
         ttk.Button(row, text="下载语言包…", command=self._show_pack_download).pack(side="left")
@@ -4011,13 +4061,14 @@ class App:
             return
         win = tk.Toplevel(self.root)
         win.title("下载离线语言包")
-        win.geometry("700x560")
+        ui_platform.fit_window(win, 720, 580, 480, 400, parent=self.root)
         win.transient(self.root)
         self.dl_win = win
         self.dl_best = {}
         self.dl_iid = {}
         self.dl_note = ttk.Label(win, text="正在获取语言包列表…", foreground="#5b6676", wraplength=660)
         self.dl_note.pack(anchor="w", padx=12, pady=(12, 4))
+        ui_platform.autowrap(self.dl_note)
 
         frow = ttk.Frame(win)
         frow.pack(fill="x", padx=12)
@@ -4426,6 +4477,19 @@ class App:
         else:
             self._on_hover(pos)
 
+    def _on_hover_err(self, err, pos):
+        """悬停取词时 OCR 报错：状态栏写一句；同一种错误只弹一次气泡（别每次停住鼠标都弹）。"""
+        err = (err or "").strip()
+        if not err:
+            return
+        self.status.configure(text="悬停取词失败：%s" % err[:160])
+        if err != getattr(self, "_hover_err_shown", None):
+            self._hover_err_shown = err
+            try:
+                self._popup().show(pos, "悬停取词失败", err[:260], error=True)
+            except Exception:
+                pass
+
     def _on_hover(self, pos):
         self.grab_mode = "hover"
         self.grab_xy = pos
@@ -4449,7 +4513,8 @@ class App:
         以及 winfo_screenwidth()，Tk 控件不是线程安全的）。
         """
         if not ocr_win.ocr_available():
-            return None
+            raise ocr_win.OcrError("系统 OCR 不可用：Windows 需要 PowerShell 5.1 和 winocr.ps1；"
+                                   "macOS / Linux 需要先安装 tesseract")
         bounds = bounds or screen_bounds() or (0, 0, 1920, 1080)
         bw, bh = self._OCR_BOX.get(scope, self._OCR_BOX["word"])
         x, y, w, h = screen_win.clamp_region(pos[0] - bw // 2, pos[1] - bh // 2, bw, bh, bounds)
@@ -4485,24 +4550,38 @@ class App:
         if hit is True:
             word = cached
         else:
+            self._hover_ocr_err = ""            # v2.13：每次重新识别前清掉旧错误，免得「这里没字」被误报成 OCR 故障
             try:
                 word = self._ocr_pick(pos, scope, lang, bounds)
             except Exception as e:      # noqa: BLE001  OCR 失败不报错、不弹状态，
                 word = None              # 悬停是后台静默取词，失败就退回双击取词，
                 self._hover_ocr_err = str(e)[:200]   # 原因记下来，方便查问题
             self._hover_cache.put(pos, scope, word)
+            if hit is not True and word:
+                self._hover_ocr_err = ""
+                self._hover_err_shown = None
         if not word:
             try:
                 ibeam = cursor_is_ibeam_win()
             except Exception:
                 ibeam = False
         self.q.put(("hover_ocr", word, pos, ibeam))
+        if not word and self._hover_ocr_err:
+            # v2.13：OCR 本身出错（不是「这里没字」）时让用户看得到原因，不再一声不响
+            self.q.put(("hover_err", self._hover_ocr_err, pos))
 
     def start_screenshot(self):
         """截图翻译：框选屏幕任意区域 → 系统 OCR 认字 → 翻译。"""
         if not IS_WIN:
-            self.status.configure(text="截图翻译只支持 Windows")
-            return
+            # v2.13：macOS / Linux 用 tesseract + 系统截图命令（只出文字，不盖在截图上）
+            import ocr_backends
+            if not ocr_win.ocr_available():
+                self.status.configure(text="截图翻译需要先安装 tesseract（macOS: brew install tesseract tesseract-lang；"
+                                           "Linux: sudo apt install tesseract-ocr tesseract-ocr-chi-sim）")
+                return
+            if not ocr_backends.capture_available():
+                self.status.configure(text="没有可用的截图命令（macOS 自带 screencapture；Linux 请安装 grim / scrot / imagemagick）")
+                return
         if getattr(self, "shot_win", None) is not None or self.grabbing:
             return
         bounds = screen_bounds()
@@ -4581,6 +4660,19 @@ class App:
             os.makedirs(DATA_DIR, exist_ok=True)
             tmp = os.path.join(DATA_DIR, "shot.bmp")
             time.sleep(0.15)      # 等框选层彻底消失，否则会把黑框也截进去
+            import ocr_backends
+            if not IS_WIN and ocr_backends.capture_available():
+                png = os.path.join(DATA_DIR, "shot.png")
+                try:
+                    ocr_backends.capture_file(png, x, y, w, h)
+                    text = ocr_win.ocr_image(png, lang=lang)
+                finally:
+                    try:
+                        os.remove(png)
+                    except Exception:
+                        pass
+                self.q.put(("shot_ocr", True, text.strip(), xy))
+                return
             if live or self.cfg.get("shot_mode", "overlay") == "overlay":
                 self._shot_overlay_worker(rect, xy, tmp, lang, sl, tl, smart, engine,
                                           ocr_scale=ocr_scale, ui_mode=ui_mode, live=live)
@@ -4861,7 +4953,7 @@ class App:
         img = tk.PhotoImage(data=base64.b64encode(png))
         canvas.create_image(0, 0, image=img, anchor="nw")
         win._img = img                                   # 引用要留着，否则图被回收
-        family = self.font[0] if isinstance(self.font, (tuple, list)) else "Microsoft YaHei UI"
+        family = self.font[0] if isinstance(self.font, (tuple, list)) else self._font_family
         pad = 2
         for b in boxes:
             bx, by, bw, bh = b["x"], b["y"], max(b["w"], 24), b["h"]
@@ -5008,16 +5100,15 @@ class App:
             return
         win = tk.Toplevel(self.root)
         win.title("网络检查")
-        win.geometry("600x430")
-        win.minsize(460, 320)
+        ui_platform.fit_window(win, 620, 450, 420, 320, parent=self.root)
         win.transient(self.root)
         self.net_win = win
-        box, self.net_txt = self._text_with_scroll(win, height=14, font=("Consolas" if IS_WIN else "monospace", 10),
+        box, self.net_txt = self._text_with_scroll(win, height=14, font=(self._mono_family, 10),
                                                   state="disabled")
         box.pack(fill="both", expand=True, padx=12, pady=(12, 6))
         for tag, color in (("ok", "#15803d"), ("bad", "#b42318"), ("info", "#5b6676"), ("warn", "#b45309")):
             self.net_txt.tag_configure(tag, foreground=color)
-        self.net_txt.tag_configure("head", font=("Microsoft YaHei UI" if IS_WIN else "TkDefaultFont", 10, "bold"))
+        self.net_txt.tag_configure("head", font=(self._font_family, 10, "bold"))
         row = ttk.Frame(win)
         row.pack(fill="x", padx=12, pady=(0, 12))
         self.net_btn_re = ttk.Button(row, text="重新检测", command=self._start_netcheck)
@@ -5115,18 +5206,31 @@ class App:
         sl = "auto" if s == AUTO else NAME2CODE.get(s, "auto")
         return sl, NAME2CODE.get(self.tl.get(), "zh-CN")
 
+    def _geometry_to_save(self):
+        """只在窗口是正常状态时记它的大小位置：最小化 / 藏起来时 Tk 可能报 1x1 或 -32000 的假坐标，
+        存进去下次启动窗口就跑到屏幕外了。再夹一次进屏幕，保证存下来的永远是可见的。"""
+        old = self.cfg.get("geometry") or DEFAULTS["geometry"]
+        try:
+            if self.root.state() != "normal":
+                return old
+            g = self.root.geometry()
+            return ui_platform.clamp_geometry(g, self.root.winfo_screenwidth(),
+                                              self.root.winfo_screenheight()) or old
+        except Exception:
+            return old
+
     def _save(self):
         sl, tl = self._codes()
         self.cfg.update(
             sl=sl, tl=tl, top=self.top_var.get(), watch=self.watch_var.get(),
             smart=self.smart_var.get(), bilingual=self.bi_var.get(),
             reflow=self.reflow_var.get(), show_src=self.show_src_var.get(),
-            geometry=self.root.geometry(), engine=self.engine.get(),
+            geometry=self._geometry_to_save(), engine=self.engine.get(),
             auto_offline=AUTO_OFFLINE, pointer=self.pointer_var.get(),
             hover=self.hover_var.get(), hover_ms=self.cfg.get("hover_ms", 800),
             hover_window=self.hover_win_var.get(), live_interval=self.cfg.get("live_interval", 3),
             pointer_scope=SCOPE_CODES.get(self.scope_cb.get(), "word"),
-            close_action=CLOSE_CODES.get(self.close_cb.get(), "tray"),
+            close_action=CLOSE_CODES.get(self.close_cb.get(), "taskbar"),
             minimize_action=MINIMIZE_CODES.get(self.min_cb.get(), "taskbar"),
             popup_mode=POPUP_CODES.get(self.popup_cb.get(), "bubble"),
             shot_mode=SHOT_CODES.get(self.shot_cb.get(), "overlay"),
@@ -5419,7 +5523,7 @@ class App:
             lines.append("%s%s" % (label, parsed["translit"]))
         self.dict_label.configure(text="\n".join(lines))
         if not self.dict_frame.winfo_ismapped():
-            self.dict_frame.pack(fill="x", pady=(0, 2))
+            self.dict_frame.pack(side="bottom", fill="x", pady=(0, 2))   # v2.13：先分配空间，窗口矮时不被译文框挤没
 
     # ---- v2.6 文档翻译（.txt / .md / .srt） ----
     def _translate_doc_file(self):
@@ -5651,11 +5755,10 @@ class App:
         if not doc_translate.supported_image_ext(path):
             self.status.configure(text="只支持 .png / .jpg / .jpeg / .bmp / .tif 图片")
             return
-        if not IS_WIN:
-            self.status.configure(text="图片翻译只在 Windows 上可用（需要系统 OCR）")
-            return
         if not ocr_win.ocr_available():
-            self.status.configure(text="图片翻译需要 Windows 系统 OCR（winocr.ps1 缺失或没有 PowerShell 5.1）")
+            self.status.configure(text=("图片翻译需要 Windows 系统 OCR（winocr.ps1 缺失或没有 PowerShell 5.1）" if IS_WIN
+                                        else "图片翻译需要先安装 tesseract（macOS: brew install tesseract tesseract-lang；"
+                                             "Linux: sudo apt install tesseract-ocr tesseract-ocr-chi-sim）"))
             return
         self.status.configure(text="正在识别图片文字…")
         # OCR 语言在 Tk 线程里读好再传进去：worker 线程里不能碰 Tk 控件。
@@ -6232,6 +6335,8 @@ class App:
                         self.root.clipboard_clear()
                         self._seq0 = clip_seq_win() if IS_WIN else 0
                         threading.Thread(target=self._copy_selection, daemon=True).start()
+                elif kind == "hover_err":
+                    self._on_hover_err(msg[1], msg[2])
                 elif kind == "bubble":
                     self._on_bubble(*msg[1:])
                 elif kind == "rt_prog":
@@ -6324,6 +6429,40 @@ def run_selftest():
         if not OFFLINE.pairs():
             ok = False
             lines.append("  ✘ 离线版但没有任何语言包")
+    # v2.13：标准库完整性——标准版的离线运行库是运行时才下载的，它要用的标准库（如 glob）必须已打进 exe
+    try:
+        import runtime_stdlib
+        loaded, missing = runtime_stdlib.preload()
+        critical = [m for m in missing if m in ("glob", "ctypes", "importlib.resources", "zipfile", "pathlib",
+                                                 "fnmatch", "shutil", "tempfile")]
+        lines.append("标准库（运行库依赖）：%d 个可用，缺 %d 个%s" % (
+            len(loaded), len(missing), ("：" + ", ".join(missing[:12])) if missing else ""))
+        if critical:
+            ok = False
+            lines.append("  ✘ 关键标准库缺失：%s（离线组件会报 No module named）" % ", ".join(critical))
+    except Exception as e:      # noqa: BLE001
+        lines.append("标准库自检失败：%s" % e)
+    # v2.13：系统 OCR 自检（只在 Windows）：对一张白图跑一遍 winocr.ps1，确认脚本能解析、WinRT 能加载
+    if IS_WIN:
+        try:
+            probe = os.path.join(DATA_DIR, "ocr_selftest.bmp")
+            os.makedirs(DATA_DIR, exist_ok=True)
+            screen_win.save_bmp(probe, 64, 64, b"\xff\xff\xff\x00" * (64 * 64))
+            try:
+                ocr_win.ocr_lines(probe)
+                lines.append("系统 OCR：脚本可运行（白图无文字，返回空属正常）")
+            except ocr_win.OcrError as e:
+                msg = str(e)
+                lines.append("系统 OCR：%s" % msg)
+                if "解析失败" in msg or "无法加载" in msg:
+                    ok = False
+            finally:
+                try:
+                    os.remove(probe)
+                except Exception:
+                    pass
+        except Exception as e:      # noqa: BLE001
+            lines.append("系统 OCR 自检出错：%s" % e)
     for c in (netcheck.check_connectivity(), netcheck.check_dns()):
         lines.append(c.line())
     lines.append("结果：%s" % ("通过" if ok else "有问题"))

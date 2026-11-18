@@ -81,6 +81,10 @@ RUNTIME_STDLIB = [
     'encodings.utf_8',
     'enum',
     'fnmatch',
+    'glob',                 # v2.13：ctranslate2 的 Windows 分支 import glob（2.12.0 漏了 → No module named 'glob'）
+    'secrets', 'hmac', 'difflib', 'pprint', 'uuid', 'getpass', 'shlex', 'sysconfig', 'gzip', 'tarfile',
+    'mmap', 'argparse', 'configparser', 'decimal', 'fractions', 'statistics', 'cmath', 'gc', 'unicodedata',
+    'ctypes.util', 'multiprocessing', 'logging.handlers',
     'functools',
     'genericpath',
     'hashlib',
@@ -177,7 +181,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[(ICON, '.')] + ([('winocr.ps1', '.')] if os.path.exists('winocr.ps1') else []),
-    hiddenimports=['pack_downloader', 'runtime_installer', 'tray_win32', 'screen_win', 'ocr_win', 'history_store', 'tts_win', 'doc_translate', 'stt_win', 'glossary', 'update_check', 'pdf_translate', 'clip_image', 'single_instance', 'settings_io', 'sqlite3', 'ctypes.wintypes'] + RUNTIME_STDLIB,       # 其余导入 PyInstaller 能自动分析到
+    hiddenimports=['pack_downloader', 'runtime_installer', 'tray_win32', 'screen_win', 'ocr_win', 'history_store', 'tts_win', 'doc_translate', 'stt_win', 'glossary', 'update_check', 'pdf_translate', 'clip_image', 'single_instance', 'settings_io', 'runtime_stdlib', 'ocr_backends', 'ui_platform', 'sqlite3', 'ctypes.wintypes'] + RUNTIME_STDLIB,       # 其余导入 PyInstaller 能自动分析到
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -32,7 +32,11 @@ def save_bmp(path, width, height, bgra):
     if len(bgra) < width * height * 4:
         raise ValueError("bgra too short")
     row = width * 4
-    data = bgra[:row * height]
+    # v2.13：GDI GetDIBits 给的 BGRA 透明通道是 0。系统 OCR（WinRT BitmapDecoder）有时会把它当成
+    # 「全透明」的图，识别结果为空——截图翻译 / 悬停取词「不识别」的原因之一。存 BMP 前统一补成不透明。
+    data = bytearray(bgra[:row * height])
+    data[3::4] = b"\xff" * (len(data) // 4)
+    data = bytes(data)
     file_size = 54 + len(data)
     header = struct.pack("<2sIHHI", b"BM", file_size, 0, 0, 54)
     dib = struct.pack("<IiiHHIIiiII", 40, width, height, 1, 32, 0,

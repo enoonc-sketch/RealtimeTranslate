@@ -16,6 +16,11 @@ import zipfile
 import offline_engine as oe
 import pack_downloader as pd
 
+try:                                     # v2.13：让 PyInstaller 把运行库要用的标准库（glob 等）全收进 exe
+    import runtime_stdlib                # noqa: F401
+except Exception:      # noqa: BLE001
+    runtime_stdlib = None
+
 # 安装顺序即下载顺序：ctranslate2 依赖 numpy 与 pyyaml，翻译还需要 sentencepiece
 PKGS = ["numpy", "pyyaml", "sentencepiece", "ctranslate2"]
 INDEX = "https://pypi.org/pypi/%s/json"
@@ -150,8 +155,14 @@ def verify_import():
     try:
         import ctranslate2          # noqa: F401
         import sentencepiece        # noqa: F401
+    except ModuleNotFoundError as e:      # noqa: BLE001
+        name = getattr(e, "name", "") or ""
+        if name and name.split(".")[0] in getattr(sys, "stdlib_module_names", ()):
+            raise oe.OfflineError("程序自带的标准库缺少「%s」（这是打包问题，不是你的电脑问题）。\n"
+                                  "请升级到 v2.13 及以上；或改用「离线版」安装包。" % name)
+        raise oe.OfflineError("组件已下载但缺少依赖「%s」，请在「离线与网络」里重新下载组件。" % name)
     except Exception as e:      # noqa: BLE001
-        raise oe.OfflineError("组件已下载但无法加载：%s\n（Windows 上常见原因：缺少 Visual C++ 运行库，"
+        raise oe.OfflineError("组件已下载但无法加载：%s\n（Windows 上常见原因：缺少 Visual C++ 运行库，\n"
                               "请安装「Microsoft Visual C++ 2015-2022 Redistributable (x64)」后重启程序）" % e)
 
 

@@ -241,6 +241,13 @@ class Engine:
                 import ctranslate2
                 import sentencepiece as spm
             except Exception as e:
+                name = getattr(e, "name", "") or ""
+                if (isinstance(e, ModuleNotFoundError) and name
+                        and name.split(".")[0] in getattr(sys, "stdlib_module_names", ())):
+                    # v2.13：标准版 exe 漏打包了某个标准库（例如 glob）——这是打包问题，给明确说法
+                    raise OfflineError(
+                        "离线引擎运行库加载失败：程序自带的标准库缺少「%s」。\n"
+                        "请升级到 v2.13 及以上（已补齐）；或改用「离线版」安装包。" % name)
                 raise OfflineError(
                     "离线引擎运行库加载失败：%s\n"
                     "（独立版请使用「离线版」安装包；从源码运行请 pip install ctranslate2 sentencepiece numpy）" % e)

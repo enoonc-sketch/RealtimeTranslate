@@ -1,6 +1,14 @@
 # 实时翻译 RealtimeTranslate
 
-Windows 桌面翻译工具 v2.12：输入即译、全局热键取词、监听剪贴板、长文档翻译、在线 / 离线引擎。
+Windows 桌面翻译工具 v2.13：输入即译、全局热键取词、监听剪贴板、长文档翻译、在线 / 离线引擎。
+
+## v2.13 修复与新增
+
+- **修复「离线引擎运行库加载失败：No module named 'glob'」**：标准版 exe 漏打包了 ctranslate2 在 Windows 上要用的标准库 `glob`。新增 `runtime_stdlib.py` 并写进两个 spec；`--selftest` 会检查这些库是否都在。**需要重新打包才生效。**
+- **修复悬停取词没反应、截图翻译 / 图片翻译不识别**：`winocr.ps1` 改成纯 ASCII（旧脚本含中文且无 BOM，中文 Windows 会按 GBK 读坏）；截图 BMP 透明通道补成不透明；超大图自动缩小；语言选「自动」时中英文引擎都试，取读到更多的；悬停取词 OCR 出错时在状态栏 / 气泡显示原因，不再静默。
+- **最小化到任务栏**：主窗口新增「— 最小化」按钮和「点 × 最小化到任务栏」勾选框；点 × 默认改为最小化到任务栏（老配置里的旧默认「隐藏到托盘」会一次性迁移，可随时改回）。
+- **面板适配各系统**：新增 `ui_platform.py`——字体按本机实际安装的挑；窗口大小按屏幕收缩并居中；按钮 / 选项行放不下自动折行；设置页内容过高可滚动；macOS / Linux 的图片 / 截图翻译走 tesseract（需自行安装）。
+- 打包后先运行 `RealtimeTranslate.exe --selftest`，看 `%APPDATA%\RealtimeTranslate\selftest.txt`。
 
 ## v2.12 新增
 
