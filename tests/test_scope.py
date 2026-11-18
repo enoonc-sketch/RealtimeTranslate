@@ -66,7 +66,7 @@ ok("plan: I-beam word unchanged", dt.pointer_plan(True, False, "word") == ["clic
 # 界面：范围下拉有三项；悬停 / 指针按所选范围走 OCR
 app = dt.App()
 ok("combobox has 3 scopes", list(app.scope_cb["values"]) == ["单词", "整行", "整段"])
-ok("minsize still fits options", app.root.minsize()[0] >= max(w.winfo_reqwidth() for w in app._fit_rows))
+ok("minsize still fits options", app.root.minsize()[0] >= max(app._fit_rows[0].winfo_reqwidth(), app._fit_rows[1].winfo_reqwidth(), *[f.min_width() for f in app._flows]))
 
 calls = []
 app._ocr_pick = lambda pos, scope, lang=None, bounds=None: (calls.append((pos, scope, lang, bounds)), "HELLO %s" % scope)[1]

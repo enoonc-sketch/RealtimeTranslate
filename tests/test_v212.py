@@ -38,7 +38,7 @@ def pump(sec, until=None):
 
 got = dt.collect_diag_info(app)
 ok("collect diag from live app has six keys",
-   all(k in got for k in ("version", "python", "os", "dpi", "ocr", "hotkeys")) and got["version"] == "2.12.0")
+   all(k in got for k in ("version", "python", "os", "dpi", "ocr", "hotkeys")) and got["version"] == "2.13.0")
 ok("collect diag hotkeys cover all six hotkeys", len(got["hotkeys"]) == 6)
 ok("collect diag never crashes on missing pieces", all(isinstance(v, str) or isinstance(v, list) for v in got.values()))
 app._copy_diag_info()
@@ -48,7 +48,7 @@ try:
 except Exception:
     pass
 ok("copy diag puts text on clipboard and reports it",
-   "2.12.0" in clip and "诊断信息已复制" in app.status.cget("text"))
+   "2.13.0" in clip and "诊断信息已复制" in app.status.cget("text"))
 
 # ---- 2. 看门狗 ----
 log = os.path.join(tmp, "watchdog.log")
@@ -123,6 +123,7 @@ while not app.q.empty(): msgs2.append(app.q.get_nowait())
 ok("window cache: changed pixels re-run OCR", len(ocr_calls) == 2 and len(msgs2) == 1)
 # 截图模式（ui_mode=False）不走整窗缓存
 dt.screen_win.capture_region = cap
+import ocr_backends; ocr_backends.capture_available = lambda: False   # 沙箱里有真的截图命令：这里要走 Windows 同款流程
 app._shot_worker((0, 0, 100, 60), (0, 0), None, "auto", "zh-CN", True, "Google", 1, False, False)
 pump(3, lambda: not app.q.empty())
 ok("screenshot mode does not use the window cache", len(ocr_calls) == 3)

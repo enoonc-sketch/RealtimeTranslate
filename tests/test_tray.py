@@ -63,12 +63,18 @@ except RuntimeError:
 ok("cursor pos None on linux", screen_win.get_cursor_pos() is None)
 
 # 4. OCR：Linux 上不可用，报 OcrError；脚本里有系统 OCR 的关键调用
-ok("ocr not available on linux", not ocr_win.ocr_available())
-try:
-    ocr_win.ocr_image(os.path.join(tmp, "t.bmp"))
-    ok("ocr_image raises on linux", False)
-except ocr_win.OcrError:
-    ok("ocr_image raises on linux", True)
+import shutil as _sh
+_has_tess = _sh.which("tesseract") is not None
+# v2.13：非 Windows 的 OCR 走 tesseract 命令行；没装它就不可用并报 OcrError，装了就可用
+ok("ocr availability on linux follows tesseract", ocr_win.ocr_available() == _has_tess)
+if not _has_tess:
+    try:
+        ocr_win.ocr_image(os.path.join(tmp, "t.bmp"))
+        ok("ocr_image raises on linux", False)
+    except ocr_win.OcrError:
+        ok("ocr_image raises on linux", True)
+else:
+    ok("ocr_image raises on linux (skipped, tesseract present)", True)
 ps = open(os.path.join(BASE, "winocr.ps1"), encoding="utf-8").read()
 ok("winocr uses Windows.Media.Ocr", "Windows.Media.Ocr.OcrEngine" in ps)
 ok("winocr tries language then user profile", "TryCreateFromLanguage" in ps

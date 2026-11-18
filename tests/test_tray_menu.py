@@ -140,6 +140,7 @@ class FakeTray:
     def set_tooltip(self, t): return True
     def stop(self): pass
 app.tray = FakeTray()
+app.cfg["close_action"] = "tray"      # v2.13 默认改成了最小化到任务栏，这里测的是隐藏到托盘
 app.cfg.pop("tray_tip_shown", None)
 app.hide_window()
 app.root.deiconify()

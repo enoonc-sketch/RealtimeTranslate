@@ -101,6 +101,7 @@ class FakeTray:
 
 
 app.tray = FakeTray(True)
+app.cfg["close_action"] = "tray"      # v2.13 默认改成了最小化到任务栏，这里测的是隐藏到托盘
 app.hide_window()
 pump(0.2)
 ok("hide with tray withdraws", str(r.winfo_viewable()) == "0")

@@ -120,7 +120,7 @@ cfg = json.load(open(dt.CONFIG_PATH))
 ok("reset: vars back to defaults", app.top_var.get() == d["top"] and app.smart_var.get() == d["smart"]
    and app.hover_var.get() == d["hover"] and app.scope_cb.get() == "单词")
 ok("reset: saved to config", cfg["top"] == d["top"] and cfg["pointer_scope"] == "word"
-   and cfg["hover_ms"] == 800 and cfg["close_action"] == "tray" and cfg["tray_tip"] is True)
+   and cfg["hover_ms"] == 800 and cfg["close_action"] == "taskbar" and cfg["tray_tip"] is True)
 dt.messagebox.askyesno = lambda *a, **k: False
 app.top_var.set(False); app._on_top()
 app._reset_settings()

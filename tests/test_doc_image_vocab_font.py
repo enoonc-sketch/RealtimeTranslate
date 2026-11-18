@@ -159,9 +159,10 @@ try:
     dt.IS_WIN = False
     called = []
     dt.ocr_win.ocr_image = lambda *a, **k: called.append(1) or "x"
+    dt.ocr_win.ocr_available = lambda: False          # v2.13：非 Windows 靠 tesseract，没装就只报状态、不调 OCR
     app._translate_image_file()
-    ok("image on linux: windows-only status, ocr not called",
-       "只在 Windows 上可用" in app.status.cget("text") and called == [])
+    ok("image on linux without tesseract: install hint, ocr not called",
+       "tesseract" in app.status.cget("text") and called == [])
 finally:
     dt.IS_WIN = real_is_win
     dt.ocr_win.ocr_image = real_ocr

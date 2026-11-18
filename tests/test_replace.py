@@ -94,8 +94,9 @@ app._on_replace_hotkey = lambda: seen.append("replace")
 app._on_hotkey(4)
 ok("hotkey 4 routes to replace", seen == ["replace"])
 app._on_hotkey(3)  # 截图：非 Windows 只报状态，不崩
-ok("hotkey 3 still screenshot path", "只支持 Windows" in app.status.cget("text")
-   or "截图翻译只支持 Windows" in app.status.cget("text"))
+_st = app.status.cget("text")
+ok("hotkey 3 still screenshot path (non-Windows: status only, no crash)",
+   "只支持 Windows" in _st or "tesseract" in _st or "截图命令" in _st or app.shot_win is not None)
 
 # ---- 5. 托盘菜单有替换项，快捷键文字跟随配置 ----
 items = dt.tray_menu_items({"pointer": True, "hotkey_replace": "Ctrl+Shift+R"}, True)

@@ -18,7 +18,7 @@ def ok(name, cond):
 
 app = dt.App()
 app.root.update()
-need = max(w.winfo_reqwidth() for w in app._fit_rows) + 28
+need = max([app._fit_rows[0].winfo_reqwidth(), app._fit_rows[1].winfo_reqwidth()] + [f.min_width() for f in app._flows]) + 28
 minw = app.root.minsize()[0]
 ok("minsize covers widest row (%d >= %d)" % (minw, need), minw >= need)
 ok("window not narrower than minsize", app.root.winfo_width() >= minw)
@@ -30,11 +30,13 @@ app.root.update()
 ok("narrow saved width widened", app.root.winfo_width() >= minw)
 
 # 每个选项行的右边缘都在窗口内
-app.root.update()
+import time
+for _ in range(15):
+    app.root.update(); time.sleep(0.02)
 right = app.root.winfo_width()
 rows_in = True
 for row in app._fit_rows[3].winfo_children():
-    for w in row.winfo_children():
+    for w in row.winfo_children():  # v2.13: 行会折行，只要不超出右边缘
         if w.winfo_rootx() + w.winfo_width() > app.root.winfo_rootx() + right:
             rows_in = False
 ok("all option widgets inside window", rows_in)
