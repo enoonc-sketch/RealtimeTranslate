@@ -1,0 +1,3 @@
+{ "name": "pet-render", "private": true, "description": "把 3D 宠物渲染成动画帧（开发用，不随软件发布）",
+  "scripts": { "bundle": "esbuild render.ts --bundle --format=iife --external:fs --external:path --outfile=render.bundle.js", "render": "npm run bundle && electron render.js ../../_frames" },
+  "devDependencies": { "three": "0.170.0", "esbuild": "^0.25.0", "electron": "^37.2.0" } }
