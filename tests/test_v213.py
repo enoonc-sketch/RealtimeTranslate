@@ -153,6 +153,14 @@ r.iconify(); pump(0.3)
 ok("geometry not overwritten while minimized", app._geometry_to_save() == g0 or ui_platform.parse_geometry(app._geometry_to_save()) is not None)
 r.deiconify(); pump(0.3)
 
+# 开机自启 --minimized：无论「点 ×」设置是什么都 iconify
+app.cfg["close_action"] = "tray"
+_c = []; _ic = r.iconify; r.iconify = lambda: _c.append(1)
+app._start_minimized(); r.iconify = _ic
+ok("--minimized start always iconifies (even in tray mode)", _c == [1])
+ok("autostart label says taskbar", "自动缩在任务栏" in open(os.path.join(ROOT, "desktop_translator.py"), encoding="utf-8").read())
+app.cfg["close_action"] = "taskbar"
+
 # 5. 面板自适应
 fam = app._font_family
 ok("font family is a real installed family or Tk default",
