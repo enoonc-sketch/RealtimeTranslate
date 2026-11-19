@@ -24,7 +24,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Syntax check
-        run: python -m py_compile desktop_translator.py tray_win32.py screen_win.py ocr_win.py ui_platform.py ocr_backends.py runtime_stdlib.py
+        run: python -m py_compile desktop_translator.py tray_win32.py screen_win.py ocr_win.py ui_platform.py ocr_backends.py runtime_stdlib.py pet_win.py pet_pack.py pet_state.py pet_catalog.py
       - name: Install PyInstaller
         run: python -m pip install --disable-pip-version-check "pyinstaller>=6.0"
       - name: Build exe
@@ -80,7 +80,7 @@ jobs:
           python-version: "3.12"
           architecture: "x64"
       - name: Syntax check
-        run: python -m py_compile desktop_translator.py tray_win32.py screen_win.py ocr_win.py offline_engine.py netcheck.py prepare_offline_models.py
+        run: python -m py_compile desktop_translator.py tray_win32.py screen_win.py ocr_win.py offline_engine.py netcheck.py prepare_offline_models.py pet_win.py pet_pack.py pet_state.py pet_catalog.py
       - name: Install build deps
         run: python -m pip install --disable-pip-version-check "pyinstaller>=6.0" ctranslate2 sentencepiece numpy
       - name: Download language packs locally
