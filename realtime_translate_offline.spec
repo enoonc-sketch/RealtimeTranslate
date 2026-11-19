@@ -39,8 +39,8 @@ a = Analysis(
     ['desktop_translator.py'],
     pathex=[HERE],
     binaries=collect_dynamic_libs('ctranslate2') + collect_dynamic_libs('sentencepiece') + sp_dlls,
-    datas=model_datas + ([(ICON, '.')] if os.path.exists(ICON) else []) + ([('winocr.ps1', '.')] if os.path.exists('winocr.ps1') else []),
-    hiddenimports=['pack_downloader', 'runtime_installer', 'tray_win32', 'screen_win', 'ocr_win', 'history_store', 'tts_win', 'doc_translate', 'stt_win', 'glossary', 'update_check', 'pdf_translate', 'clip_image', 'single_instance', 'settings_io', 'runtime_stdlib', 'ocr_backends', 'ui_platform', 'glob', 'sqlite3', 'ctypes.wintypes', 'ctranslate2', 'sentencepiece', 'numpy'],
+    datas=model_datas + ([(ICON, '.')] if os.path.exists(ICON) else []) + ([('winocr.ps1', '.')] if os.path.exists('winocr.ps1') else []) + [('pets', 'pets')],  # v2.14：桌面小宠物动画包
+    hiddenimports=['pack_downloader', 'runtime_installer', 'tray_win32', 'screen_win', 'ocr_win', 'history_store', 'tts_win', 'doc_translate', 'stt_win', 'glossary', 'update_check', 'pdf_translate', 'clip_image', 'single_instance', 'settings_io', 'runtime_stdlib', 'ocr_backends', 'ui_platform', 'pet_win', 'pet_pack', 'pet_catalog', 'pet_state', 'glob', 'sqlite3', 'ctypes.wintypes', 'ctranslate2', 'sentencepiece', 'numpy'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

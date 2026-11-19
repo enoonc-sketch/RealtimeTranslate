@@ -28,7 +28,7 @@ if errorlevel 1 goto :notk
 
 echo.
 echo [2/6] 检查源码语法
-%PY% -m py_compile desktop_translator.py tray_win32.py screen_win.py ocr_win.py history_store.py tts_win.py doc_translate.py stt_win.py glossary.py update_check.py offline_engine.py netcheck.py prepare_offline_models.py
+%PY% -m py_compile desktop_translator.py tray_win32.py screen_win.py ocr_win.py history_store.py tts_win.py doc_translate.py stt_win.py glossary.py update_check.py offline_engine.py netcheck.py prepare_offline_models.py pet_win.py pet_pack.py pet_state.py pet_catalog.py
 if errorlevel 1 goto :syntax
 
 echo.

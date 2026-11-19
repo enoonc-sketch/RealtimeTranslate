@@ -1,4 +1,4 @@
-# 实时翻译 v2.12 — Windows 构建说明
+# 实时翻译 v2.14 — Windows 构建说明
 
 当前环境是 Linux，**无法交叉编译出 Windows 程序**，请在 **Windows 电脑**上按下面步骤操作。
 
@@ -27,7 +27,7 @@
    建独立虚拟环境 → 下载语言包到 `offline_models\` → 打包 → **自动自检**（真正加载模型翻译一句）
 4. 得到 `dist\RealtimeTranslateOffline\`，里面的 `RealtimeTranslate.exe` 可直接运行，整个文件夹可复制给别人
 5. 做成安装向导：安装 [Inno Setup 6](https://jrsoftware.org/isdl.php)，运行 `build_installer.bat offline`
-   → `Output\RealtimeTranslate_Offline_Setup_v2.12.0.exe`
+   → `Output\RealtimeTranslate_Offline_Setup_v2.14.0.exe`
 
 **语言包下载不下来？**（`argos-net.com` 在部分网络下不通）
 用浏览器 / 代理从 [索引](https://github.com/argosopentech/argospm-index)（`index.json` 的 `links` 字段）下载 `.argosmodel`，
@@ -424,3 +424,11 @@
 - `installer.iss` / `build_installer.bat` — Inno 安装包（标准版 / `offline`）
 - `version_info.txt`、`app.ico` — exe 版本信息与图标
 - `tests\` — 测试
+
+
+## v2.14：桌面小宠物的打包说明
+
+- 动画帧在 `pets\*.pet`（18 个文件，共约 5.4 MB），已经写进两个 spec 的 `datas`（`('pets', 'pets')`），PyInstaller 会一起打进 exe / 离线版目录，**打包机器不需要 Node.js、Electron 或 Pillow**。
+- 打完包先运行 `RealtimeTranslate.exe --selftest`，看 `%APPDATA%\RealtimeTranslate\selftest.txt` 里有一行「小宠物动画包：18 只，全部可用」；如果写「损坏/缺失」，说明 `pets` 没打进去。
+- **v2.14 未能在 Windows 上验证的部分**：宠物的逐像素透明窗口（`pet_win.py` 的 `LayeredWindow`，纯 ctypes）。首次请实测：宠物边缘是否平滑、拖动 / 单击 / 双击 / 右键是否正常、全屏游戏时是否挡住。出错会自动退回普通画布（边缘会有一圈抠色痕迹），不影响翻译。
+- 想改宠物造型 / 加新宠物：见 `tools/pet_render/`（`npm install` → `npm run render` 渲染到 `_frames`，再 `python tools\pack_pets.py _frames pets`）。

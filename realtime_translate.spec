@@ -161,8 +161,6 @@ RUNTIME_STDLIB = [
     'traceback',
     'types',
     'typing',
-    'typing.io',
-    'typing.re',
     'urllib',
     'urllib.error',
     'urllib.parse',
@@ -180,8 +178,8 @@ a = Analysis(
     ['desktop_translator.py'],
     pathex=[],
     binaries=[],
-    datas=[(ICON, '.')] + ([('winocr.ps1', '.')] if os.path.exists('winocr.ps1') else []),
-    hiddenimports=['pack_downloader', 'runtime_installer', 'tray_win32', 'screen_win', 'ocr_win', 'history_store', 'tts_win', 'doc_translate', 'stt_win', 'glossary', 'update_check', 'pdf_translate', 'clip_image', 'single_instance', 'settings_io', 'runtime_stdlib', 'ocr_backends', 'ui_platform', 'sqlite3', 'ctypes.wintypes'] + RUNTIME_STDLIB,       # 其余导入 PyInstaller 能自动分析到
+    datas=[(ICON, '.')] + ([('winocr.ps1', '.')] if os.path.exists('winocr.ps1') else []) + [('pets', 'pets')],  # v2.14：桌面小宠物动画包
+    hiddenimports=['pack_downloader', 'runtime_installer', 'tray_win32', 'screen_win', 'ocr_win', 'history_store', 'tts_win', 'doc_translate', 'stt_win', 'glossary', 'update_check', 'pdf_translate', 'clip_image', 'single_instance', 'settings_io', 'runtime_stdlib', 'ocr_backends', 'ui_platform', 'pet_win', 'pet_pack', 'pet_catalog', 'pet_state', 'sqlite3', 'ctypes.wintypes'] + RUNTIME_STDLIB,       # 其余导入 PyInstaller 能自动分析到
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

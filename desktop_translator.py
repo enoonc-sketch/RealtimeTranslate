@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-实时翻译 — 桌面独立版 v2.13，Windows / macOS / Linux(X11)
+实时翻译 — 桌面独立版 v2.14，Windows / macOS / Linux(X11)
 
 功能
   1. 输入即译：窗口里打字或粘贴，停顿约 0.35 秒自动翻译
@@ -94,6 +94,12 @@ import update_check
 import pdf_translate
 import clip_image
 import settings_io
+import pet_catalog
+import pet_state
+try:                                   # v2.14：桌面小宠物。整个模块出任何问题都只是没有宠物，不影响翻译
+    import pet_win
+except Exception:                      # pragma: no cover
+    pet_win = None
 import single_instance
 import ui_platform
 import tempfile
@@ -242,7 +248,7 @@ CLOSE_NAMES = {"tray": "隐藏到托盘", "taskbar": "最小化到任务栏", "q
 CLOSE_CODES = {v: k for k, v in CLOSE_NAMES.items()}
 MINIMIZE_NAMES = {"taskbar": "留在任务栏", "tray": "收进托盘"}        # 点窗口 – 最小化时（v2.10）
 MINIMIZE_CODES = {v: k for k, v in MINIMIZE_NAMES.items()}
-__version__ = "2.13.0"
+__version__ = "2.14.0"
 APP_TITLE = "实时翻译"
 RUN_VALUE = "RealtimeTranslate"
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -325,8 +331,9 @@ NAME2CODE = {v: k for k, v in LANGS.items()}
 # 标准版 exe 不含离线运行库：此时不显示「离线」，避免选了必报错
 ENGINES = ["Google", "微软"] + (["离线"] if offline_engine.runtime_present() else [])
 DEFAULTS = {
+    "pet_mode": "minimized", "pet_id": "cat", "pet_bubble": True, "cute_theme": False,
     "sl": "auto", "tl": "zh-CN", "top": True, "watch": False, "smart": True,
-    "bilingual": False, "reflow": True, "show_src": True, "geometry": "620x760",
+    "bilingual": False, "reflow": True, "show_src": True, "geometry": "480x760",
     "engine": "Google", "auto_offline": True,
     "pointer": True, "pointer_scope": "word", "pack_mirror": "",
     "hover": True, "hover_ms": 800,
@@ -388,8 +395,24 @@ THEME_DARK = {"bg": "#1c1c1e", "fg": "#f5f5f7", "gray": "#a1a1a6",
               "border": "#48484a", "error": "#ff6961"}
 
 
+# v2.14 萌系配色（粉彩）：只在勾选后用；深色优先。对比度同样过 WCAG AA（test_pet.py 里会算）。
+THEME_CUTE = {"bg": "#f6f3fb", "fg": "#3d303b", "gray": "#6b5e69",
+              "text_bg": "#ffffff", "text_fg": "#3d303b",
+              "bubble_bg": "#fff3ea", "bubble_fg": "#3d303b",
+              "bubble_gray": "#6f5f6c", "bubble_foot": "#a8929f",
+              "border": "#e3d9ee", "error": "#c2364f"}
+_CUTE = False
+
+
+def set_cute(on):
+    global _CUTE
+    _CUTE = bool(on)
+
+
 def theme_colors(dark):
-    return dict(THEME_DARK if dark else THEME_LIGHT)
+    if dark:
+        return dict(THEME_DARK)
+    return dict(THEME_CUTE if _CUTE else THEME_LIGHT)
 
 
 def _lum(hexcolor):
@@ -1912,7 +1935,7 @@ class App:
         _sw, _sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         self.root.geometry(ui_platform.clamp_geometry(self.cfg.get("geometry") or DEFAULTS["geometry"], _sw, _sh)
                            or DEFAULTS["geometry"])
-        self.root.minsize(min(420, _sw - 40), min(400, _sh - 80))
+        self.root.minsize(min(380, _sw - 40), min(360, _sh - 80))
         try:
             if IS_WIN:
                 self.root.iconbitmap(resource_path("app.ico"))
@@ -1936,6 +1959,7 @@ class App:
                                               self.hide_window()))
         self._watchdog = Watchdog(WATCHDOG_LOG)   # v2.12：界面线程卡死自动记调用栈
         self._watchdog.start()
+        self._init_pet()
         self.root.after(100, self._poll)
         self.root.after(600, self._watch_clip)
         self.root.after(1500, self._warmup)
@@ -1943,7 +1967,9 @@ class App:
         self._start_hotkey()
         self._start_tray()
         if "--minimized" in sys.argv:
-            self.hide_window(tip=False)
+            # v2.13.2：开机自启（--minimized）一律缩在任务栏，不管「点 ×」选的是什么。
+            # 等窗口真正显示出来再最小化，启动瞬间调用 iconify 在 Windows 上有时不生效。
+            self.root.after(300, self._start_minimized)
 
     @staticmethod
     def _load_cfg():
@@ -1977,6 +2003,10 @@ class App:
             cfg["close_action"] = DEFAULTS["close_action"]
         # v2.13：旧版默认「点 × 隐藏到托盘」，窗口会从任务栏消失、很多人以为程序退出了。
         # 老配置里还是旧默认值的，一次性改成「最小化到任务栏」（设置里 / 主窗口勾选框随时可改回去，只迁移一次）。
+        # v2.13.2：默认窗口改小（480x600），老配置里存的大窗口一次性重置成小窗口，之后用户自己拖多大都记住
+        if not cfg.get("compact_migrated"):
+            cfg["geometry"] = DEFAULTS["geometry"]
+            cfg["compact_migrated"] = True
         if not cfg.get("close_taskbar_migrated"):
             if cfg.get("close_action") == "tray":
                 cfg["close_action"] = "taskbar"
@@ -2017,6 +2047,16 @@ class App:
         cfg.update(validate_hotkey_cfg(cfg))
         # v2.7：深色外观、术语表、自动检查更新
         cfg["dark_mode"] = bool(cfg.get("dark_mode", False))
+        # v2.14：萌系配色 + 桌面小宠物
+        cfg["cute_theme"] = bool(cfg.get("cute_theme", False))
+        if cfg.get("pet_mode") not in pet_catalog.PET_MODES:
+            cfg["pet_mode"] = "minimized"
+        if cfg.get("pet_id") not in pet_catalog.pet_ids():
+            cfg["pet_id"] = pet_catalog.DEFAULT_PET
+        cfg["pet_bubble"] = bool(cfg.get("pet_bubble", True))
+        for k in ("pet_x", "pet_y"):
+            if not isinstance(cfg.get(k), int) or isinstance(cfg.get(k), bool) or abs(cfg[k]) > 20000:
+                cfg.pop(k, None)
         cfg["glossary"] = glossary.sanitize_pairs(cfg.get("glossary", []))
         cfg["update_auto"] = bool(cfg.get("update_auto", True))
         if not isinstance(cfg.get("update_last_check"), str):
@@ -2080,6 +2120,12 @@ class App:
             self.root.iconify()
         elif not self._hide_to_tray(tip):
             self.root.iconify()
+
+    def _start_minimized(self):
+        try:
+            self.root.iconify()
+        except Exception:
+            pass
 
     def minimize_to_taskbar(self):
         """v2.13：主窗口「— 最小化」按钮：无条件缩到任务栏（点任务栏图标还原），
@@ -2253,8 +2299,8 @@ class App:
             need = max([top.winfo_reqwidth(), eng_frame.winfo_reqwidth()]
                        + [f.min_width() for f in self._flows]) + 2 * 12 + 4
             sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-            min_w = min(max(420, need), sw - 40)
-            self.root.minsize(min_w, min(400, sh - 80))
+            min_w = min(max(380, need), sw - 40)
+            self.root.minsize(min_w, min(360, sh - 80))
             m = re.match(r"^(\d+)x(\d+)(.*)$", str(self.root.geometry()))
             if m and int(m.group(1)) < min_w:
                 self.root.geometry("%dx%d%s" % (min_w, int(m.group(2)), m.group(3)))
@@ -2429,6 +2475,9 @@ class App:
         self.auto_copy_var = tk.BooleanVar(value=bool(self.cfg.get("auto_copy", False)))
         self.font_size_var = tk.IntVar(value=int(self.cfg.get("font_size", 11)))
         self.dark_var = tk.BooleanVar(value=bool(self.cfg.get("dark_mode", False)))
+        set_cute(self.cfg.get("cute_theme", False))
+        self.cute_var = tk.BooleanVar(value=bool(self.cfg.get("cute_theme", False)))
+        self.pet_bubble_var = tk.BooleanVar(value=bool(self.cfg.get("pet_bubble", True)))
         self.update_auto_var = tk.BooleanVar(value=bool(self.cfg.get("update_auto", True)))
         self._stt_busy = False
         self._replace_hwnd = 0
@@ -2449,6 +2498,9 @@ class App:
         self.close_taskbar_var = tk.BooleanVar(value=self.cfg.get("close_action", "taskbar") == "taskbar")
         o1.add(ttk.Checkbutton(o1, text="点 × 最小化到任务栏", variable=self.close_taskbar_var,
                                command=self._on_close_taskbar))
+        if IS_WIN:      # v2.13.2：开机自启放到主窗口，勾上后开机自动缩在任务栏
+            o1.add(ttk.Checkbutton(o1, text="开机自动缩在任务栏", variable=self.auto_var,
+                                   command=self._on_autostart))
 
         o2 = ui_platform.FlowFrame(opts)
         o2.pack(fill="x", pady=(2, 0))
@@ -2525,8 +2577,8 @@ class App:
         f = tab("general", "常规")
         check(f, "窗口置顶", self.top_var, self._on_top, "翻译窗口始终显示在其他窗口上面。")
         if IS_WIN:
-            check(f, "开机自启（最小化到托盘）", self.auto_var, self._on_autostart,
-                  "登录 Windows 后自动运行，并直接收进托盘，不打扰你。")
+            check(f, "开机自启（自动缩在任务栏）", self.auto_var, self._on_autostart,
+                  "登录 Windows 后自动运行，并直接缩在任务栏，点任务栏图标即可打开，不打扰你。")
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(14, 0))
         ttk.Label(row, text="点窗口右上角 ×：").pack(side="left")
@@ -2557,6 +2609,23 @@ class App:
                   foreground="#5b6676").pack(side="left", padx=6)
         check(f, "深色外观", self.dark_var, self._on_dark_mode,
               "主窗口、设置、历史、气泡 / 小窗口换成深色；默认是浅色，不勾就是今天的样子。")
+        check(f, "萌系配色（粉彩）", self.cute_var, self._on_cute_theme,
+              "把浅色外观换成柔和的粉彩配色；和「深色外观」同时勾选时以深色为准。")
+        # v2.14：桌面小宠物
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(10, 0))
+        ttk.Label(row, text="桌面小宠物：").pack(side="left")
+        self.pet_mode_cb = ttk.Combobox(row, state="readonly", width=18, values=list(pet_catalog.PET_MODES.values()))
+        self.pet_mode_cb.set(pet_catalog.PET_MODES.get(self.cfg.get("pet_mode", "minimized"), ""))
+        self.pet_mode_cb.pack(side="left")
+        self.pet_mode_cb.bind("<<ComboboxSelected>>", lambda e: self._on_pet_opt())
+        self.pet_cb = ttk.Combobox(row, state="readonly", width=12, values=[pet_catalog.pet_display(p) for p in pet_catalog.pet_ids()])
+        self.pet_cb.set(pet_catalog.pet_display(self.cfg.get("pet_id", pet_catalog.DEFAULT_PET)))
+        self.pet_cb.pack(side="left", padx=6)
+        self.pet_cb.bind("<<ComboboxSelected>>", lambda e: self._on_pet_opt())
+        check(f, "译好后用气泡显示译文（宠物显示时）", self.pet_bubble_var, self._on_pet_opt,
+              "小宠物会跟着翻译状态变化：复制文字时惊讶、翻译中思考、译好开心、失败难过、久不用会睡着。"
+              "点它打开翻译窗口，双击翻译剪贴板，右键换宠物。")
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(14, 0))
         ttk.Button(row, text="导出设置…", command=self._export_settings).pack(side="left")
@@ -3073,6 +3142,98 @@ class App:
         except Exception:
             pass
         return snap
+
+    # ------------------------------------------------ v2.14 桌面小宠物 / 萌系配色
+    def _main_visible(self):
+        try:
+            return self.root.state() == "normal" and bool(self.root.winfo_viewable())
+        except Exception:
+            return True
+
+    def _init_pet(self):
+        """建桌面小宠物。任何失败都只是没有宠物，不影响翻译。"""
+        self.pet = None
+        self.pet_error = ""
+        if pet_win is None:
+            return
+        try:
+            pets_dir = resource_path("pets")
+            hooks = {
+                "show_main": self.show_window,
+                "translate_clip": lambda: self._on_tray_cmd("clip"),
+                "shot": lambda: self.q.put(("tray_shot",)),
+                "quit": self.quit,
+                "main_visible": self._main_visible,
+                "get_theme": lambda: theme_colors(bool(self.cfg.get("dark_mode", False))),
+                "save": self._save,
+            }
+            self.pet = pet_win.PetWindow(self.root, pets_dir, self.cfg, hooks)
+            self.pet.start()
+        except Exception as e:
+            self.pet = None
+            self.pet_error = str(e)
+
+    def _pet_event(self, kind, text="", bubble=True):
+        p = getattr(self, "pet", None)
+        if p is not None:
+            try:
+                p.event(kind, text, bubble)
+            except Exception:
+                pass
+
+    def _pet_msg(self, msg):
+        """把程序里的消息翻成宠物的动作（只读，不改任何消息、不影响原有处理）。"""
+        if getattr(self, "pet", None) is None:
+            return
+        try:
+            kind = msg[0]
+            if kind in ("hotkey", "copied"):
+                self._pet_event("curious")
+            elif kind == "progress":
+                _, my, done, total = msg
+                if my == self.seq:
+                    self._pet_event("busy", "翻译中 %d/%d" % (done, total))
+            elif kind == "result":
+                _, my, ok, payload = msg
+                if my != self.seq:
+                    return
+                if ok:
+                    self._pet_event("done", " ".join(d for _, d in payload[0] if d))
+                else:
+                    self._pet_event("fail", pet_state.short_text(str(payload).split("\n")[0], 36))
+            elif kind == "bubble":                    # 指针/悬停翻译：自己有弹窗，宠物只做表情
+                if msg[1] == self.bseq:
+                    self._pet_event("done" if msg[2] else "fail", "", bubble=False)
+            elif kind == "doc_prog":
+                self._pet_event("busy", "文档翻译中…")
+            elif kind == "doc_done":
+                self._pet_event("done" if msg[1] else "fail", "文档翻译好啦" if msg[1] else "文档翻译失败")
+            elif kind in ("shot_ocr", "image_ocr", "hover_ocr"):
+                self._pet_event("busy", "识别中…")
+            elif kind == "dl_done":
+                self._pet_event("done", "下载好啦")
+        except Exception:
+            pass
+
+    def _on_pet_opt(self):
+        rev = {v: k for k, v in pet_catalog.PET_MODES.items()}
+        mode = rev.get(self.pet_mode_cb.get(), "minimized")
+        pid = pet_catalog.pet_ids()[self.pet_cb.current()] if self.pet_cb.current() >= 0 else pet_catalog.DEFAULT_PET
+        self.cfg.update(pet_mode=mode, pet_id=pid, pet_bubble=self.pet_bubble_var.get())
+        self._save()
+        p = getattr(self, "pet", None)
+        if p is None and pet_win is not None and mode != "off":
+            self._init_pet()
+        elif p is not None:
+            p.refresh_pet()
+            if not self.pet_bubble_var.get():
+                p.bubble.hide()
+
+    def _on_cute_theme(self):
+        self.cfg["cute_theme"] = self.cute_var.get()
+        set_cute(self.cute_var.get())
+        self._apply_theme()
+        self._save()
 
     def _on_dark_mode(self):
         self.cfg["dark_mode"] = self.dark_var.get()
@@ -5978,6 +6139,7 @@ class App:
         if self._hist_reuse_main(my, text[:MAX_LEN], sl, tl):
             return
         self.status.configure(text="翻译中…")
+        self._pet_event("busy", "翻译中…")
         threading.Thread(
             target=self._worker,
             args=(my, text[:MAX_LEN], sl, tl, self.smart_var.get(),
@@ -6020,6 +6182,11 @@ class App:
 
     def quit(self):
         self._save()
+        try:
+            if getattr(self, "pet", None) is not None:
+                self.pet.close()
+        except Exception:
+            pass
         try:                                      # v2.12：先停看门狗，别留后台线程
             if getattr(self, "_watchdog", None) is not None:
                 self._watchdog.stop()
@@ -6259,6 +6426,7 @@ class App:
             for _drain in range(300):          # v2.10：每轮最多处理 300 条，别让一大波消息把界面堵死
                 msg = self.q.get_nowait()
                 kind = msg[0]
+                self._pet_msg(msg)
                 if kind == "hotkey":
                     self._on_hotkey(msg[1] if len(msg) > 1 else 1)
                 elif kind == "copied":
@@ -6429,6 +6597,21 @@ def run_selftest():
         if not OFFLINE.pairs():
             ok = False
             lines.append("  ✘ 离线版但没有任何语言包")
+    # v2.14：桌面小宠物的动画包要能打开（打包漏了 pets 目录会在这里直接报出来）
+    try:
+        import pet_pack
+        bad = []
+        for pid in pet_catalog.pet_ids():
+            try:
+                pet_pack.PetPack(pet_pack.pack_path(resource_path("pets"), pid))
+            except pet_pack.PetPackError as e:
+                bad.append("%s（%s）" % (pid, e))
+        lines.append("小宠物动画包：%d 只，%s" % (len(pet_catalog.pet_ids()), ("损坏/缺失：" + "、".join(bad[:5])) if bad else "全部可用"))
+        if bad:
+            ok = False
+    except Exception as e:      # noqa: BLE001
+        ok = False
+        lines.append("小宠物动画包检查出错：%s" % e)
     # v2.13：标准库完整性——标准版的离线运行库是运行时才下载的，它要用的标准库（如 glob）必须已打进 exe
     try:
         import runtime_stdlib
