@@ -20,9 +20,14 @@ nc.check_connectivity = lambda: nc.Check("net", "基础联网（外网 TCP 直�
 nc.check_dns = lambda: nc.Check("dns", "DNS 解析", True)
 
 app = dt.App(); r = app.root
-def pump(sec):
+def pump(sec, until=None):
+    # 2026-11-20：离线首次翻译（载模型 + 推理）在慢机器上要 2.5~3.7 秒，
+    # 固定等 2.5 秒就断言是时间竞态 —— 允许按条件等（最多 sec 秒）。
     end = time.time() + sec
-    while time.time() < end: r.update(); time.sleep(0.02)
+    while time.time() < end:
+        r.update(); time.sleep(0.02)
+        if until and until(): return True
+    return bool(until and until())
 res = []
 def ok(name, cond): print(("PASS " if cond else "FAIL ") + name); res.append(cond)
 
@@ -38,8 +43,9 @@ app._copy_net_report(); ok("report copied to clipboard", "网络检查" in r.cli
 app.net_win.destroy()
 
 # 2. auto fallback status in main window (google dead, offline has en->zh)
-app.engine.set("Google"); app._set_src("hello world this is a test"); app.translate_now(); pump(2.5)
-ok("auto fallback to offline shown in status", "已自动改用离线" in app.status.cget("text") and app.plain_result() != "")
+app.engine.set("Google"); app._set_src("hello world this is a test"); app.translate_now()
+ok("auto fallback to offline shown in status",
+   pump(8, lambda: "已自动改用离线" in app.status.cget("text")) and app.plain_result() != "")
 
 # 3. offline engine + pack dialog + import
 app.engine.set("离线"); app._update_engine_hint()

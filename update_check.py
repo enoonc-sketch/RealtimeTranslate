@@ -14,6 +14,16 @@ RELEASES_URL = ("https://github.com/enoonc-sketch/"
                 "RealtimeTranslate/releases/latest")
 
 
+def _read_capped(resp, limit):
+    """读 HTTP 响应并限流：真实响应支持 read(n)；某些桩对象只定义了无参 read()，
+    遇 TypeError 时退回无参读再截断（上限照样守住）。"""
+    try:
+        data = resp.read(limit)
+    except TypeError:
+        data = resp.read()
+    return data[:limit]
+
+
 def parse_version(tag):
     """'v2.6.0' / '2.6.0' -> (2, 6, 0)；解析不出返回 None。"""
     try:
@@ -45,7 +55,9 @@ def fetch_latest_tag(opener=None, timeout=8):
     open_fn = opener or urllib.request.urlopen
     try:
         with open_fn(LATEST_URL, timeout=timeout) as r:
-            data = json.loads(r.read().decode("utf-8"))
+            # 稳定性：响应限流 1 MB —— 更新检查的 JSON 只有几百字节，
+            # 服务器返回超大内容时不把它全读进内存。
+            data = json.loads(_read_capped(r, 1 << 20).decode("utf-8"))
     except Exception as e:      # noqa: BLE001  断网、超时、HTTP 错误都一样处理
         return None, str(e)[:200]
     tag = data.get("tag_name") if isinstance(data, dict) else None

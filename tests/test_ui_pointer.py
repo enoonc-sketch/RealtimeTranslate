@@ -33,6 +33,10 @@ dt.ENGINES[:] = ["Google", "微软", "离线"]
 dt.g_translate = lambda t, sl, tl, attempts=3, timeout=12: ("译:" + t[:30], "en")
 
 app = dt.App(); r = app.root
+# 安全修复（2026-11-20）：_dl_start 在下载未钉死哈希的语言对前会弹确认框；
+# 本测试用的假索引是 1.0 版（未钉死），这里桩掉确认框模拟用户点「是」，
+# 否则 xvfb 下没人点确认、测试会一直等下去。
+dt.messagebox.askyesno = lambda *a, **k: True
 def pump(sec, until=None):
     end = time.time() + sec
     while time.time() < end:

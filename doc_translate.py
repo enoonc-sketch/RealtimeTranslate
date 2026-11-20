@@ -28,9 +28,30 @@ _TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}( .*
 # v2.10：大文件保护。超过上限直接拒绝（给出明确提示），不再把整个文件读进内存后卡死。
 MAX_TEXT_BYTES = 50 * 1024 * 1024        # .txt / .md / .srt
 MAX_DOCX_BYTES = 100 * 1024 * 1024       # .docx 压缩包本身
-MAX_DOCX_XML_BYTES = 200 * 1024 * 1024   # word/document.xml 解压后（防压缩炸弹）
+# L-04：word/document.xml 解压后上限 200→50 MB（正常手册的 document.xml 远小于此）。
+MAX_DOCX_XML_BYTES = 50 * 1024 * 1024
+# M-05：docx 全部条目解压后总量上限（防压缩炸弹：单个文件不大、加起来很大）。
+MAX_DOCX_TOTAL_BYTES = 400 * 1024 * 1024
 MAX_PDF_BYTES = 200 * 1024 * 1024        # .pdf（与 pdf_translate.MAX_PDF_BYTES 一致）
 LARGE_DOC_BYTES = 5 * 1024 * 1024        # 超过这个大小先问一句再翻
+
+# M-05：docx 重建时只保留这些条目 —— 白名单之外的（如 vbaProject.bin 宏、
+# 自定义可执行内容）直接丢掉，不原样带进输出文件。
+_DOCX_ALLOWED_DIRS = (
+    "_rels/", "word/", "docProps/", "customXml/", "xl/", "ppt/",
+    "theme/", "drawings/", "media/", "embeddings/", "charts/", "glossary/",
+    "printerSettings/",
+)
+
+
+def _docx_entry_allowed(name):
+    """M-05：条目名是否可保留 —— 拒绝 ..、绝对路径、盘符，且必须在白名单里。"""
+    if not name or name.startswith(("/", "\\")):
+        return False
+    n = name.replace("\\", "/")
+    if ".." in n.split("/") or (len(n) >= 2 and n[1] == ":"):
+        return False
+    return n == "[Content_Types].xml" or any(n.startswith(p) for p in _DOCX_ALLOWED_DIRS)
 
 
 def size_limit_for(ext):
@@ -73,13 +94,19 @@ def read_text_file(path, max_bytes=MAX_TEXT_BYTES):
 
 
 def _check_docx_zip(zin):
-    """docx 压缩包里 document.xml 解压后太大就拒绝（压缩炸弹）。"""
+    """docx 压缩包里 document.xml 解压后太大、或全部条目解压后总量太大就拒绝（压缩炸弹）。"""
     try:
         info = zin.getinfo("word/document.xml")
     except KeyError:
         return
     if info.file_size > MAX_DOCX_XML_BYTES:
         raise ValueError("文档正文太大（解压后 %.0f MB），已拒绝处理" % (info.file_size / 1048576.0))
+    total = 0
+    for item in zin.infolist():
+        total += item.file_size
+        if total > MAX_DOCX_TOTAL_BYTES:
+            raise ValueError("文档解压后总量太大（超过 %d MB），已拒绝处理"
+                             % (MAX_DOCX_TOTAL_BYTES // 1048576))
 
 
 def supported_doc_ext(path):
@@ -311,7 +338,8 @@ def docx_document_xml(data):
 def docx_rebuild(data, translated):
     """按 translated（与 docx_paragraph_texts 一一对应）重建整个 .docx。
 
-    其他 zip 条目按原压缩方式原样复制。
+    M-05：只保留白名单里的条目（见 _DOCX_ALLOWED_DIRS），其余（如宏）直接丢掉；
+    ZipInfo 只保留文件名与时间戳重建，不原样带出原包的权限位 / 注释等元数据。
     """
     zin = zipfile.ZipFile(io.BytesIO(data or b""))
     try:
@@ -321,9 +349,13 @@ def docx_rebuild(data, translated):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
+                if not _docx_entry_allowed(item.filename):
+                    continue
                 payload = new_xml if item.filename == "word/document.xml" \
                     else zin.read(item.filename)
-                zout.writestr(item, payload)
+                zi = zipfile.ZipInfo(item.filename, item.date_time)
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                zout.writestr(zi, payload)
         return buf.getvalue()
     finally:
         zin.close()

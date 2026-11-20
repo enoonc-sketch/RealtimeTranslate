@@ -55,12 +55,16 @@ class SingleInstance:
             if handle:
                 kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
                 kernel32.CloseHandle(handle)
-            # 已有实例：唤起它的主窗口（与旧 acquire_single_instance() 一致）。
+            # 已有实例：先确认它真的是本程序（M-02）—— 互斥体名是固定字符串，
+            # 别的程序也能抢先创建；找不到已验证的窗口就当它已失效，fail-open 启动，
+            # 不让一个同名互斥体把本程序永久挡在门外。
             try:
-                bring_existing_to_front()
+                if _find_existing_window() is not None:
+                    bring_existing_to_front()
+                    return False
             except Exception:
                 pass
-            return False
+            return True
         if not handle:
             # 建互斥体失败但并非已存在：fail-open，照常启动。
             return True
@@ -157,11 +161,69 @@ def ensure_single_instance(name=None, lock_path=None):
     return None
 
 
+def _find_existing_window():
+    """M-02：按标题找窗口，并校验它确属本程序进程。
+
+    互斥体名是固定字符串，任何程序都能抢先创建 —— 光凭标题找窗口再提
+    前台，可能把一个同名窗口的别的程序提到前台，甚至被用来拒绝本程序
+    启动。所以只认进程映像名是 RealtimeTranslate.exe / python.exe /
+    pythonw.exe 的窗口；校验失败（拿不到进程信息）时按「不是本程序」算。
+    非 Windows 返回 None。
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowW.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                        wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        for title in (DEFAULT_WINDOW_TITLE, _FALLBACK_WINDOW_TITLE):
+            hwnd = user32.FindWindowW(None, title)
+            if not hwnd:
+                continue
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if not pid.value:
+                continue
+            handle = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                continue
+            try:
+                buf = ctypes.create_unicode_buffer(260)
+                size = wintypes.DWORD(260)
+                if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                    continue
+                if os.path.basename(buf.value).lower() in _OWN_PROCESS_NAMES:
+                    return hwnd
+            finally:
+                kernel32.CloseHandle(handle)
+        return None
+    except Exception:
+        return None
+
+
+# M-02：按标题找到的窗口，只有进程映像名是这三个之一才认是本程序。
+_OWN_PROCESS_NAMES = ("realtimetranslate.exe", "python.exe", "pythonw.exe")
+
+
 def bring_existing_to_front():
     """尽力把已运行实例的主窗口提到前台；成功返回 True，否则 False，永不抛错。
 
-    Windows：按标题找窗口，先试 "实时翻译"（APP_TITLE），再试
-    "RealtimeTranslate"；找到就 ShowWindow(SW_RESTORE) + SetForegroundWindow。
+    Windows：先按标题找窗口，再校验它确属本程序进程（M-02），
+    找到就 ShowWindow(SW_RESTORE) + SetForegroundWindow。
     非 Windows：返回 False。
     """
     if sys.platform != "win32":
@@ -170,25 +232,19 @@ def bring_existing_to_front():
         import ctypes
         from ctypes import wintypes
 
+        hwnd = _find_existing_window()
+        if not hwnd:
+            return False
         user32 = ctypes.windll.user32
-        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
-        user32.FindWindowW.restype = wintypes.HWND
         user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         user32.ShowWindow.restype = wintypes.BOOL
         user32.SetForegroundWindow.argtypes = [wintypes.HWND]
         user32.SetForegroundWindow.restype = wintypes.BOOL
-
-        hwnd = None
-        for title in (DEFAULT_WINDOW_TITLE, _FALLBACK_WINDOW_TITLE):
-            hwnd = user32.FindWindowW(None, title)
-            if hwnd:
-                break
-        if not hwnd:
-            return False
         try:
             user32.ShowWindow(hwnd, SW_RESTORE)
         except Exception:
             pass
-        return bool(user32.SetForegroundWindow(hwnd))
+        user32.SetForegroundWindow(hwnd)
+        return True
     except Exception:
         return False

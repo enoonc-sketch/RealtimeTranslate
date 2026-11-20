@@ -23,6 +23,18 @@ MAX_LOADED = 3          # 同时驻留内存的翻译模型数（每个约 100~3
 MAX_SENT_CHARS = 300    # 单句超过此长度时按逗号/空格再切，避免模型对超长句质量骤降
 NO_SPACE_LANGS = ("zh", "ja", "th")
 
+# 安全修复（2026-11-20，按安全评估报告）：
+#   H-02：metadata.json 里的 from_code / to_code / package_version 直接拼安装路径，
+#         未校验可导致目录遍历 + 任意目录删除 —— 只接受白名单字符，拼完再断言落点。
+#   H-06：ASCII 缓存原先落在 %PUBLIC% / ProgramData（全用户可写），跨用户可投毒模型
+#         —— 改成本用户专属目录。
+#   M-12：模型加载时不验完整性 —— 安装时留 sha256 清单，加载前比对（无清单的老包首次
+#         加载时按现状建清单，即信任首次使用，之后每次比对）。
+_CODE_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+_VER_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,31}")
+_TOP_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}")
+_MANIFEST_DIRNAME = ".integrity"       # 哈希清单目录（与模型目录分离存放，不放在模型目录里）
+
 
 class OfflineError(RuntimeError):
     """面向用户的错误，message 已是中文说明。"""
@@ -106,8 +118,105 @@ def scan_dirs(dirs):
     return [v[1] for v in best.values()], [p for p in found if not p.usable]
 
 
-def install_package(archive, dest_dir):
-    """把 .argosmodel（zip）安全解压到 dest_dir，返回 Pkg。出错抛 OfflineError。"""
+def _check_code(value, what):
+    """H-02：metadata.json 里的语言代码 / 版本只接受白名单字符，否则拒绝安装。
+    语言代码只允许字母数字 - _；版本号还允许 .（如 1.9），但不许含 ..。"""
+    rx = _VER_RE if what == "package_version" else _CODE_RE
+    if not isinstance(value, str) or not rx.fullmatch(value) or ".." in value:
+        raise OfflineError("%s 不合法（只允许字母、数字、-、_，版本号还可含 .）：%r" % (what, value))
+    return value
+
+
+def _check_top(top):
+    """H-02：zip 里 metadata.json 所在的顶层目录只取一层，且必须是安全目录名。"""
+    if not top:
+        return ""
+    if not _TOP_RE.fullmatch(top) or top in (".", "..") or ".." in top:
+        raise OfflineError("语言包顶层目录名不合法，已拒绝：%s" % top)
+    return top
+
+
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def _manifest_path(pkg_path):
+    """模型完整性清单的存放位置：与模型目录分离（模型目录的父目录下）。"""
+    return os.path.join(os.path.dirname(pkg_path), _MANIFEST_DIRNAME,
+                        os.path.basename(pkg_path) + ".sha256.json")
+
+
+def _hash_tree(root, prefix=""):
+    """对 root 下全部文件算 sha256，键为 prefix + 相对路径（统一用 / 作分隔符）。"""
+    out = {}
+    for r, _dirs, files in os.walk(root):
+        for fn in files:
+            p = os.path.join(r, fn)
+            rel = os.path.relpath(p, root).replace(os.sep, "/")
+            try:
+                out[prefix + rel] = _sha256_file(p)
+            except OSError:
+                return None
+    return out
+
+
+def _hash_model_files(pkg):
+    """M-12：对原生库加载的文件算哈希：model/ 下全部文件 + sentencepiece.model。"""
+    out = _hash_tree(pkg.model_dir, prefix="model/")
+    if out is None:
+        return None
+    try:
+        out["sentencepiece.model"] = _sha256_file(pkg.sp_path)
+    except OSError:
+        return None
+    return out
+
+
+def _write_manifest(pkg):
+    """M-12：安装成功后把模型文件哈希写进清单（下次加载前比对）。写失败不阻安装。"""
+    try:
+        hashes = _hash_model_files(pkg)
+        if not hashes:
+            return False
+        mp = _manifest_path(pkg.path)
+        os.makedirs(os.path.dirname(mp), exist_ok=True)
+        tmp = mp + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(hashes, f, sort_keys=True)
+        os.replace(tmp, mp)
+        return True
+    except Exception:
+        return False
+
+
+def _verify_manifest(pkg):
+    """M-12：加载前比对清单。返回 True（通过）/ False（被改动）/ None（无清单，老包）。"""
+    try:
+        mp = _manifest_path(pkg.path)
+        if not os.path.isfile(mp):
+            return None
+        with open(mp, "r", encoding="utf-8") as f:
+            want = json.load(f)
+        if not isinstance(want, dict) or not want:
+            return None
+        got = _hash_model_files(pkg)
+        if got is None:
+            return False
+        return got == want
+    except Exception:
+        return False
+
+
+def install_package(archive, dest_dir, expected=None):
+    """把 .argosmodel（zip）安全解压到 dest_dir，返回 Pkg。出错抛 OfflineError。
+
+    expected（可选）：(from_code, to_code, package_version)，与索引条目一致才安装
+    （H-03：防止下载的包与索引条目不符、被掉包后仍装上）。"""
     if not zipfile.is_zipfile(archive):
         raise OfflineError("不是有效的语言包文件（应为 .argosmodel）：%s" % os.path.basename(archive))
     os.makedirs(dest_dir, exist_ok=True)
@@ -117,7 +226,7 @@ def install_package(archive, dest_dir):
         metas = [n for n in names if n.endswith("metadata.json") and n.count("/") <= 1]
         if not metas:
             raise OfflineError("语言包里没有 metadata.json，文件可能已损坏")
-        top = metas[0].rsplit("/", 1)[0] if "/" in metas[0] else ""
+        top = _check_top(metas[0].rsplit("/", 1)[0] if "/" in metas[0] else "")
         for n in names:                                   # 防 zip-slip
             target = os.path.realpath(os.path.join(root, n))
             if not (target == root or target.startswith(root + os.sep)):
@@ -134,11 +243,29 @@ def install_package(archive, dest_dir):
     if not probe.usable:
         shutil.rmtree(tmp_root, ignore_errors=True)
         raise OfflineError("%s（%s→%s）" % (probe.problem, probe.from_code, probe.to_code))
+    # H-02：安装目录拼装前先校验 metadata 字段，拼完再断言落点在 dest_dir 内，
+    # 然后再 rmtree / move —— 字段里再也藏不进 ../。
+    _check_code(probe.from_code, "from_code")
+    _check_code(probe.to_code, "to_code")
+    _check_code(probe.version, "package_version")
+    if expected is not None:
+        exp_f, exp_t, exp_v = expected
+        if (probe.from_code, probe.to_code, probe.version) != (exp_f, exp_t, str(exp_v)):
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            raise OfflineError("语言包与索引条目不符（包内 %s→%s v%s，索引要求 %s→%s v%s），"
+                               "已拒绝安装" % (probe.from_code, probe.to_code, probe.version,
+                                             exp_f, exp_t, exp_v))
     final = os.path.join(root, top or "translate-%s_%s-%s" % (probe.from_code, probe.to_code, probe.version.replace(".", "_")))
+    final_real = os.path.realpath(final)
+    if not (final_real == root or final_real.startswith(root + os.sep)):
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        raise OfflineError("语言包安装目标超出安装目录，已拒绝：%s" % final)
     shutil.rmtree(final, ignore_errors=True)
     shutil.move(src, final)
     shutil.rmtree(tmp_root, ignore_errors=True)
-    return Pkg(final, "已安装")
+    pkg = Pkg(final, "已安装")
+    _write_manifest(pkg)          # M-12：安装时留哈希清单
+    return pkg
 
 
 # ---------------------------------------------------------------- 分句
@@ -177,8 +304,14 @@ def _join(parts, to_code):
 
 # ---------------------------------------------------------------- 引擎
 def _ascii_cache_root():
-    base = os.environ.get("PUBLIC") or os.environ.get("ProgramData") or "C:\\Users\\Public"
-    return os.path.join(base, "RealtimeTranslate", "modelcache")
+    # H-06：必须用本用户专属目录。原先用 %PUBLIC% / ProgramData（全用户可写），
+    # 同机低权限用户可替换其中的模型文件，下次受害用户启动即加载被篡改的模型。
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        return os.path.join(local, "RealtimeTranslate", "modelcache")
+    # 非 Windows / 无 LOCALAPPDATA：用本用户临时目录下的隔离子目录（仍是本用户专属）。
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "RealtimeTranslate-modelcache")
 
 
 class Engine:
@@ -237,6 +370,15 @@ class Engine:
             if hit:
                 self._loaded[pkg.path] = hit
                 return hit
+            # M-12：原生库加载模型前先比对安装时留下的哈希清单；被改动就拒绝加载。
+            # 无清单的老包（本修复之前装好的）首次加载时按现状建清单（信任首次使用），
+            # 之后每次比对 —— 既不断掉老用户，也堵住“装好后悄悄换权重”的口子。
+            verified = _verify_manifest(pkg)
+            if verified is False:
+                raise OfflineError("离线模型已被改动（%s），已拒绝加载。\n"
+                                   "请在「离线语言包…」里重新下载 / 导入该语言对。" % pkg.name)
+            if verified is None:
+                _write_manifest(pkg)
             try:
                 import ctranslate2
                 import sentencepiece as spm
@@ -259,7 +401,13 @@ class Engine:
                 # 部分 Windows 版本的 ctranslate2 打不开含中文的路径：复制到纯英文目录再试
                 if sys.platform.startswith("win") and not pkg.model_dir.isascii():
                     safe = os.path.join(_ascii_cache_root(), pkg.name)
-                    if not os.path.isdir(safe):
+                    # H-06/M-12：缓存副本也要验——不存在或被改动就重新复制，不直接信任旧缓存。
+                    want = _hash_model_files(pkg)
+                    want_model = ({k: v for k, v in want.items() if k != "sentencepiece.model"}
+                                  if want else None)
+                    got = _hash_tree(safe, prefix="model/") if os.path.isdir(safe) else None
+                    if want_model is None or got != want_model:
+                        shutil.rmtree(safe, ignore_errors=True)
                         shutil.copytree(pkg.model_dir, safe)
                     tr = ctranslate2.Translator(safe, device="cpu", inter_threads=1,
                                                 intra_threads=0, compute_type="auto")

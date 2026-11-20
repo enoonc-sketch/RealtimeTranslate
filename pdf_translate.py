@@ -413,8 +413,16 @@ def _extract_pdf_text_bytes(data):
     # CMap 只可能在含 beginbfchar / beginbfrange 的流里（或文件明文里）；
     # 以前把所有流 + 整个文件拼成一份巨大字符串再 decode，内存是文件的好几倍。
     cmap_parts = [p for p in payloads if b"beginbf" in p]
-    if b"beginbf" in (data or b""):
-        cmap_parts.append(data)
+    # 稳定性：文件明文里含 beginbf 时，只取每个出现点前后各 256KB 的窗口
+    # （最多 4 处），不再把整个文件（可达 200 MB）拼进 CMap 文本。
+    raw = data or b""
+    pos = 0
+    for _ in range(4):
+        i = raw.find(b"beginbf", pos)
+        if i < 0:
+            break
+        cmap_parts.append(raw[max(0, i - 256 * 1024): i + 256 * 1024])
+        pos = i + 1
     cmap_text = b"\n".join(cmap_parts)
     cmap = _parse_cmap(cmap_text.decode("latin-1", errors="replace")) if cmap_parts else {}
     del cmap_text, cmap_parts
@@ -436,6 +444,9 @@ def extract_pdf_text(path_or_bytes):
     """
     try:
         if isinstance(path_or_bytes, (bytes, bytearray)):
+            # 稳定性：字节输入也限流，超过上限直接拒绝，不全拷进内存。
+            if len(path_or_bytes) > MAX_PDF_BYTES:
+                return ""
             data = bytes(path_or_bytes)
         elif isinstance(path_or_bytes, (str, os.PathLike)):
             if os.path.getsize(path_or_bytes) > MAX_PDF_BYTES:
@@ -468,6 +479,11 @@ def translate_pdf(path, translate_fn):
     （多半是扫描件/图片型 PDF，提示改用截图翻译）。
     文件读不到时 open 的 OSError 直接向上传；translate_fn 的异常也向上传。
     """
+    # 稳定性：读文件前先验大小 —— 原先直接 f.read()，超大文件会把内存撑满。
+    size = os.path.getsize(path)
+    if size > MAX_PDF_BYTES:
+        raise ValueError("文件太大（%.1f MB），上限 %d MB，请拆成几份再翻译"
+                         % (size / 1048576.0, MAX_PDF_BYTES // 1048576))
     with open(path, "rb") as f:
         data = f.read()
     text = extract_pdf_text(data)

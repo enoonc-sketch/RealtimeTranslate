@@ -12,12 +12,20 @@ System.Speech 的 SpeechRecognitionEngine + DictationGrammar
 recognize() 直接返回 ("unavailable", "")。
 """
 
+import hashlib
 import os
 import subprocess
 import sys
 import tempfile
 
 IS_WIN = sys.platform.startswith("win")
+
+# 安全修复（2026-11-20，按安全评估报告）：
+#   M-01：识别脚本写进临时文件后立即验哈希再执行（防临时文件被替换）。
+#   L-07：找 powershell.exe 不再信任 SystemRoot 环境变量。
+#   L-08：每次识别前清理 %TEMP% 里超过 24 小时的旧 rt-tts-*/rt-stt-* 临时文件。
+#   识别结果文件只读前 64KB（语音识别结果是短文本，超过即异常）。
+MAX_STT_RESULT_BYTES = 65536
 
 try:
     from tts_win import culture_for
@@ -31,6 +39,11 @@ except Exception:      # noqa: BLE001  tts_win 缺失时用自己的映射
         if code in _CULTURES:
             return _CULTURES[code]
         return _CULTURES.get(code.split("-")[0].lower(), "en-US")
+
+try:
+    from tts_win import cleanup_stale_temp_files as _cleanup_stale
+except Exception:      # noqa: BLE001
+    _cleanup_stale = None
 
 TIMEOUT_MIN, TIMEOUT_MAX = 5, 60
 DEFAULT_TIMEOUT = 15
@@ -51,14 +64,30 @@ def is_available():
     return _find_powershell() is not None
 
 
+def _system32_dir():
+    """不依赖环境变量取 System32 目录（L-07：SystemRoot 环境变量可被注入）。"""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(260)
+        n = ctypes.windll.kernel32.GetSystemDirectoryW(buf, 260)
+        if 0 < n < 260:
+            return buf.value
+    except Exception:      # noqa: BLE001
+        pass
+    return None
+
+
 def _find_powershell():
     if not IS_WIN:
         return None
-    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
-    cand = os.path.join(system_root, "System32", "WindowsPowerShell",
-                        "v1.0", "powershell.exe")
-    if os.path.isfile(cand):
-        return cand
+    cands = []
+    sys32 = _system32_dir()
+    if sys32:
+        cands.append(os.path.join(sys32, "WindowsPowerShell", "v1.0", "powershell.exe"))
+    cands.append(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    for cand in cands:
+        if os.path.isfile(cand):
+            return cand
     import shutil
     return shutil.which("powershell")
 
@@ -131,12 +160,29 @@ def recognize(lang_code, timeout=DEFAULT_TIMEOUT):
     ps = _find_powershell()
     if not ps:
         return "unavailable", ""
+    # L-08：顺手清理旧临时文件（进程被杀时残留的 rt-tts-*/rt-stt-*）。
+    if _cleanup_stale is not None:
+        try:
+            _cleanup_stale()
+        except Exception:      # noqa: BLE001
+            pass
     out_fd, out_path = tempfile.mkstemp(suffix=".txt", prefix="rt-stt-")
     os.close(out_fd)
     ps_fd, ps_path = tempfile.mkstemp(suffix=".ps1", prefix="rt-stt-")
     try:
         with os.fdopen(ps_fd, "w", encoding="utf-8") as f:
             f.write(_PS_SCRIPT)
+        # M-01：脚本写进临时文件后立即读回验哈希 —— 写入和执行之间文件若被替换，
+        # 哈希不符就拒绝执行（测试里这里写的是真实脚本，验哈希能通过）。
+        try:
+            h = hashlib.sha256()
+            with open(ps_path, "rb") as f:
+                for b in iter(lambda: f.read(1 << 20), b""):
+                    h.update(b)
+            if h.hexdigest() != hashlib.sha256(_PS_SCRIPT.encode("utf-8")).hexdigest():
+                return "error", "识别脚本写入后被改动，已拒绝执行"
+        except OSError as e:
+            return "error", "读取识别脚本失败：%s" % e
         cmd = build_command(out_path, ps_path, lang_code, timeout)
         if cmd is None:
             return "unavailable", ""
@@ -151,7 +197,7 @@ def recognize(lang_code, timeout=DEFAULT_TIMEOUT):
         if proc.returncode == 0:
             try:
                 with open(out_path, "r", encoding="utf-8") as f:
-                    text = f.read().strip()
+                    text = f.read(MAX_STT_RESULT_BYTES).strip()
             except Exception:
                 text = ""
             return ("ok", text) if text else ("timeout", "")

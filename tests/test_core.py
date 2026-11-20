@@ -71,11 +71,13 @@ def fake_urlopen(req, timeout=0):
     url = req.full_url
     if url.startswith(dt.MS_AUTH):
         state["auth"] += 1
-        return R(("tok%d" % state["auth"]).encode())
+        # 安全修复（2026-11-20）：_ms_get_token 校验 token 格式（10~512 字符的
+        # base64url 字符），假 token 也得像个真 token，不然会被当成拦截页拒绝。
+        return R(("test-token-%03d" % state["auth"]).encode())
     state["tr"] += 1
     if state["tr"] == 1:
         raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, None)
-    assert req.headers["Authorization"] == "Bearer tok2", req.headers
+    assert req.headers["Authorization"] == "Bearer test-token-002", req.headers
     return R(json.dumps([{"detectedLanguage": {"language": "zh-Hans"}, "translations": [{"text": "hello"}]}]).encode())
 dt.urllib.request.urlopen = fake_urlopen
 dt.time.sleep = lambda s: None

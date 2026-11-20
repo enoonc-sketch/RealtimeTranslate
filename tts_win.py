@@ -14,6 +14,7 @@ System.Speech 会用默认语音朗读（可能读不准），或 SelectVoiceByC
 抛错时 speak() 返回 False；程序只在状态栏明说失败，不崩。
 """
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -21,6 +22,28 @@ import tempfile
 import threading
 
 IS_WIN = sys.platform.startswith("win")
+
+# 安全修复（2026-11-20，按安全评估报告）：
+#   M-01：朗读脚本写进临时文件后立即验哈希再执行（防临时文件被替换）。
+#   L-03：voice 指定时先对已安装语音列表校验，查无此语音就回落默认语音。
+#   L-07：找 powershell.exe 不再信任 SystemRoot 环境变量。
+#   L-08：每次首次朗读时清理 %TEMP% 里超过 24 小时的旧 rt-tts-*/rt-stt-* 临时文件。
+#   L-09：朗读进程加看管超时（按文字长度算，60 秒起、600 秒封顶），超时杀掉；
+#         文字超过 20000 字先截断再朗读。
+MAX_TTS_CHARS = 20000
+_STALE_CLEANED = False
+
+
+def _sha256_text(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
 
 # 语言代码 → Windows 语音 culture（System.Speech 用 culture 挑语音）
 CULTURES = {
@@ -63,14 +86,30 @@ def is_available():
     return _find_powershell() is not None
 
 
+def _system32_dir():
+    """不依赖环境变量取 System32 目录（L-07：SystemRoot 环境变量可被注入）。"""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(260)
+        n = ctypes.windll.kernel32.GetSystemDirectoryW(buf, 260)
+        if 0 < n < 260:
+            return buf.value
+    except Exception:      # noqa: BLE001
+        pass
+    return None
+
+
 def _find_powershell():
     if not IS_WIN:
         return None
-    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
-    cand = os.path.join(system_root, "System32", "WindowsPowerShell",
-                        "v1.0", "powershell.exe")
-    if os.path.isfile(cand):
-        return cand
+    cands = []
+    sys32 = _system32_dir()
+    if sys32:
+        cands.append(os.path.join(sys32, "WindowsPowerShell", "v1.0", "powershell.exe"))
+    cands.append(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    for cand in cands:
+        if os.path.isfile(cand):
+            return cand
     import shutil
     return shutil.which("powershell")
 
@@ -100,7 +139,7 @@ def list_voices(timeout=15):
     if not ps:
         return []
     try:
-        script_path = _write_temp(_LIST_VOICES_SCRIPT, ".ps1")
+        script_path = _write_script_temp(_LIST_VOICES_SCRIPT, ".ps1")
     except Exception:
         return []
     try:
@@ -181,6 +220,43 @@ def _write_temp(text, suffix):
     return path
 
 
+def _write_script_temp(script_text, suffix=".ps1"):
+    """M-01：把脚本写进临时文件后立即读回验哈希 —— 写入和执行之间文件若被
+    替换（同机其他程序 / 恶意软件），哈希不符就删文件并拒绝执行。"""
+    path = _write_temp(script_text, suffix)
+    try:
+        if _sha256_file(path) != _sha256_text(script_text):
+            raise OSError("临时脚本文件写入后被改动")
+    except OSError:
+        _cleanup_files([path])
+        raise
+    return path
+
+
+def cleanup_stale_temp_files(max_age_seconds=86400):
+    """L-08：清理 %TEMP% 里超过 max_age_seconds 的旧 rt-tts-* / rt-stt-* 临时文件
+    （进程异常退出 / 被杀掉时 _reap 来不及删的残留）。只删文件，不动目录。"""
+    import time
+    try:
+        tmp = tempfile.gettempdir()
+    except Exception:      # noqa: BLE001
+        return
+    cutoff = time.time() - max_age_seconds
+    try:
+        names = os.listdir(tmp)
+    except OSError:
+        return
+    for name in names:
+        if not (name.startswith("rt-tts-") or name.startswith("rt-stt-")):
+            continue
+        p = os.path.join(tmp, name)
+        try:
+            if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                os.remove(p)
+        except OSError:
+            pass
+
+
 _lock = threading.Lock()
 _proc = None            # 正在朗读的 powershell 进程（同一时间只读一个）
 _files = []             # 本次朗读的临时文件（读完即删）
@@ -228,12 +304,27 @@ def speak(text, lang_code, rate=0, voice=None):
     再调一次 speak() 会先停掉上一次。失败（非 Windows / 没文字 /
     起不来进程）返回 False，绝不向界面抛异常。
     """
-    global _proc, _files
+    global _proc, _files, _STALE_CLEANED
     if not IS_WIN or not (text or "").strip():
         return False
     ps = _find_powershell()
     if not ps:
         return False
+    # L-08：每个进程只清理一次旧临时文件（首次朗读时）。
+    if not _STALE_CLEANED:
+        _STALE_CLEANED = True
+        cleanup_stale_temp_files()
+    # L-09：超长文字先截断 —— System.Speech 读几十万字会挂几个小时不返回。
+    text = text[:MAX_TTS_CHARS]
+    # L-03：指定了语音名就先对已安装语音列表校验 —— 查无此语音时回落默认语音，
+    # 不把用户输入的任意名字原样传给 SelectVoice（PowerShell 脚本里它直接拼进命令）。
+    if voice:
+        try:
+            names = {v.get("name") for v in list_voices()}
+        except Exception:      # noqa: BLE001
+            names = set()
+        if names and voice not in names:
+            voice = None
     stop()                       # 同一时间只读一个：新朗读先停旧的
     try:
         txt_path = _write_temp(text, ".txt")
@@ -241,7 +332,7 @@ def speak(text, lang_code, rate=0, voice=None):
         return False
     # 脚本也写进临时文件：命令行里只有两个文件路径 + culture + 语速。
     try:
-        ps_path = _write_temp(_PS_SCRIPT, ".ps1")
+        ps_path = _write_script_temp(_PS_SCRIPT, ".ps1")
     except Exception:
         _cleanup_files([txt_path])
         return False
@@ -258,16 +349,28 @@ def speak(text, lang_code, rate=0, voice=None):
         return False
     with _lock:
         _proc, _files = proc, [txt_path, ps_path]
-    # 读完（或被 stop）后由 _reap 线程删临时文件：进程退出前文件不能删。
-    threading.Thread(target=_reap, args=(proc, [txt_path, ps_path]), daemon=True).start()
+    # L-09：朗读进程看管超时 —— 60 秒起，每 1000 字加 60 秒，600 秒封顶；
+    # 超时杀进程、删临时文件，不让它无限挂着。读完（或被 stop）后由 _reap
+    # 线程删临时文件：进程退出前文件不能删。
+    n_chars = max(1, len(text))
+    timeout = min(600, max(60, 60 * ((n_chars + 999) // 1000)))
+    threading.Thread(target=_reap, args=(proc, [txt_path, ps_path], timeout), daemon=True).start()
     return True
 
 
-def _reap(proc, paths):
+def _reap(proc, paths, timeout=60):
     try:
-        proc.wait()
-    except Exception:
-        pass
+        proc.wait(timeout=timeout)
+    except Exception:      # noqa: BLE001
+        # 超时 / 等待失败：杀掉进程，不让它无限挂着占住临时文件。
+        try:
+            proc.kill()
+        except Exception:      # noqa: BLE001
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:      # noqa: BLE001
+            pass
     with _lock:
         global _proc, _files
         if _proc is proc:

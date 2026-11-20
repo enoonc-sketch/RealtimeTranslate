@@ -338,8 +338,11 @@ DEFAULTS = {
     "pointer": True, "pointer_scope": "word", "pack_mirror": "",
     "hover": True, "hover_ms": 800,
     "close_action": "taskbar", "tray_tip": True, "minimize_action": "taskbar",   # v2.13：点 × 默认最小化到任务栏
-    "hover_window": False, "live_interval": 3,      # v2.11：悬停整窗翻译、实时刷新间隔（秒）
+    "hover_window": False, "live_interval": 5,      # v2.11：悬停整窗翻译、实时刷新间隔（秒）
+    # L-05：最短 5 秒——2~3 秒一轮高频 OCR 会把窗口卡住、CPU 占满。
     "history_on": True, "history_max": 2000, "history_reuse": False,
+    # H-01：剪贴板监听开启时的外发提醒是否已显示过（只提醒一次）。
+    "clip_warn_shown": False,
     "popup_mode": "bubble", "mini_w": 320, "mini_h": 110, "shot_mode": "overlay",
     # v2.5：朗读语速（-10~10，默认 0）、自动复制译文（默认关）、自定义全局快捷键
     "tts_rate": 0, "auto_copy": False,
@@ -356,6 +359,162 @@ DEFAULTS = {
     # v2.9：朗读语音（空 = 系统默认语音；下拉框里选的是 Windows 已安装语音的名字）
     "tts_voice": "",
 }
+
+
+def _read_capped(resp, limit):
+    """读 HTTP 响应并限流：真实响应支持 read(n)；某些桩对象只定义了无参 read()，
+    遇 TypeError 时退回无参读再截断（上限照样守住）。"""
+    try:
+        data = resp.read(limit)
+    except TypeError:
+        data = resp.read()
+    return data[:limit]
+
+
+def _rotate_log(path, max_bytes=5 * 1024 * 1024):
+    """M-06：日志超过 max_bytes 就轮转（改名 .1，只留一份旧的），
+    防止 crash.log / watchdog 日志无限增长。"""
+    try:
+        if os.path.getsize(path) > max_bytes:
+            bak = path + ".1"
+            try:
+                os.remove(bak)
+            except OSError:
+                pass
+            os.replace(path, bak)
+    except OSError:
+        pass
+
+
+# H-01：剪贴板内容像不像敏感信息 —— 是就不要自动翻译、不要存历史、不要放进输入框。
+_SENSITIVE_CLIP_RES = [
+    re.compile(r"^\d{6,}$"),                                   # 一次性验证码 / 纯数字证件号
+    re.compile(r"^sk-[A-Za-z0-9\-_]{16,}$"),                   # API 密钥（sk- 开头）
+    re.compile(r"^\d{17}[\dXx]$"),                             # 18 位身份证号
+    re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[A-Za-z0-9\-_+/=]{32,}$"),  # 长串高熵 token
+]
+_SENSITIVE_KW_RE = re.compile(
+    r"(password|passwd|pwd|token|secret|api[-_]?key|access[-_]?key)\s*[:=]\s*\S+",
+    re.IGNORECASE)
+
+
+def is_sensitive_clip(text):
+    """H-01：剪贴板内容像不像敏感信息（验证码、身份证号、API 密钥、
+    密码/令牌、长串 token）。纯函数，便于测试。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _SENSITIVE_KW_RE.search(t):
+        return True
+    lines = [ln for ln in t.splitlines() if ln.strip()]
+    if len(lines) == 1:
+        s = lines[0]
+        for rx in _SENSITIVE_CLIP_RES:
+            if rx.match(s):
+                return True
+    return False
+
+
+def _dpapi_protect(plaintext):
+    """M-04：Windows DPAPI 加密（本用户本机才能解开），返回 "dpapi:<base64>"。
+    非 Windows / 加密失败返回 None（调用方回落明文）。"""
+    if not sys.platform.startswith("win") or not plaintext:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+
+        class _DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+        data = plaintext.encode("utf-8")
+        in_blob = _DATA_BLOB(len(data), (ctypes.c_ubyte * len(data)).from_buffer_copy(data))
+        out_blob = _DATA_BLOB()
+        if not crypt32.CryptProtectData(ctypes.byref(in_blob), None, None, None, None,
+                                       0x1, ctypes.byref(out_blob)):  # CRYPTPROTECT_UI_FORBIDDEN
+            return None
+        try:
+            enc = ctypes.string_at(out_blob.pbData, out_blob.cbData)
+        finally:
+            kernel32.LocalFree(out_blob.pbData)
+        return "dpapi:" + base64.b64encode(enc).decode("ascii")
+    except Exception:      # noqa: BLE001
+        return None
+
+
+def _dpapi_unprotect(stored):
+    """M-04：解开 _dpapi_protect 加密的值。不是 dpapi: 前缀的旧明文原样返回
+    （兼容老版本 config.json）；解不开返回 None。"""
+    if not isinstance(stored, str) or not stored:
+        return stored
+    if not stored.startswith("dpapi:"):
+        return stored  # 旧版明文：兼容，存盘时再加密
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        crypt32 = ctypes.windll.crypt32
+        kernel32 = ctypes.windll.kernel32
+
+        class _DATA_BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+        raw = base64.b64decode(stored[6:])
+        in_blob = _DATA_BLOB(len(raw), (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw))
+        out_blob = _DATA_BLOB()
+        if not crypt32.CryptUnprotectData(ctypes.byref(in_blob), None, None, None, None,
+                                         0x1, ctypes.byref(out_blob)):  # CRYPTPROTECT_UI_FORBIDDEN
+            return None
+        try:
+            return ctypes.string_at(out_blob.pbData, out_blob.cbData).decode("utf-8")
+        finally:
+            kernel32.LocalFree(out_blob.pbData)
+    except Exception:      # noqa: BLE001
+        return None
+
+
+def _foreground_is_password_field_win():
+    """M-03：当前前台窗口的焦点控件是不是密码框（ES_PASSWORD 样式）。
+    是就返回 True —— 翻译并替换 / 复制选中时不该碰密码框里的内容。
+    非 Windows 返回 False。"""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+
+        class _GUITHREADINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD),
+                        ("flags", wintypes.DWORD),
+                        ("hwndActive", wintypes.HWND),
+                        ("hwndFocus", wintypes.HWND),
+                        ("hwndCapture", wintypes.HWND),
+                        ("hwndMenuOwner", wintypes.HWND),
+                        ("hwndMoveSize", wintypes.HWND),
+                        ("hwndCaret", wintypes.HWND),
+                        ("rcCaret", wintypes.RECT)]
+
+        user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(_GUITHREADINFO)]
+        user32.GetGUIThreadInfo.restype = wintypes.BOOL
+        info = _GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(_GUITHREADINFO)
+        if not user32.GetGUIThreadInfo(0, ctypes.byref(info)):
+            return False
+        hwnd = info.hwndFocus
+        if not hwnd:
+            return False
+        user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetWindowLongW.restype = wintypes.LONG
+        style = user32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
+        return bool(style & 0x20)  # ES_PASSWORD
+    except Exception:      # noqa: BLE001
+        return False
 
 
 def base(code):
@@ -523,7 +682,8 @@ def g_translate_full(text, sl, tl, attempts=3, timeout=12):
         try:
             req = urllib.request.Request(url, data=body, headers=headers)
             with _urlopen(req, timeout=timeout) as r:
-                data = json.loads(r.read().decode("utf-8"))
+                # 稳定性：响应限流 4 MB —— 免费端点偶尔会返回超大内容，不全读进内存。
+                data = json.loads(_read_capped(r, 4 << 20).decode("utf-8"))
             out = "".join((seg[0] or "") for seg in (data[0] or []) if seg)
             det = data[2] if len(data) > 2 and data[2] else sl
             _LAST_GOOGLE.update(text=text, sl=sl, tl=tl, data=data)
@@ -831,6 +991,7 @@ class Watchdog:
             parent = os.path.dirname(self.log_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
+            _rotate_log(self.log_path)     # M-06：超过 5 MB 先轮转，不无限增长
             with open(self.log_path, "a", encoding="utf-8") as f:
                 f.write("".join(parts) + "\n")
         except Exception:
@@ -906,6 +1067,9 @@ _UA_EDGE = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0"
 )
+# L-02：Edge token 应是 JWT 样的短串 —— 格式不对（超长、含非法字符、像 HTML
+# 拦截页）就当这次取 token 失败走重试，不把它原样拼进 Authorization 头。
+_MS_TOKEN_RE = re.compile(r"^[A-Za-z0-9\-_\.]{10,512}$")
 
 
 def _ms_get_token(force=False):
@@ -915,7 +1079,10 @@ def _ms_get_token(force=False):
             return _ms_token["value"]
         req = urllib.request.Request(MS_AUTH, headers={"User-Agent": _UA_EDGE})
         with _urlopen(req, timeout=10) as r:
-            tok = r.read().decode("utf-8").strip()
+            # 稳定性：token 响应限流 64KB —— 正常 token 只有几百字节。
+            tok = _read_capped(r, 64 << 10).decode("utf-8").strip()
+        if not _MS_TOKEN_RE.fullmatch(tok):
+            raise ValueError("Edge token 格式异常（可能被网络拦截页替换），已拒绝使用")
         _ms_token.update(value=tok, ts=time.time())
         return tok
 
@@ -940,7 +1107,8 @@ def ms_translate(text, sl, tl, attempts=3, timeout=15):
             }
             req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
             with _urlopen(req, timeout=timeout) as r:
-                data = json.loads(r.read().decode("utf-8"))
+                # 稳定性：响应限流 4 MB —— 正常翻译响应只有几 KB。
+                data = json.loads(_read_capped(r, 4 << 20).decode("utf-8"))
             item = data[0] if isinstance(data, list) and data else {}
             translations = item.get("translations") or []
             out = (translations[0].get("text") if translations else "") or ""
@@ -1579,6 +1747,7 @@ def set_autostart(on):
 def log_crash(text):
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
+        _rotate_log(CRASH_LOG)             # M-06：超过 5 MB 先轮转，不无限增长
         with open(CRASH_LOG, "a", encoding="utf-8") as f:
             f.write("[%s] v%s\n%s\n\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), __version__, text))
     except Exception:
@@ -1951,6 +2120,11 @@ class App:
         self._apply_theme()
         if self._first_run:
             self.status.configure(text="在上方输入文字，或在任意软件里选中文字按 Ctrl+Alt+T 翻译")
+        # M-11：离线运行库文件被改动时启动加载会被拒绝 —— 在状态栏提醒用户重新下载，
+        # 而不是让离线引擎在后台悄悄不可用。
+        if runtime_installer.LAST_VERIFY_ERROR:
+            self.status.configure(text="离线组件校验失败：%s，请在「离线与网络」里重新下载组件。"
+                                  % runtime_installer.LAST_VERIFY_ERROR)
 
         self.last_clip = self._get_clip()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -2013,9 +2187,9 @@ class App:
             cfg["close_taskbar_migrated"] = True
         cfg["hover_window"] = bool(cfg.get("hover_window", False))
         try:
-            cfg["live_interval"] = max(2, min(int(cfg.get("live_interval", 3)), 30))
+            cfg["live_interval"] = max(5, min(int(cfg.get("live_interval", 5)), 30))
         except Exception:
-            cfg["live_interval"] = 3
+            cfg["live_interval"] = 5
         if cfg.get("minimize_action") not in MINIMIZE_NAMES:
             cfg["minimize_action"] = "taskbar"
         cfg["tray_tip"] = bool(cfg.get("tray_tip", True))
@@ -2082,6 +2256,11 @@ class App:
             cfg["proxy_user"] = ""
         if not isinstance(cfg.get("proxy_pass"), str):
             cfg["proxy_pass"] = ""
+        # M-04：代理密码在盘上是 DPAPI 加密的 —— 读入后解开，内存里保持明文；
+        # 旧版明文直接兼容；解不开（换了用户/机器）就清空，不让坏值进代理。
+        if cfg.get("proxy_pass"):
+            dec = _dpapi_unprotect(cfg["proxy_pass"])
+            cfg["proxy_pass"] = dec if isinstance(dec, str) else ""
         if not isinstance(cfg.get("tts_voice"), str):
             cfg["tts_voice"] = ""
         if not re.match(r"^\d+x\d+([+-]-?\d+[+-]-?\d+)?$", str(cfg.get("geometry", ""))):
@@ -2441,7 +2620,7 @@ class App:
         btns2.pack(fill="x", padx=12)
         self.doc_cancel_btn = ttk.Button(btns2, text="取消翻译", command=self._cancel_doc)
         self.live_var = tk.BooleanVar(value=False)
-        self.live_int_var = tk.StringVar(value=str(self.cfg.get("live_interval", 3)))
+        self.live_int_var = tk.StringVar(value=str(self.cfg.get("live_interval", 5)))
 
         # —— 选项区：常用开关留在主窗口，其余按用途归类放进「高级设置」 ——
         self.top_var = tk.BooleanVar(value=self.cfg["top"])
@@ -2720,7 +2899,7 @@ class App:
         row.pack(anchor="w", pady=(8, 0))
         ttk.Checkbutton(row, text="实时刷新", variable=self.live_var,
                         command=lambda: self._settings_then(self._on_live_toggle)).pack(side="left")
-        lcb = ttk.Combobox(row, textvariable=self.live_int_var, values=["2", "3", "5", "10"], width=3)
+        lcb = ttk.Combobox(row, textvariable=self.live_int_var, values=["5", "10", "15", "30"], width=3)
         lcb.pack(side="left", padx=(8, 0))
         lcb.bind("<<ComboboxSelected>>", lambda e: self._on_live_interval())
         lcb.bind("<Return>", lambda e: self._on_live_interval())
@@ -3364,6 +3543,11 @@ class App:
         if not path:
             return
         try:
+            # 稳定性：术语表文件超过 1 MB 直接拒绝，不全读进内存。
+            if os.path.getsize(path) > 1 << 20:
+                messagebox.showerror("导入术语表", "文件太大（超过 1 MB），已拒绝",
+                                     parent=self.settings_win)
+                return
             with open(path, "r", encoding="utf-8-sig") as f:
                 text = f.read()
         except Exception as e:      # noqa: BLE001
@@ -3547,6 +3731,11 @@ class App:
         if not path:
             return
         try:
+            # 稳定性：设置文件超过 1 MB 直接拒绝，不全读进内存。
+            if os.path.getsize(path) > 1 << 20:
+                messagebox.showerror("导入设置", "文件太大（超过 1 MB），已拒绝",
+                                     parent=self.settings_win)
+                return
             with open(path, "r", encoding="utf-8-sig") as f:
                 text = f.read()
         except Exception as e:      # noqa: BLE001
@@ -3557,6 +3746,22 @@ class App:
             messagebox.showerror("导入设置", "文件不对：%s\n没有应用任何设置。" % err,
                                  parent=self.settings_win)
             return
+        # H-04：导入文件要改网络出口（镜像域名 / 代理）时，先把变化列给用户确认，
+        # 不同意则整份设置都不导入。proxy_pass 永远不被导入（见 settings_io）。
+        changes = settings_io.sensitive_import_changes(text, self.cfg, DEFAULTS)
+        if changes:
+            def _fmt(v):
+                return "(空)" if v in ("", None) else str(v)
+            detail = "\n".join("  %s：%s → %s" % (k, _fmt(a), _fmt(b)) for k, a, b in changes)
+            ok = messagebox.askyesno(
+                "导入设置 — 网络出口将改变",
+                "这份设置文件要改动以下网络相关项（改了等于改了程序的网络出口，"
+                "流量可能被引到别的服务器）：\n\n%s\n\n确定应用吗？不同意则整份设置都不导入。"
+                % detail,
+                parent=self.settings_win)
+            if not ok:
+                self.status.configure(text="已取消导入设置（网络出口未改动）")
+                return
         self._apply_cfg_to_ui(cfg)
         self.status.configure(text="设置已导入%s" % (
             "，忽略了 %d 个未知 / 错误的项" % ignored if ignored else ""))
@@ -3582,7 +3787,7 @@ class App:
         self.scope_cb.set(SCOPE_NAMES[d["pointer_scope"]])
         self.hover_ms_var.set(d["hover_ms"]); self.cfg["hover_ms"] = d["hover_ms"]
         self.hover_win_var.set(d.get("hover_window", False))
-        self.live_int_var.set(str(d.get("live_interval", 3))); self.cfg["live_interval"] = d.get("live_interval", 3)
+        self.live_int_var.set(str(d.get("live_interval", 5))); self.cfg["live_interval"] = d.get("live_interval", 5)
         self.close_cb.set(CLOSE_NAMES.get(d["close_action"], CLOSE_NAMES["taskbar"])); self._sync_close_taskbar()
         self.min_cb.set(MINIMIZE_NAMES.get(d.get("minimize_action"), MINIMIZE_NAMES["taskbar"]))
         self.tray_tip_var.set(d["tray_tip"])
@@ -3628,7 +3833,7 @@ class App:
         self.scope_cb.set(SCOPE_NAMES[d["pointer_scope"]])
         self.hover_ms_var.set(d["hover_ms"]); self.cfg["hover_ms"] = d["hover_ms"]
         self.hover_win_var.set(d.get("hover_window", False))
-        self.live_int_var.set(str(d.get("live_interval", 3))); self.cfg["live_interval"] = d.get("live_interval", 3)
+        self.live_int_var.set(str(d.get("live_interval", 5))); self.cfg["live_interval"] = d.get("live_interval", 5)
         self.close_cb.set(CLOSE_NAMES.get(d["close_action"], CLOSE_NAMES["taskbar"])); self._sync_close_taskbar()
         self.min_cb.set(MINIMIZE_NAMES.get(d.get("minimize_action"), MINIMIZE_NAMES["taskbar"]))
         self.tray_tip_var.set(d["tray_tip"])
@@ -4391,6 +4596,39 @@ class App:
         mirror = self.dl_mirror.get().strip()
         self.cfg["pack_mirror"] = mirror
         self._save()
+        # H-03：钉死表里没有的语言对下载后无法验哈希 —— 在工作线程启动前
+        # （界面线程里）先请用户确认，不在后台线程里弹窗。
+        unpinned = pack_downloader.unpinned_pairs(pairs, self.dl_best or {})
+        if unpinned:
+            detail = "\n".join("  %s → %s（v%s）" % (f, t, v) for (f, t), v in unpinned)
+            if not messagebox.askyesno(
+                    "下载语言包 — 未校验的语言对",
+                    "以下语言对没有内置的哈希校验信息，下载后无法验证文件有没有"
+                    "被篡改（默认两对 en-zh / zh-en 有校验，不受影响）：\n\n%s\n\n"
+                    "确定继续下载吗？建议只从官方索引下载，下载后留意文件大小是否正常。"
+                    % detail,
+                    parent=self.root):
+                self.dl_prog.configure(text="已取消下载（未校验的语言对）")
+                return
+        # H-04：镜像域名不在内置白名单里时，保存前请用户确认一次 ——
+        # 自定义镜像意味着语言包从用户指定的服务器下载。
+        if mirror:
+            hosts = []
+            for pair in re.split(r"[;；]", mirror):
+                if "=" in pair:
+                    hosts.append(pair.split("=", 1)[1].strip().split("/")[0].split(":")[0].lower())
+                elif pair.strip():
+                    hosts.append(pair.strip().split("/")[0].split(":")[0].lower())
+            untrusted = [h for h in hosts
+                         if h and not pack_downloader.is_trusted_mirror_host(h)]
+            if untrusted:
+                if not messagebox.askyesno(
+                        "下载语言包 — 自定义镜像",
+                        "镜像域名 %s 不在程序内置的已知可信域名里。\n\n"
+                        "语言包将从该镜像下载。确定使用这个镜像吗？" % "、".join(untrusted),
+                        parent=self.root):
+                    self.dl_prog.configure(text="已取消下载（未确认自定义镜像）")
+                    return
         self.dl_busy, self.dl_cancel = True, False
         self._dl_speed = {"label": None, "t": 0.0, "done": 0, "v": 0.0}
         self.dl_btn.configure(state="disabled")
@@ -5016,9 +5254,10 @@ class App:
     # ---- v2.11 实时刷新：每隔几秒重新翻译同一个窗口，译文层点击穿透，可以照常操作软件
     def _on_live_interval(self):
         try:
-            v = max(2, min(int(self.live_int_var.get()), 30))
+            # L-05：实时刷新间隔最短 5 秒 —— 2~3 秒一轮高频 OCR 会把窗口卡住。
+            v = max(5, min(int(self.live_int_var.get()), 30))
         except Exception:
-            v = self.cfg.get("live_interval", 3)
+            v = self.cfg.get("live_interval", 5)
         self.live_int_var.set(str(v))
         self.cfg["live_interval"] = v
         self._save()
@@ -5083,7 +5322,7 @@ class App:
         """一轮翻译（成功 / 没认出字 / 出错）结束：隔 live_interval 秒再来一轮。"""
         self._live_busy = False
         if self.live_on and self._live_job is None:
-            sec = max(2, int(self.cfg.get("live_interval", 3)))
+            sec = max(5, int(self.cfg.get("live_interval", 5)))
             self._live_job = self.root.after(sec * 1000, self._live_tick)
 
     # ---- 截图翻译：译文盖在截图上
@@ -5211,7 +5450,7 @@ class App:
             win.update_idletasks()
             screen_win.make_click_through(win.winfo_id())
             self.status.configure(text="实时刷新中（每 %d 秒）：%s → %s · 再按 %s 或取消「实时刷新」停止"
-                                  % (self.cfg.get("live_interval", 3), lang_name(det), lang_name(target),
+                                  % (self.cfg.get("live_interval", 5), lang_name(det), lang_name(target),
                                      self.hotkey_window_label))
             self._live_done()
             return
@@ -5389,7 +5628,7 @@ class App:
             geometry=self._geometry_to_save(), engine=self.engine.get(),
             auto_offline=AUTO_OFFLINE, pointer=self.pointer_var.get(),
             hover=self.hover_var.get(), hover_ms=self.cfg.get("hover_ms", 800),
-            hover_window=self.hover_win_var.get(), live_interval=self.cfg.get("live_interval", 3),
+            hover_window=self.hover_win_var.get(), live_interval=self.cfg.get("live_interval", 5),
             pointer_scope=SCOPE_CODES.get(self.scope_cb.get(), "word"),
             close_action=CLOSE_CODES.get(self.close_cb.get(), "taskbar"),
             minimize_action=MINIMIZE_CODES.get(self.min_cb.get(), "taskbar"),
@@ -5415,9 +5654,23 @@ class App:
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
             tmp = CONFIG_PATH + ".tmp"
+            # M-04：存盘前把代理密码换成 DPAPI 加密副本 —— 内存里的 self.cfg
+            # 保持明文（代理还要用），盘上的 config.json 不再存明文密码。
+            # 加密失败（非 Windows / DPAPI 不可用）时回落明文，不阻保存。
+            to_save = dict(self.cfg)
+            pw = to_save.get("proxy_pass") or ""
+            if pw and not str(pw).startswith("dpapi:"):
+                enc = _dpapi_protect(pw)
+                if enc:
+                    to_save["proxy_pass"] = enc
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.cfg, f, ensure_ascii=False, indent=1)
+                json.dump(to_save, f, ensure_ascii=False, indent=1)
             os.replace(tmp, CONFIG_PATH)
+            # M-04/M-06：配置文件仅本用户可读（里面有代理账号密码）。
+            try:
+                os.chmod(CONFIG_PATH, 0o600)
+            except OSError:
+                pass
         except Exception:
             pass
         set_proxy_url(proxy_url(self.cfg))   # v2.9：保存后立刻按新配置决定走不走代理
@@ -5448,6 +5701,21 @@ class App:
     def _on_watch(self):
         if self.watch_var.get():
             self.last_clip = self._get_clip()
+            # H-01：监听剪贴板意味着复制的内容会发给在线翻译引擎并存入历史库 ——
+            # 第一次开启时提醒一次（只提醒一次，之后不再打扰）。
+            if not self.cfg.get("clip_warn_shown"):
+                self.cfg["clip_warn_shown"] = True
+                try:
+                    messagebox.showinfo(
+                        "监听剪贴板",
+                        "已开启剪贴板监听。\n\n"
+                        "开启后，你在任何地方复制的文字都会自动发给在线翻译引擎"
+                        "（Google / 微软），并保存在本机历史库（%s）里。\n"
+                        "复制验证码、密码、身份证号等敏感内容时请先关闭监听。"
+                        % HISTORY_PATH,
+                        parent=self.root)
+                except Exception:
+                    pass
         self._save()
 
     def _on_bilingual(self):
@@ -6098,7 +6366,12 @@ class App:
         if action == "paste":
             try:
                 focus_window_win(hwnd0)
-                time.sleep(0.15)
+                time.sleep(0.05)
+                # M-03：粘贴前再确认一次前台窗口还是原来的 —— 翻译这段时间里
+                # 用户可能切走了窗口，贴错地方就把译文粘进了别的软件。
+                if foreground_window_win() != hwnd0:
+                    self.status.configure(text="前台窗口已变，只把译文放进了剪贴板（按 Ctrl+V 粘贴）")
+                    return
                 send_paste_win()
             except Exception:
                 pass
@@ -6367,6 +6640,11 @@ class App:
                 self._pointer_grab_win()
                 return
             if IS_WIN:
+                # M-03：焦点在密码框里时不模拟 Ctrl+C —— 密码不该进剪贴板。
+                if _foreground_is_password_field_win():
+                    self._grab_aborted = True
+                    self.status.configure(text="当前是密码框，不复制")
+                    return
                 send_copy_win()
                 t0 = time.time()
                 # 最多等 1.2 秒，剪贴板一更新就继续；慢速软件也不会漏
@@ -6386,12 +6664,25 @@ class App:
             self.q.put(("copied",))
 
     def _on_copied(self):
-        text = self._get_clip()
-        if self.grab_mode == "pointer" and getattr(self, "_pointer_text", None):
-            text, self._pointer_text = self._pointer_text, None      # OCR 取到的整行 / 整段
-        self._set_clip(self.old_clip)
-        self.last_clip = self.old_clip
-        self.grabbing = False
+        # M-03：密码框里按了取词热键 —— _copy_selection 已跳过复制，
+        # 这里直接收尾，不翻译剪贴板里原来的旧内容。
+        if getattr(self, "_grab_aborted", False):
+            self._grab_aborted = False
+            self.grabbing = False
+            return
+        try:
+            text = self._get_clip()
+            if self.grab_mode == "pointer" and getattr(self, "_pointer_text", None):
+                text, self._pointer_text = self._pointer_text, None      # OCR 取到的整行 / 整段
+        finally:
+            # M-03：无论后面翻译成不成功，剪贴板一定要恢复成复制前的旧内容，
+            # 不让刚复制的选中文字留在剪贴板里。
+            try:
+                self._set_clip(self.old_clip)
+            except Exception:
+                pass
+            self.last_clip = self.old_clip
+            self.grabbing = False
         if self.grab_mode == "pointer":
             self._pointer_translate(text.strip(), self.grab_xy)      # 气泡就地显示，不打开主窗口
             return
@@ -6415,6 +6706,11 @@ class App:
                 if clip and clip != self.last_clip:
                     self.last_clip = clip
                     if clip.strip():
+                        # H-01：像验证码 / 身份证号 / API 密钥 / 密码的内容不自动翻译、
+                        # 不存历史、不放进输入框，只在状态栏提示一次。
+                        if is_sensitive_clip(clip):
+                            self.status.configure(text="剪贴板内容疑似敏感信息（验证码 / 密码等），已跳过自动翻译")
+                            return
                         self._set_src(clip.strip()[:MAX_LEN])
                         self.show_window()
                         self.translate_now()

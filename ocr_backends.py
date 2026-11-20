@@ -35,16 +35,21 @@ def _no_window():
     return {}
 
 
+# L-10：tesseract 的 TSV 输出限流（10 MB）—— 超过直接拒绝，不全读进内存。
+MAX_TSV_BYTES = 10 << 20
+
+
 def tesseract_path():
-    """tesseract 可执行文件路径；没有返回 None。macOS 的 GUI 程序 PATH 里常常没有 Homebrew 目录，这里补上。"""
-    p = shutil.which("tesseract")
-    if p:
-        return p
+    """tesseract 可执行文件路径；没有返回 None。
+
+    L-07：先试固定安装路径（不受 PATH 注入影响），再试 which（macOS 的 GUI
+    程序 PATH 里常常没有 Homebrew 目录，所以 which 仍保留作兜底）。
+    """
     for cand in ("/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract", "/usr/bin/tesseract",
                  "/snap/bin/tesseract"):
         if os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
-    return None
+    return shutil.which("tesseract")
 
 
 def installed_langs():
@@ -95,6 +100,9 @@ def recognize(image_path, lang=None, timeout=60, psm=6):
         raise BackendError("启动 tesseract 失败：%s" % e)
     if r.returncode != 0:
         raise BackendError((r.stderr or b"").decode("utf-8", "replace")[-400:] or "tesseract 失败")
+    # L-10：TSV 输出限流 —— 超过 10 MB 直接拒绝，不全读进内存。
+    if len(r.stdout or b"") > MAX_TSV_BYTES:
+        raise BackendError("OCR 输出过大（超过 %d MB），已拒绝" % (MAX_TSV_BYTES >> 20))
     return parse_tsv((r.stdout or b"").decode("utf-8", "replace"))
 
 

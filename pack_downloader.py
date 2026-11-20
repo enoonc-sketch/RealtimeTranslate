@@ -22,19 +22,70 @@ INDEX_URLS = [
 ]
 UA = {"User-Agent": "RealtimeTranslate/2.3"}
 
+# 安全修复（2026-11-20，按安全评估报告）：
+#   H-03：语言包下载无签名/哈希校验 —— 下面的钉死表只放默认两对 en-zh / zh-en
+#         （2026-11-20 从 argos-net.com 流式下载实测的 sha256；版本升级时随发版更新）。
+#         表里有的语言对：下载后必须验 hash，不符即拒；表里没有的：界面下载前弹警告、
+#         请用户二次确认（见 unpinned_pairs），构建脚本则打印警告后继续。
+#   H-04：pack_mirror 原先是任意子串替换 —— 下面白名单是程序内置的已知可信域名；
+#         用户自己填的自定义镜像域名不在表里也可以用，但 apply_replace 只接受
+#         “裸域名”写法、并拒绝 https→http 降级，界面层在保存自定义镜像时再请用户确认。
+PINNED_PACK_SHA256 = {
+    ("en", "zh", "1.9"): "433e7c4f034d87fbe2353161e05f18646d7999452f801a4e1f0378522b9850ab",
+    ("zh", "en", "1.9"): "62e7af5a3a48b530e47b7b3e5c78c2de79073ecd815750d2bf3ab35b4a67da2d",
+}
+MIRROR_HOST_ALLOWLIST = frozenset([
+    "raw.githubusercontent.com", "cdn.jsdelivr.net", "fastly.jsdelivr.net",
+    "argos-net.com", "pypi.org", "files.pythonhosted.org",
+])
+
+_HOST_RE = re.compile(r"[A-Za-z0-9.-]+(:\d{1,5})?$")
+
+
+def is_trusted_mirror_host(host):
+    """镜像域名是否在内置白名单里（供界面层：自定义域名保存前请用户二次确认）。
+    本机回环地址（127.0.0.1 / localhost / ::1）也算可信 —— 那是用户自己的机器，
+    不是远程服务器。"""
+    h = (host or "").strip().lower()
+    return h in MIRROR_HOST_ALLOWLIST or h in ("127.0.0.1", "localhost", "::1")
+
+
+def _url_ok(url):
+    """下载链接只接受 https；http 只接受本机回环（本地测试服务器），防中间人替换模型。"""
+    u = str(url or "")
+    if u.startswith("https://"):
+        return True
+    if u.startswith("http://"):
+        parts = u.split("/")
+        if len(parts) < 3:
+            return False
+        hostport = parts[2].split("@")[-1]
+        host = hostport[1:].split("]")[0] if hostport.startswith("[") else hostport.split(":")[0]
+        return host.lower() in ("127.0.0.1", "localhost", "::1")
+    return False
+
 
 class Cancelled(Exception):
     pass
 
 
 def apply_replace(link, replace):
-    """replace 形如 'argos-net.com=镜像域名'，可用分号写多组（'a=b;c=d'）；为空或格式不对时原样返回。"""
+    """replace 形如 'argos-net.com=镜像域名'，可用分号写多组（'a=b;c=d'）；为空或格式不对时原样返回。
+
+    安全修复（H-04）：只接受“裸域名”替换 —— new 必须是裸域名（可带端口），
+    old 里不能带 "://"（防 scheme 替换）；替换后原来是 https 的链接必须仍是 https
+    （防 https→http 降级）。不合规的组直接跳过，不动原链接。
+    """
     for pair in re.split(r"[;；]", replace or ""):
         if "=" in pair:
             old, new = pair.split("=", 1)
             old, new = old.strip(), new.strip()
-            if old:
-                link = link.replace(old, new)
+            if not old or "://" in old or not _HOST_RE.fullmatch(new or ""):
+                continue
+            new_link = link.replace(old, new)
+            if link.startswith("https://") and not new_link.startswith("https://"):
+                continue
+            link = new_link
     return link
 
 
@@ -66,6 +117,11 @@ def fetch_index(cache_path=None, urls=None, replace="", timeout=20, max_age=None
             return data, "使用 %s前保存的列表（点「刷新列表」可获取最新）" % when, False
     errors = []
     for url in (urls or INDEX_URLS):
+        # H-03/H-04：索引本身无签名，http 索引会被中间人直接换掉 —— 只走 https，
+        # http 仅接受本机回环（本地测试服务器）。
+        if not _url_ok(apply_replace(url, replace)):
+            errors.append("%s：只接受 https 索引地址" % (url.split("/")[2] if "//" in url else url))
+            continue
         try:
             with _open(apply_replace(url, replace), timeout) as r:
                 data = json.loads(r.read().decode("utf-8"))
@@ -98,12 +154,31 @@ def best_by_pair(index):
         if not isinstance(p, dict) or (p.get("type") or "translate") != "translate":
             continue
         f, t = p.get("from_code"), p.get("to_code")
-        if not f or not t or not [l for l in p.get("links", []) if str(l).startswith("http")]:
+        # H-03：只接受 https 链接（http 仅本机回环，见 _url_ok），防中间人替换模型。
+        if not f or not t or not [l for l in p.get("links", []) if _url_ok(l)]:
             continue
         cur = best.get((f, t))
         if cur is None or oe._ver_tuple(p.get("package_version")) > oe._ver_tuple(cur.get("package_version")):
             best[(f, t)] = p
     return best
+
+
+def pinned_sha256(entry):
+    """H-03：索引条目在钉死表里就返回期望 sha256，否则返回 None（未知语言对）。"""
+    if not isinstance(entry, dict):
+        return None
+    return PINNED_PACK_SHA256.get((entry.get("from_code"), entry.get("to_code"),
+                                   str(entry.get("package_version", ""))))
+
+
+def unpinned_pairs(pairs, best):
+    """H-03：pairs 里哪些语言对不在钉死表里 → [(pair, version), ...]，供界面层下载前请用户确认。"""
+    out = []
+    for pair in pairs:
+        entry = best.get(pair)
+        if entry is not None and pinned_sha256(entry) is None:
+            out.append((pair, str(entry.get("package_version", ""))))
+    return out
 
 
 def status_of(pair, entry, engine):
@@ -172,11 +247,15 @@ def _fetch_into(url, tmp, progress, cancelled, timeout):
             raise ConnectionError("下载中断（已下 %d / %d 字节）" % (got, total))
 
 
-def download(url, dest, progress=None, cancelled=None, timeout=60, retries=3, backoff=1.0):
+def download(url, dest, progress=None, cancelled=None, timeout=60, retries=3, backoff=1.0,
+             expected_sha256=None):
     """下载到 dest（先写 .part，校验是 zip 后再改名）。progress(已下字节, 总字节)。
 
     中断 / 取消后 .part 会保留，下次同一链接自动续传；传输中途断线会自动重试（续传）。
+    expected_sha256 给出时（H-03：钉死的语言对）下载后必须验哈希，不符即删文件并拒绝。
     """
+    if not _url_ok(url):
+        raise oe.OfflineError("下载地址必须用 https：%s" % url)
     tmp = dest + ".part"
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     for attempt in range(retries):
@@ -198,19 +277,39 @@ def download(url, dest, progress=None, cancelled=None, timeout=60, retries=3, ba
         except OSError:
             pass
         raise oe.OfflineError("下载内容不是有效的语言包（可能被网络拦截页替换了）")
+    if expected_sha256:
+        import hashlib
+        h = hashlib.sha256()
+        with open(tmp, "rb") as f:
+            for b in iter(lambda: f.read(1 << 20), b""):
+                h.update(b)
+        if h.hexdigest() != expected_sha256:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise oe.OfflineError("语言包校验失败（哈希不符），可能被中间人替换，已拒绝：%s"
+                                  % os.path.basename(dest))
     os.replace(tmp, dest)
 
 
 def download_pack(entry, models_dir, work_dir, replace="", progress=None, cancelled=None, timeout=60):
-    """下载并安装一个语言包，成功返回 Pkg。每个下载链接依次尝试；全部失败抛 OfflineError。"""
-    links = [l for l in entry.get("links", []) if str(l).startswith("http")]
+    """下载并安装一个语言包，成功返回 Pkg。每个下载链接依次尝试；全部失败抛 OfflineError。
+
+    H-03：钉死的语言对下载后验 sha256（见 pinned_sha256）；安装时再核对包内
+    metadata 与索引条目一致（from/to/version），不符拒绝安装。
+    """
+    links = [l for l in entry.get("links", []) if _url_ok(l)]
     errors = []
     for link in links:
         url = apply_replace(link, replace)
         dest = os.path.join(work_dir, os.path.basename(url.split("?")[0]) or "pack.argosmodel")
         try:
-            download(url, dest, progress, cancelled, timeout)
-            pkg = oe.install_package(dest, models_dir)
+            download(url, dest, progress, cancelled, timeout,
+                     expected_sha256=pinned_sha256(entry))
+            pkg = oe.install_package(dest, models_dir, expected=(
+                entry.get("from_code"), entry.get("to_code"),
+                str(entry.get("package_version", ""))))
             try:
                 os.remove(dest)          # 装好后不留安装包，省几十 MB
             except OSError:

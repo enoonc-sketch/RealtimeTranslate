@@ -124,6 +124,10 @@ try:
     ok("build_command keeps -Culture", "-Culture" in cmd and "zh-CN" in cmd)
 
     # ---- 3. speak 把 voice 传进 Popen 命令 ----
+    # 安全修复（2026-11-20）：speak() 先对已安装语音列表校验 voice，
+    # 未安装的回落默认语音；这里把 Zira 放进假语音列表，测「已安装语音透传」。
+    FakeProc.stdout = (b"Microsoft Zira Desktop\ten-US\tFemale\n"
+                       b"Microsoft Huihui Desktop\tzh-CN\tFemale\n")
     ok("speak with voice starts",
        tts_win.speak("hello", "en-US", voice="Microsoft Zira Desktop") is True)
     cmd3 = seen_popen.get("cmd") or []

@@ -1,0 +1,11 @@
+# 离线运行库钉死版本（M-07，2026-11-20）：只给离线版构建用。
+# 版本与 runtime_installer.PINNED_WHEELS 里的钉死表一致（2026-11-20
+# 从 PyPI JSON 实测的 cp312 轮子 sha256）；升级版本时两边一起改。
+#
+# 注意：本文件只钉直接依赖的版本，不含 --hash。完整的传递依赖哈希清单
+# 需在 Windows 上跑 `pip-compile --generate-hashes requirements.in` 生成，
+# 本仓库尚未做这一步（见安全评估报告 M-07）。
+numpy==2.5.5
+pyyaml==6.0.3
+sentencepiece==0.2.3
+ctranslate2==4.9.0

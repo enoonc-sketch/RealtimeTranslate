@@ -12,12 +12,14 @@ Language.OCR*）。没装会报 OcrError，里面写明原因。
 非 Windows 上 import 安全，ocr_image 会直接抛 OcrError。
 """
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 
 try:
     import ocr_backends
@@ -25,6 +27,24 @@ except Exception:      # noqa: BLE001
     ocr_backends = None
 
 IS_WIN = sys.platform.startswith("win")
+
+# 安全修复（2026-11-20，按安全评估报告）：
+#   M-01：winocr.ps1 执行前先验哈希（2026-11-20 实测，与报告一致）。
+#   L-05：OCR 子进程同时最多 2 个 + 默认超时 60→20 秒（悬停高频触发不再无上限起进程）。
+#   L-10：PowerShell 输出超过 10 MB 直接拒绝；JSON 结构与坐标转换逐项校验。
+#   L-03：未知语言代码映射到 "auto"，不再原样传给脚本。
+#   L-07：找 powershell.exe 不再信任 SystemRoot 环境变量。
+_SCRIPT_SHA256 = "0a9423758e5b67bf2cd92d122928fbc3f5f045765d9f8d6616cc0eb09558cf95"
+_MAX_OCR_OUTPUT_BYTES = 10 << 20      # 10 MB：OCR 输出远小于此，超过即异常
+_OCR_SEM = threading.BoundedSemaphore(2)
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
 
 
 class OcrError(Exception):
@@ -36,15 +56,31 @@ def _script_path():
     return os.path.join(root, "winocr.ps1")
 
 
+def _system32_dir():
+    """不依赖环境变量取 System32 目录（L-07：SystemRoot 环境变量可被注入）。"""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(260)
+        n = ctypes.windll.kernel32.GetSystemDirectoryW(buf, 260)
+        if 0 < n < 260:
+            return buf.value
+    except Exception:      # noqa: BLE001
+        pass
+    return None
+
+
 def find_powershell():
     """Windows PowerShell 5.1 的完整路径；找不到返回 None。"""
     if not IS_WIN:
         return None
-    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
-    cand = os.path.join(system_root, "System32", "WindowsPowerShell",
-                        "v1.0", "powershell.exe")
-    if os.path.isfile(cand):
-        return cand
+    cands = []
+    sys32 = _system32_dir()
+    if sys32:
+        cands.append(os.path.join(sys32, "WindowsPowerShell", "v1.0", "powershell.exe"))
+    cands.append(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    for cand in cands:
+        if os.path.isfile(cand):
+            return cand
     return shutil.which("powershell")
 
 
@@ -120,34 +156,53 @@ def _no_window_kwargs():
     return kw
 
 
-def _run_ps(image_path, lang=None, want_json=False, timeout=60):
+def _run_ps(image_path, lang=None, want_json=False, timeout=20):
     ps = find_powershell()
     if not IS_WIN or not ps:
         raise OcrError("截图 OCR 只支持 Windows，且需要 Windows PowerShell 5.1")
     script = _script_path()
     if not os.path.isfile(script):
         raise OcrError("找不到 winocr.ps1（打包时漏了该文件）")
-    cmd = [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-           "-File", script, "-Path", os.path.abspath(image_path)]
-    if lang and lang != "auto":
-        cmd += ["-Language", WIN_OCR_TAG.get(lang, lang)]
-    if want_json:
-        cmd += ["-Json"]
+    # M-01：执行前先验脚本哈希 —— winocr.ps1 被替换过就拒绝跑，
+    # 防止恶意脚本借程序权限执行；被改动时提示重装。
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=timeout,
-                              **_no_window_kwargs())
-    except subprocess.TimeoutExpired:
-        raise OcrError("OCR 超时（%d 秒），图片可能太大或 OCR 卡住了" % timeout)
-    except Exception as e:
-        raise OcrError("启动 PowerShell OCR 失败：%s" % e)
-    out = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
-    err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
-    if proc.returncode != 0:
-        raise OcrError(explain_ps_error(err, proc.returncode))
-    return out, err
+        if _sha256_file(script) != _SCRIPT_SHA256:
+            raise OcrError("winocr.ps1 已被改动，拒绝执行。请重新安装程序。")
+    except OcrError:
+        raise
+    except OSError as e:
+        raise OcrError("读取 winocr.ps1 失败：%s" % e)
+    # L-05：同时最多 2 个 OCR 子进程 —— 悬停高频触发时不再无上限起进程，
+    # 满了直接报「繁忙」，悬停路径会吞掉这个错并回落，不卡界面。
+    if not _OCR_SEM.acquire(blocking=False):
+        raise OcrError("OCR 繁忙，请稍后再试")
+    try:
+        cmd = [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+               "-File", script, "-Path", os.path.abspath(image_path)]
+        if lang and lang != "auto":
+            cmd += ["-Language", WIN_OCR_TAG.get(lang) or "auto"]
+        if want_json:
+            cmd += ["-Json"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                                  **_no_window_kwargs())
+        except subprocess.TimeoutExpired:
+            raise OcrError("OCR 超时（%d 秒），图片可能太大或 OCR 卡住了" % timeout)
+        except Exception as e:
+            raise OcrError("启动 PowerShell OCR 失败：%s" % e)
+        # L-10：输出限流 —— PowerShell 吐超过 10 MB 就拒绝，不把它全读进内存。
+        if len(proc.stdout or b"") > _MAX_OCR_OUTPUT_BYTES:
+            raise OcrError("OCR 输出过大（超过 %d MB），已拒绝" % (_MAX_OCR_OUTPUT_BYTES >> 20))
+        out = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
+        err = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0:
+            raise OcrError(explain_ps_error(err, proc.returncode))
+        return out, err
+    finally:
+        _OCR_SEM.release()
 
 
-def ocr_image(image_path, lang=None, timeout=60):
+def ocr_image(image_path, lang=None, timeout=20):
     """识别一张图片，返回按行拼好的文字（没认出返回空串）。"""
     if not IS_WIN:
         data = _backend_data(image_path, lang, timeout)
@@ -168,7 +223,11 @@ def _backend_data(image_path, lang, timeout):
 
 
 def _ocr_json(image_path, lang, timeout):
-    """统一取 {"lines": [...]}：Windows 走 PowerShell，其余走 tesseract。解析失败返回 {}。"""
+    """统一取 {"lines": [...]}：Windows 走 PowerShell，其余走 tesseract。解析失败返回 {}。
+
+    L-10：PowerShell / tesseract 的 JSON 输出是外部数据 —— 结构逐项校验，
+    不是 list/dict 的一律丢掉，不让它带着畸形结构一路走到取词逻辑里。
+    """
     if not IS_WIN:
         return _backend_data(image_path, lang, timeout)
     out, _ = _run_ps(image_path, lang=lang, want_json=True, timeout=timeout)
@@ -178,10 +237,29 @@ def _ocr_json(image_path, lang, timeout):
         data = json.loads(out)
     except Exception:      # noqa: BLE001
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    raw_lines = data.get("lines", []) or []
+    if isinstance(raw_lines, dict):             # PowerShell 单元素有时不带数组括号
+        raw_lines = [raw_lines]
+    if not isinstance(raw_lines, list):
+        return {}
+    lines = []
+    for ln in raw_lines:
+        if not isinstance(ln, dict):
+            continue
+        raw_words = ln.get("words", []) or []
+        if isinstance(raw_words, dict):
+            raw_words = [raw_words]
+        if not isinstance(raw_words, list):
+            raw_words = []
+        text = ln.get("text", "")
+        lines.append({"text": text if isinstance(text, str) else "",
+                      "words": [w for w in raw_words if isinstance(w, dict)]})
+    return {"lines": lines}
 
 
-def ocr_words(image_path, lang=None, timeout=60):
+def ocr_words(image_path, lang=None, timeout=20):
     """识别一张图片，返回单词列表 [{text, x, y, w, h}]（坐标是图片内像素）。
 
     悬停取词用：按光标位置挑离得最近的单词。
@@ -192,13 +270,21 @@ def ocr_words(image_path, lang=None, timeout=60):
     if isinstance(raw_lines, dict):                 # PowerShell 单元素有时不带数组括号
         raw_lines = [raw_lines]
     for line in raw_lines:
+        if not isinstance(line, dict):
+            continue
         raw_words = line.get("words", []) or []
         if isinstance(raw_words, dict):
             raw_words = [raw_words]
         for w in raw_words:
-            words.append({"text": w.get("text", ""),
-                          "x": int(w.get("x", 0)), "y": int(w.get("y", 0)),
-                          "w": int(w.get("w", 0)), "h": int(w.get("h", 0))})
+            if not isinstance(w, dict):
+                continue
+            # L-10：坐标逐项转 int，转不动（非数字字符串、None 等）就跳过这个词，不崩。
+            try:
+                words.append({"text": w.get("text", "") if isinstance(w.get("text", ""), str) else "",
+                              "x": int(w.get("x", 0)), "y": int(w.get("y", 0)),
+                              "w": int(w.get("w", 0)), "h": int(w.get("h", 0))})
+            except (TypeError, ValueError):
+                continue
     return [w for w in words if w["text"]]
 
 
@@ -228,7 +314,7 @@ def pick_word_at(words, px, py):
 # 下面都是纯逻辑，不碰 Windows，Linux 上也能测。
 # ---------------------------------------------------------------------------
 
-def ocr_lines(image_path, lang=None, timeout=60):
+def ocr_lines(image_path, lang=None, timeout=20):
     """识别一张图片，返回行列表 [{text, x, y, w, h}]（坐标是图片内像素）。
 
     行框由该行所有单词的框合并而成；text 用系统 OCR 给的整行文字。
@@ -239,20 +325,31 @@ def ocr_lines(image_path, lang=None, timeout=60):
         raw = [raw]
     lines = []
     for ln in raw:
+        if not isinstance(ln, dict):
+            continue
         words = ln.get("words", []) or []
         if isinstance(words, dict):
             words = [words]
-        boxes = [(int(w.get("x", 0)), int(w.get("y", 0)),
-                  int(w.get("w", 0)), int(w.get("h", 0))) for w in words]
+        # L-10：坐标逐项转 int，转不动的词跳过，不让一个坏词崩掉整行。
+        boxes = []
+        for w in words:
+            if not isinstance(w, dict):
+                continue
+            try:
+                boxes.append((int(w.get("x", 0)), int(w.get("y", 0)),
+                              int(w.get("w", 0)), int(w.get("h", 0))))
+            except (TypeError, ValueError):
+                continue
         if not boxes:
             continue
         x0 = min(b[0] for b in boxes)
         y0 = min(b[1] for b in boxes)
         x1 = max(b[0] + b[2] for b in boxes)
         y1 = max(b[1] + b[3] for b in boxes)
-        text = (ln.get("text") or "").strip()
+        text = ln.get("text", "")
+        text = text.strip() if isinstance(text, str) else ""
         if not text:
-            text = join_lines([w.get("text", "") for w in words])
+            text = join_lines([w.get("text", "") if isinstance(w, dict) else "" for w in words])
         if text:
             lines.append({"text": text, "x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0})
     return lines

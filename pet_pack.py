@@ -14,6 +14,13 @@ import zlib
 MAGIC = b"RTPET1\n"
 ANIMS = ("idle", "blink", "sleep", "think", "happy", "sad", "alert")
 
+# 安全修复（2026-11-20，按安全评估报告 L-01）：.pet 包是外部文件，头里的尺寸 /
+# 帧表未经校验就直接用 —— 恶意包可让程序解压出超大内存、或用越界帧索引崩溃。
+# 宠物图实际最大约 512×512，这里按此设上限；文件本身超过 16MB 也直接拒绝。
+MAX_PET_FILE_BYTES = 16 << 20       # 16 MB：正常 .pet 包远小于此
+MAX_PET_HEADER_BYTES = 1 << 20      # 1 MB：头只是 JSON，超过即异常
+MAX_PET_DIM = 512                   # 单边像素上限
+
 
 class PetPackError(Exception):
     pass
@@ -22,6 +29,10 @@ class PetPackError(Exception):
 class PetPack:
     def __init__(self, path):
         try:
+            size = os.path.getsize(path)
+            if size > MAX_PET_FILE_BYTES:
+                raise PetPackError("动画包太大（%.1f MB，上限 %d MB），已拒绝"
+                                   % (size / 1048576.0, MAX_PET_FILE_BYTES // 1048576))
             with open(path, "rb") as f:
                 data = f.read()
         except OSError as e:
@@ -29,6 +40,8 @@ class PetPack:
         if not data.startswith(MAGIC) or len(data) < len(MAGIC) + 4:
             raise PetPackError("不是有效的动画包")
         (hl,) = struct.unpack_from("<I", data, len(MAGIC))
+        if hl > MAX_PET_HEADER_BYTES:
+            raise PetPackError("动画包头太大（%d 字节），已拒绝" % hl)
         start = len(MAGIC) + 4
         try:
             head = json.loads(data[start:start + hl].decode("utf-8"))
@@ -37,14 +50,20 @@ class PetPack:
             self._frames = [tuple(x) for x in head["frames"]]
         except (ValueError, KeyError, TypeError) as e:
             raise PetPackError("动画包头损坏：%s" % e)
+        if not (1 <= self.w <= MAX_PET_DIM and 1 <= self.h <= MAX_PET_DIM):
+            raise PetPackError("动画包尺寸不合法（%dx%d），已拒绝" % (self.w, self.h))
         self._body = data[start + hl:]
-        self._cache = {}
+        n_frames = len(self._frames)
         for a in ANIMS:
             if not self.anims.get(a):
                 raise PetPackError("动画包缺少动画：%s" % a)
+            for i in self.anims[a]:
+                if not isinstance(i, int) or not (0 <= i < n_frames):
+                    raise PetPackError("动画 %s 的帧索引越界：%r" % (a, i))
         for off, ln in self._frames:
             if off < 0 or off + ln > len(self._body):
                 raise PetPackError("动画包数据被截断")
+        self._cache = {}
 
     def frames(self, anim):
         return self.anims.get(anim) or self.anims["idle"]
@@ -53,9 +72,16 @@ class PetPack:
         """第 idx 帧的 RGBA 字节（w*h*4）。"""
         b = self._cache.get(idx)
         if b is None:
+            if not isinstance(idx, int) or not (0 <= idx < len(self._frames)):
+                raise PetPackError("帧索引越界：%r" % (idx,))
             off, ln = self._frames[idx]
             try:
-                b = zlib.decompress(self._body[off:off + ln])
+                # L-01：解压限流 —— 压缩数据再小，解出来也不能超过 w*h*4+1 字节，
+                # 否则就是恶意包（zip 炸弹），直接拒绝，不让它把内存撑爆。
+                de = zlib.decompressobj()
+                b = de.decompress(self._body[off:off + ln], self.w * self.h * 4 + 1)
+                if de.unconsumed_tail or not de.eof:
+                    raise PetPackError("动画帧数据异常")
             except zlib.error as e:
                 raise PetPackError("动画帧损坏：%s" % e)
             if len(b) != self.w * self.h * 4:

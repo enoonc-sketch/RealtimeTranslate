@@ -1,0 +1,9 @@
+# 构建工具钉死版本（M-07，2026-11-20）：两个构建任务都装本文件。
+# 离线运行库（numpy / pyyaml / sentencepiece / ctranslate2）另见
+# requirements-runtime-lock.txt —— 标准版构建不装它们，否则 PyInstaller
+# 会把它们打进标准版 exe。
+#
+# 注意：本文件只钉直接依赖的版本，不含 --hash。完整的传递依赖哈希清单
+# 需在 Windows 上跑 `pip-compile --generate-hashes requirements.in` 生成，
+# 本仓库尚未做这一步（见安全评估报告 M-07）。
+pyinstaller==6.22.3

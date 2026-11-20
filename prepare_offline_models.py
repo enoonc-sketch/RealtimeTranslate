@@ -32,6 +32,7 @@ except Exception:  # noqa: BLE001
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import offline_engine as oe   # noqa: E402
+import pack_downloader as pd  # noqa: E402  # 复用其中的链接校验 / 镜像替换 / 钉死哈希（H-03/H-04）
 
 OUT = os.path.join(HERE, "offline_models")
 DL = os.path.join(OUT, "_downloads")
@@ -53,7 +54,19 @@ def fetch(url, timeout=60):
     return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout)
 
 
-def download(url, dest):
+def _file_sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def download(url, dest, expected_sha256=None):
+    """H-03：只走 https（http 仅本机回环）；钉死的语言对下载后验 sha256，不符即拒。"""
+    if not pd._url_ok(url):
+        raise RuntimeError("下载地址必须用 https：%s" % url)
     tmp = dest + ".part"
     last = None
     for attempt in range(3):
@@ -72,6 +85,9 @@ def download(url, dest):
             print()
             if not zipfile.is_zipfile(tmp):
                 raise RuntimeError("下载内容不是有效的语言包（可能被网络劫持/拦截页替换）")
+            if expected_sha256 and _file_sha256(tmp) != expected_sha256:
+                raise RuntimeError("语言包校验失败（哈希不符），可能被中间人替换，已拒绝：%s"
+                                   % os.path.basename(dest))
             os.replace(tmp, dest)
             return
         except Exception as e:      # noqa: BLE001
@@ -118,6 +134,8 @@ def main():
     failed = []
     if todo and not a.from_dir:
         print("\n获取语言包索引 …")
+        if not pd._url_ok(a.index_url):
+            sys.exit("索引地址必须用 https：%s" % a.index_url)
         try:
             with fetch(a.index_url, 30) as r:
                 index = json.loads(r.read().decode("utf-8"))
@@ -130,19 +148,28 @@ def main():
                 failed.append("%s-%s" % (f, t))
                 continue
             p = max(cands, key=lambda x: oe._ver_tuple(x.get("package_version")))
-            links = [l for l in p.get("links", []) if l.startswith("http")]
-            if a.replace and "=" in a.replace:
-                old, new = a.replace.split("=", 1)
-                links = [l.replace(old, new) for l in links]
+            # H-03：钉死表里没有的语言对没有哈希可验 —— 构建脚本打印醒目警告后继续
+            # （人工核对后再打进安装包；默认两对 en-zh / zh-en 1.9 在钉死表里，一定会验）。
+            sha = pd.pinned_sha256(p)
+            if sha is None:
+                print("    [警告] %s → %s v%s 未在哈希钉死表里，下载后无法校验完整性，"
+                      "请人工核对该语言包来源后再打包。" % (f, t, p.get("package_version")))
+            links = [l for l in p.get("links", []) if pd._url_ok(l)]
+            if a.replace:
+                links = [pd.apply_replace(l, a.replace) for l in links]
             dest = os.path.join(DL, os.path.basename(links[0]) if links else "x.argosmodel")
             print("\n[下载] %s → %s  v%s" % (f, t, p.get("package_version")))
             done = False
             for link in links:
                 try:
                     print("    " + link)
+                    # 已有旧文件且钉死哈希不符时删掉重下，不直接安装来历不明的文件。
+                    if os.path.exists(dest):
+                        if sha is not None and _file_sha256(dest) != sha:
+                            os.remove(dest)
                     if not os.path.exists(dest):
-                        download(link, dest)
-                    pkg = oe.install_package(dest, OUT)
+                        download(link, dest, expected_sha256=sha)
+                    pkg = oe.install_package(dest, OUT, expected=(f, t, str(p.get("package_version"))))
                     print("    已安装：%s" % pkg.name)
                     done = True
                     break

@@ -37,8 +37,9 @@ _HOTKEY_KEYS = frozenset([
     "hotkey_clip", "hotkey_window",
 ])
 # 注意：proxy_pass（代理密码）刻意不在上面任何一张表里——设置导出时
-# _check_value 认不出它，永远不写进导出的 JSON；导入时则按 defaults
-# 里对应值的类型（str）接受。密码只存本机 config.json。
+# _check_value 认不出它，永远不写进导出的 JSON；导入时 import_settings
+# 也明确跳过它（安全修复 H-04：别人给的设置文件不能悄悄改走本机代理密码，
+# 否则流量可被引到攻击者的代理上）。密码只存本机 config.json。
 # 数值键的合法范围；mini_w / mini_h 只有下限（正整数）。
 _CLAMPS = {
     "font_size": (10, 18),
@@ -48,8 +49,15 @@ _CLAMPS = {
     "mini_w": (1, None),
     "mini_h": (1, None),
     "proxy_port": (0, 65535),
-    "live_interval": (2, 30),
+    # L-05：实时翻译间隔最短 5 秒——2 秒一轮高频 OCR 会把窗口卡住、CPU 占满。
+    "live_interval": (5, 30),
 }
+
+# H-04：导入设置时涉及网络出口的敏感键 —— 界面层在应用前把这些变化
+# 列给用户确认（见 sensitive_import_changes），不在这里悄悄应用。
+SENSITIVE_IMPORT_KEYS = frozenset([
+    "pack_mirror", "proxy_host", "proxy_port", "proxy_enabled", "proxy_user",
+])
 
 _TOP_KEYS = frozenset(["app", "version", "config", "glossary"])
 
@@ -186,6 +194,11 @@ def import_settings(text, defaults):
         if key not in known:
             ignored += 1
             continue
+        # H-04：导入的设置文件永远不接受 proxy_pass —— 别人给的文件不能悄悄
+        # 改走本机代理密码；要改密码请在界面「代理密码」栏里自己填。
+        if key == "proxy_pass":
+            ignored += 1
+            continue
         ok, clean = _check_value(key, value, base)
         if ok:
             updates[key] = clean
@@ -206,3 +219,36 @@ def import_settings(text, defaults):
     result = copy.deepcopy(base)
     result.update(updates)
     return result, ignored, None
+
+
+def sensitive_import_changes(text, current_cfg, defaults):
+    """H-04：算出「这次导入会改动的敏感键」→ [(key, 旧值, 新值), ...]。
+
+    只看导入文件里明确写了的敏感键（SENSITIVE_IMPORT_KEYS：镜像域名、
+    代理地址/端口/开关/账号 —— 改了这些等于改了程序的网络出口），
+    文件里没提的键不算改动。界面层在应用导入前把这份清单列给用户，
+    用户点头才应用；没变化返回 []。解析失败返回 []（由 import_settings 报错）。
+    proxy_pass 不在这里出现：它永远不被导入（见 import_settings）。
+    """
+    try:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            return []
+        config = data.get("config", {})
+        if not isinstance(config, dict):
+            return []
+        current = current_cfg if isinstance(current_cfg, dict) else {}
+        base = defaults if isinstance(defaults, dict) else current
+        out = []
+        for key in sorted(SENSITIVE_IMPORT_KEYS):
+            if key not in config:
+                continue
+            ok, clean = _check_value(key, config[key], base)
+            if not ok:
+                continue
+            old = current.get(key)
+            if old != clean:
+                out.append((key, old, clean))
+        return out
+    except Exception:      # noqa: BLE001
+        return []

@@ -47,6 +47,10 @@ KIND_NAMES = {"main": "主窗口", "pointer": "指针取词", "hover": "悬停�
               "replace": "翻译并替换"}
 _COLS = ("id", "ts", "src", "dst", "sl", "tl", "req_sl", "req_tl", "engine", "kind", "fav", "count")
 
+# M-06 / 稳定性：收藏记录原来没有上限 —— 收藏再多也只留最新 10000 条，
+# 否则 history.db 会随收藏无限增长（导出时一次性读全表也会越读越慢）。
+MAX_FAV_ITEMS = 10000
+
 
 def _is_word(src):
     """是不是单词条目：单个词、无空白、1~30 字（与主程序的 is_word_entry 同义）。"""
@@ -90,8 +94,15 @@ class HistoryStore:
         d = os.path.dirname(self.path)
         if d:
             os.makedirs(d, exist_ok=True)
+        new_file = not os.path.exists(self.path)
         conn = sqlite3.connect(self.path, timeout=5)
         conn.row_factory = sqlite3.Row
+        if new_file:
+            # M-06：历史库里是用户剪贴板 / 截图的原文译文，新建时收紧成仅本用户可读。
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
         if not self._ready:
             conn.executescript(_SCHEMA)
             conn.commit()
@@ -144,6 +155,12 @@ class HistoryStore:
         c.execute(
             "DELETE FROM history WHERE fav=0 AND id NOT IN "
             "(SELECT id FROM history WHERE fav=0 ORDER BY ts DESC, id DESC LIMIT ?)", (n,))
+        # M-06 / 稳定性：收藏原来无上限 —— 超过 MAX_FAV_ITEMS 时只删最旧的收藏
+        # （未收藏的上限逻辑在上面；这里只动收藏，不影响 test_history 的小数目行为）。
+        c.execute(
+            "DELETE FROM history WHERE fav=1 AND id NOT IN "
+            "(SELECT id FROM history WHERE fav=1 ORDER BY ts DESC, id DESC LIMIT ?)",
+            (MAX_FAV_ITEMS,))
 
     def set_fav(self, rid, fav=True):
         try:
