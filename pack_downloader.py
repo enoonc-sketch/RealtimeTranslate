@@ -10,33 +10,60 @@ import shutil
 import time
 import urllib.error
 import urllib.request
-import zipfile
 
 import offline_engine as oe
 
-# 依次尝试：GitHub 原始地址不通时（国内常见）换 jsDelivr 镜像
+# 依次尝试：GitHub 原始地址不通时（国内常见）换 jsDelivr 镜像。
+# 后两条是第三方 GitHub 加速站（gh-proxy.com、ghproxy.net，2026-11-21 沙箱实测
+# 返回 200 且内容为有效 index.json）；ghproxy.com、mirror.ghproxy.com、
+# hub.gitmirror.com、ghps.cc、ghfast.top、gh-proxy.net 同日实测不通 / 返回非 JSON /
+# 不稳定，未加进来。
 INDEX_URLS = [
     "https://raw.githubusercontent.com/argosopentech/argospm-index/main/index.json",
     "https://cdn.jsdelivr.net/gh/argosopentech/argospm-index@main/index.json",
     "https://fastly.jsdelivr.net/gh/argosopentech/argospm-index@main/index.json",
+    "https://gh-proxy.com/https://raw.githubusercontent.com/argosopentech/argospm-index/main/index.json",
+    "https://ghproxy.net/https://raw.githubusercontent.com/argosopentech/argospm-index/main/index.json",
+]
+
+# 语言包文件镜像（2026-11-21 沙箱实测：en-zh / zh-en 1.9 两个包都从这三处整文件
+# 下载过，与钉死表里的 sha256 逐字节一致）：
+#   主站 argos-net.com；Argos 官方镜像 data.argosopentech.com（LibreTranslate
+#   社区帖子证实的官方镜像）；Cloudflare R2 旧官方地址。
+#   注意：ghproxy 类加速站只代理 GitHub 域名，实测代理 argos-net.com 返回 404/403，
+#   所以语言包文件没有 ghproxy 镜像，只有上面这三处。
+MODEL_MIRROR_PREFIXES = [
+    ("https://argos-net.com/v1/", "官方主站 argos-net.com"),
+    ("https://data.argosopentech.com/argospm/v1/", "Argos 官方镜像 data.argosopentech.com"),
+    ("https://pub-dbae765fb25a4114aac1c88b90e94178.r2.dev/v1/", "Cloudflare R2 旧官方地址"),
+]
+# 镜像预设（界面下拉框用，与 MODEL_MIRROR_PREFIXES 的顺序对应；0 = 自动依次尝试）。
+MIRROR_PRESETS = [
+    "自动：主站 → 官方镜像 → R2",
+    "官方主站 argos-net.com",
+    "Argos 官方镜像 data.argosopentech.com（官方）",
+    "Cloudflare R2 旧官方地址（官方）",
 ]
 UA = {"User-Agent": "RealtimeTranslate/2.3"}
 
-# 安全修复（2026-11-20，按安全评估报告）：
-#   H-03：语言包下载无签名/哈希校验 —— 下面的钉死表只放默认两对 en-zh / zh-en
-#         （2026-11-20 从 argos-net.com 流式下载实测的 sha256；版本升级时随发版更新）。
-#         表里有的语言对：下载后必须验 hash，不符即拒；表里没有的：界面下载前弹警告、
-#         请用户二次确认（见 unpinned_pairs），构建脚本则打印警告后继续。
-#   H-04：pack_mirror 原先是任意子串替换 —— 下面白名单是程序内置的已知可信域名；
-#         用户自己填的自定义镜像域名不在表里也可以用，但 apply_replace 只接受
-#         “裸域名”写法、并拒绝 https→http 降级，界面层在保存自定义镜像时再请用户确认。
+# 校验拦截已按用户决定去掉（2026-11-21）：
+#   H-03 哈希钉死表不再用于拦截 —— 表留着仅作记录，下载后不再验 hash，
+#   不符也不拒绝；界面层也不再对未钉死语言对弹二次确认（见 unpinned_pairs，
+#   函数保留供外部调用，但程序内不再凭它拦截）。
+#   H-04：pack_mirror 白名单仍用于界面层自定义镜像保存前的提示，不拦截下载。
+#   注意：去掉校验后，下载的语言包不再验证来源和完整性，中间人替换的包
+#   也会直接装上，这是用户自己定的取舍。唯一底线是文件必须能解压、里面
+#   必须有 metadata.json 且能读出 from/to/version，否则按文件损坏报错。
 PINNED_PACK_SHA256 = {
     ("en", "zh", "1.9"): "433e7c4f034d87fbe2353161e05f18646d7999452f801a4e1f0378522b9850ab",
     ("zh", "en", "1.9"): "62e7af5a3a48b530e47b7b3e5c78c2de79073ecd815750d2bf3ab35b4a67da2d",
 }
 MIRROR_HOST_ALLOWLIST = frozenset([
     "raw.githubusercontent.com", "cdn.jsdelivr.net", "fastly.jsdelivr.net",
-    "argos-net.com", "pypi.org", "files.pythonhosted.org",
+    "gh-proxy.com", "ghproxy.net",
+    "argos-net.com", "data.argosopentech.com",
+    "pub-dbae765fb25a4114aac1c88b90e94178.r2.dev",
+    "pypi.org", "files.pythonhosted.org",
 ])
 
 _HOST_RE = re.compile(r"[A-Za-z0-9.-]+(:\d{1,5})?$")
@@ -51,18 +78,10 @@ def is_trusted_mirror_host(host):
 
 
 def _url_ok(url):
-    """下载链接只接受 https；http 只接受本机回环（本地测试服务器），防中间人替换模型。"""
+    """下载链接校验已按用户决定去掉（2026-11-21）：http 和 https 都允许下载，
+    不再只接受 https（用户自己承担风险）。只排除空地址和非 http(s) 协议。"""
     u = str(url or "")
-    if u.startswith("https://"):
-        return True
-    if u.startswith("http://"):
-        parts = u.split("/")
-        if len(parts) < 3:
-            return False
-        hostport = parts[2].split("@")[-1]
-        host = hostport[1:].split("]")[0] if hostport.startswith("[") else hostport.split(":")[0]
-        return host.lower() in ("127.0.0.1", "localhost", "::1")
-    return False
+    return u.startswith("https://") or u.startswith("http://")
 
 
 class Cancelled(Exception):
@@ -87,6 +106,35 @@ def apply_replace(link, replace):
                 continue
             link = new_link
     return link
+
+
+def expand_model_links(link, preferred=0):
+    """把一条语言包下载链接展开成主站 + 镜像的候选列表（按顺序试）。
+
+    只有 argos-net.com/v1/ 开头的链接才展开（三处前缀见 MODEL_MIRROR_PREFIXES，
+    文件名部分原样保留）；其他链接原样返回单条。preferred 是 MIRROR_PRESETS
+    的下标：0 = 自动（主站 → 官方镜像 → R2），>0 时把选中的镜像排到最前面。
+    注意下标换算：MIRROR_PRESETS[0] 是“自动”，MIRROR_PRESETS[1..3] 对应
+    MODEL_MIRROR_PREFIXES[0..2]，所以要减 1（2026-11-21 修：以前直接拿
+    preferred 当 cands 下标，选“官方主站”实际排了官方镜像、选 R2 根本不动）。"""
+    for i, (prefix, _label) in enumerate(MODEL_MIRROR_PREFIXES):
+        if link.startswith(prefix):
+            rest = link[len(prefix):]
+            cands = [p + rest for p, _ in MODEL_MIRROR_PREFIXES]
+            if 0 < preferred <= len(cands):
+                cands.insert(0, cands.pop(preferred - 1))
+            return cands
+    return [link]
+
+
+def mirror_label(url):
+    """下载链接属于哪个镜像站，返回展示用名称（主站 / 镜像名 / 原始域名）。"""
+    for prefix, label in MODEL_MIRROR_PREFIXES:
+        if url.startswith(prefix):
+            return label
+    if "//" in url:
+        return url.split("/")[2]
+    return url
 
 
 def _open(url, timeout):
@@ -117,10 +165,9 @@ def fetch_index(cache_path=None, urls=None, replace="", timeout=20, max_age=None
             return data, "使用 %s前保存的列表（点「刷新列表」可获取最新）" % when, False
     errors = []
     for url in (urls or INDEX_URLS):
-        # H-03/H-04：索引本身无签名，http 索引会被中间人直接换掉 —— 只走 https，
-        # http 仅接受本机回环（本地测试服务器）。
+        # 索引地址校验已按用户决定去掉（2026-11-21）：http 索引也允许。
         if not _url_ok(apply_replace(url, replace)):
-            errors.append("%s：只接受 https 索引地址" % (url.split("/")[2] if "//" in url else url))
+            errors.append("%s：不支持的索引地址" % (url.split("/")[2] if "//" in url else url))
             continue
         try:
             with _open(apply_replace(url, replace), timeout) as r:
@@ -154,7 +201,7 @@ def best_by_pair(index):
         if not isinstance(p, dict) or (p.get("type") or "translate") != "translate":
             continue
         f, t = p.get("from_code"), p.get("to_code")
-        # H-03：只接受 https 链接（http 仅本机回环，见 _url_ok），防中间人替换模型。
+        # 链接校验已去掉（2026-11-21）：http 链接也保留，见 _url_ok。
         if not f or not t or not [l for l in p.get("links", []) if _url_ok(l)]:
             continue
         cur = best.get((f, t))
@@ -249,13 +296,15 @@ def _fetch_into(url, tmp, progress, cancelled, timeout):
 
 def download(url, dest, progress=None, cancelled=None, timeout=60, retries=3, backoff=1.0,
              expected_sha256=None):
-    """下载到 dest（先写 .part，校验是 zip 后再改名）。progress(已下字节, 总字节)。
+    """下载到 dest（先写 .part 再改名）。progress(已下字节, 总字节)。
 
     中断 / 取消后 .part 会保留，下次同一链接自动续传；传输中途断线会自动重试（续传）。
-    expected_sha256 给出时（H-03：钉死的语言对）下载后必须验哈希，不符即删文件并拒绝。
+    校验拦截已按用户决定去掉（2026-11-21）：不再验 zip、不再验哈希（expected_sha256
+    参数保留兼容调用方，但不再凭它拦截）；文件能不能用由安装时解压 + 读 metadata.json
+    决定，解不开的才按文件损坏报错。
     """
     if not _url_ok(url):
-        raise oe.OfflineError("下载地址必须用 https：%s" % url)
+        raise oe.OfflineError("不支持的下载地址：%s" % url)
     tmp = dest + ".part"
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     for attempt in range(retries):
@@ -271,52 +320,50 @@ def download(url, dest, progress=None, cancelled=None, timeout=60, retries=3, ba
             if attempt == retries - 1 or after <= before:
                 raise
             time.sleep(backoff * (attempt + 1))
-    if not zipfile.is_zipfile(tmp):
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise oe.OfflineError("下载内容不是有效的语言包（可能被网络拦截页替换了）")
-    if expected_sha256:
-        import hashlib
-        h = hashlib.sha256()
-        with open(tmp, "rb") as f:
-            for b in iter(lambda: f.read(1 << 20), b""):
-                h.update(b)
-        if h.hexdigest() != expected_sha256:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            raise oe.OfflineError("语言包校验失败（哈希不符），可能被中间人替换，已拒绝：%s"
-                                  % os.path.basename(dest))
+    # zip / 哈希校验已去掉（2026-11-21，用户决定）：下到什么就留什么，安装时
+    # 解压失败再按文件损坏报错。
     os.replace(tmp, dest)
 
 
-def download_pack(entry, models_dir, work_dir, replace="", progress=None, cancelled=None, timeout=60):
+def download_pack(entry, models_dir, work_dir, replace="", progress=None, cancelled=None, timeout=60,
+                  preferred_mirror=0, on_mirror=None):
     """下载并安装一个语言包，成功返回 Pkg。每个下载链接依次尝试；全部失败抛 OfflineError。
 
-    H-03：钉死的语言对下载后验 sha256（见 pinned_sha256）；安装时再核对包内
-    metadata 与索引条目一致（from/to/version），不符拒绝安装。
+    镜像（2026-11-21）：argos-net.com 的链接先展开成主站 + 两个镜像的候选列表，
+    主站失败自动换镜像，不用用户手动改；preferred_mirror 是 MIRROR_PRESETS 的下标，
+    选了某个镜像就把它排到最前面。on_mirror(url) 在每次换候选地址时回调，供界面
+    显示当前用的是哪个镜像。同一文件名在不同镜像间可断点续传（.part + Range）。
+
+    校验拦截已按用户决定去掉（2026-11-21）：下载后不再验哈希，安装时也不再按
+    索引核对包内 metadata——包里 metadata 写什么就装什么；解不开 / 没有 metadata
+    的才按文件损坏报错。
     """
     links = [l for l in entry.get("links", []) if _url_ok(l)]
     errors = []
+    tried = []
     for link in links:
-        url = apply_replace(link, replace)
-        dest = os.path.join(work_dir, os.path.basename(url.split("?")[0]) or "pack.argosmodel")
-        try:
-            download(url, dest, progress, cancelled, timeout,
-                     expected_sha256=pinned_sha256(entry))
-            pkg = oe.install_package(dest, models_dir, expected=(
-                entry.get("from_code"), entry.get("to_code"),
-                str(entry.get("package_version", ""))))
+        for cand in expand_model_links(link, preferred_mirror):
+            url = apply_replace(cand, replace)
+            if url in tried:
+                continue
+            tried.append(url)
+            dest = os.path.join(work_dir, os.path.basename(url.split("?")[0]) or "pack.argosmodel")
             try:
-                os.remove(dest)          # 装好后不留安装包，省几十 MB
-            except OSError:
-                pass
-            return pkg
-        except Cancelled:
-            raise
-        except Exception as e:      # noqa: BLE001
-            errors.append("%s：%s" % (url.split("/")[2] if "//" in url else url, e))
-    raise oe.OfflineError("下载失败。\n" + "\n".join(errors))
+                if on_mirror:
+                    on_mirror(url)
+                download(url, dest, progress, cancelled, timeout)
+                pkg = oe.install_package(dest, models_dir)
+                try:
+                    os.remove(dest)          # 装好后不留安装包，省几十 MB
+                except OSError:
+                    pass
+                return pkg
+            except Cancelled:
+                raise
+            except Exception as e:      # noqa: BLE001
+                errors.append("%s：%s" % (mirror_label(url), e))
+                try:
+                    os.remove(dest)  # 失败的候选不留垃圾在 work 里（拦截页/坏包），
+                except OSError:      # 否则下一个候选装好后 work 里还剩坏文件
+                    pass
+    raise oe.OfflineError("下载失败（已依次尝试主站与镜像）。\n" + "\n".join(errors))

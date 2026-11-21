@@ -42,11 +42,11 @@ PINNED_WHEELS = {
         "numpy-2.5.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl":
             "704d819265e5d1064d932968e9ee85fff2103ccc78c05b878c06943ba27b8507",
     }},
-    "pyyaml": {"version": "6.0.3", "sha256": {
-        "pyyaml-6.0.3-cp312-cp312-win_amd64.whl":
-            "5fcd34e47f6e0b794d17de1b4ff496c00986e1c83f7ab2fb8fcfe9616ff7477b",
-        "pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl":
-            "ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc",
+    "pyyaml": {"version": "6.0.4", "sha256": {
+        "pyyaml-6.0.4-cp312-cp312-win_amd64.whl":
+            "131d11bd9b60d705a6388366d77ed67850995a4d2be85fe149785a257c17e531",
+        "pyyaml-6.0.4-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl":
+            "93bfb2459195406a518e2f487a9bbf01df240175f31e06f5a252ac6734c7bbf0",
     }},
     "sentencepiece": {"version": "0.2.3", "sha256": {
         "sentencepiece-0.2.3-cp312-cp312-win_amd64.whl":

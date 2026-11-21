@@ -144,8 +144,11 @@ def check_proxy():
                  "程序会自动使用系统代理；若翻译失败，请确认代理软件正在运行")
 
 
-def check_engine(key, name, fn, timeout=15):
-    """fn() 应发起一次最小翻译（单次尝试），成功返回非空译文。"""
+def check_engine(key, name, fn, timeout=15, http404_reason=None):
+    """fn() 应发起一次最小翻译（单次尝试），成功返回非空译文。
+
+    http404_reason：该引擎的 404 有已知的明确原因时传进来（如微软免费接口已下线），
+    404 就按这个说，不再含糊成“服务返回了异常状态”或“可能被拦截”。"""
     t0 = time.time()
     r, e = _run_with_timeout(fn, timeout)
     ms = (time.time() - t0) * 1000
@@ -153,6 +156,9 @@ def check_engine(key, name, fn, timeout=15):
         return Check(key, name, True, ms)
     if e is None:
         return Check(key, name, False, None, "返回为空", "服务可连通但没有返回译文")
+    if http404_reason and isinstance(e, urllib.error.HTTPError) and e.code == 404:
+        why, hint = http404_reason
+        return Check(key, name, False, None, why, hint)
     why, hint = explain_error(e)
     return Check(key, name, False, None, why, hint)
 
@@ -187,8 +193,9 @@ def recommend(checks, current=None):
         return Recommendation("离线", "在线引擎都不可用，但离线引擎可用；建议使用「离线」，或开启「断网时自动改用离线」。", "warn")
     if not ok("net"):
         return Recommendation(None, "本机无法联网，且没有可用的离线引擎。请先恢复网络连接。", "bad")
-    return Recommendation(None, "能上外网，但 Google 和微软翻译都连不上（可能被代理/防火墙拦截），也没有离线引擎。"
-                          "请看上面各项的建议，或换一个网络。", "bad")
+    return Recommendation(None, "能上外网，但 Google 被限流（HTTP 429，代理出口 IP 被 Google 限流，只能等一等或换网络）、"
+                          "微软免费接口已下线（HTTP 404，暂时不可用），也没有离线引擎。"
+                          "建议装离线版用离线翻译，在线失败时会自动回退到离线。", "bad")
 
 
 def run_all(google_fn, ms_fn, offline_info, on_item=None, cancelled=None):
@@ -198,7 +205,9 @@ def run_all(google_fn, ms_fn, offline_info, on_item=None, cancelled=None):
         ("dns", check_dns),
         ("proxy", check_proxy),
         ("google", lambda: check_engine("google", "Google 翻译", google_fn)),
-        ("ms", lambda: check_engine("ms", "微软翻译", ms_fn)),
+        ("ms", lambda: check_engine("ms", "微软翻译", ms_fn, http404_reason=(
+            "微软免费接口已下线（HTTP 404）",
+            "微软免费取 token 的接口已下线，不是代理拦截；微软引擎暂时不可用，请改用 Google 或离线"))),
         ("offline", lambda: check_offline(offline_info)),
     ]
     results, lock = {}, threading.Lock()

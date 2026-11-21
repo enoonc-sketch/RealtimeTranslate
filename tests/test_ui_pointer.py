@@ -55,6 +55,18 @@ ok("plan: terminal w/o I-beam sends nothing (no Ctrl+C interrupt)", dt.pointer_p
 # ---------- 下载对话框 ----------
 app._show_offline_packs(); pump(0.2)
 app._show_pack_download()
+# 镜像预设下拉（2026-11-21 回归：标准版里也要能选镜像；以前下拉框在、
+# 选了也不生效——expand_model_links 把预设下标直接当了镜像下标）
+ok("mirror preset var exists", hasattr(app, "dl_mirror_preset"))
+ok("mirror preset default is auto", app.dl_mirror_preset.get() == pd.MIRROR_PRESETS[0])
+def _walk(w):
+    yield w
+    for c in w.winfo_children():
+        yield from _walk(c)
+import tkinter.ttk as _ttk
+_boxes = [w for w in _walk(app.dl_win) if isinstance(w, _ttk.Combobox) and list(w.cget("values")) == pd.MIRROR_PRESETS]
+ok("mirror preset dropdown lists 4 presets", len(_boxes) == 1 and str(_boxes[0].cget("state")) == "readonly")
+app.dl_mirror_preset.set(pd.MIRROR_PRESETS[2])  # 选 Argos 官方镜像，再下包应记住该选择
 ok("list loads", pump(5, lambda: len(app.dl_tv.get_children()) == 4))
 rows = {app.dl_tv.item(i)["values"][1]: app.dl_tv.item(i)["values"] for i in app.dl_tv.get_children()}
 ok("rows show not-installed", rows["en-zh"][3] == "未安装")
@@ -84,6 +96,7 @@ ok("nothing left to download", "都已安装" in app.dl_prog.cget("text"))
 ok("downloaded temp cleaned", not [f for f in os.listdir(dt._dl_dir()) if f.endswith(".argosmodel")])
 ok("index cached", os.path.isfile(dt._index_cache()))
 ok("config remembers mirror field", "pack_mirror" in json.load(open(dt.CONFIG_PATH)))
+ok("config remembers mirror preset choice", json.load(open(dt.CONFIG_PATH)).get("pack_mirror_preset") == pd.MIRROR_PRESETS[2])
 
 # 取消
 for i, p in app.dl_iid.items():

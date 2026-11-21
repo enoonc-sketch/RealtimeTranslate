@@ -212,11 +212,12 @@ def _verify_manifest(pkg):
         return False
 
 
-def install_package(archive, dest_dir, expected=None):
+def install_package(archive, dest_dir):
     """把 .argosmodel（zip）安全解压到 dest_dir，返回 Pkg。出错抛 OfflineError。
 
-    expected（可选）：(from_code, to_code, package_version)，与索引条目一致才安装
-    （H-03：防止下载的包与索引条目不符、被掉包后仍装上）。"""
+    索引核对已按用户决定去掉（2026-11-21）：不再按索引条目核对包内 metadata，
+    包里 metadata 写什么就装什么。底线不变：文件必须能解压、里面必须有
+    metadata.json 且能读出 from/to/version，否则按文件损坏报错。"""
     if not zipfile.is_zipfile(archive):
         raise OfflineError("不是有效的语言包文件（应为 .argosmodel）：%s" % os.path.basename(archive))
     os.makedirs(dest_dir, exist_ok=True)
@@ -248,13 +249,6 @@ def install_package(archive, dest_dir, expected=None):
     _check_code(probe.from_code, "from_code")
     _check_code(probe.to_code, "to_code")
     _check_code(probe.version, "package_version")
-    if expected is not None:
-        exp_f, exp_t, exp_v = expected
-        if (probe.from_code, probe.to_code, probe.version) != (exp_f, exp_t, str(exp_v)):
-            shutil.rmtree(tmp_root, ignore_errors=True)
-            raise OfflineError("语言包与索引条目不符（包内 %s→%s v%s，索引要求 %s→%s v%s），"
-                               "已拒绝安装" % (probe.from_code, probe.to_code, probe.version,
-                                             exp_f, exp_t, exp_v))
     final = os.path.join(root, top or "translate-%s_%s-%s" % (probe.from_code, probe.to_code, probe.version.replace(".", "_")))
     final_real = os.path.realpath(final)
     if not (final_real == root or final_real.startswith(root + os.sep)):

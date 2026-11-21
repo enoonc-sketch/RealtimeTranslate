@@ -83,8 +83,13 @@ pd.download(B + "en_zh.argosmodel", dest, lambda d, t: seen.append((d, t)))
 ok("download reports progress and total", seen and seen[-1][0] == seen[-1][1] > 0 and zipfile.is_zipfile(dest))
 try: pd.download(B + "big.argosmodel", os.path.join(tmp, "dl", "b"), cancelled=lambda: True); ok("cancel", False)
 except pd.Cancelled: ok("cancel raises Cancelled", True)
-try: pd.download(B + "blocked.argosmodel", os.path.join(tmp, "dl", "c")); ok("blocked page rejected", False)
-except oe.OfflineError as e: ok("blocked page rejected", "不是有效的语言包" in str(e))
+# 下载拦截已按用户决定去掉（2026-11-21）：拦截页内容下载时不再拒绝，文件照常
+# 留下；装的时候解不开才按文件损坏报错。
+_c = os.path.join(tmp, "dl", "c")
+pd.download(B + "blocked.argosmodel", _c)
+ok("blocked page no longer rejected at download (user decision)", os.path.isfile(_c))
+try: oe.install_package(_c, os.path.join(tmp, "models-bad")); ok("blocked page fails at install", False)
+except oe.OfflineError as e: ok("blocked page fails at install with factual error", "不是有效的语言包" in str(e))
 
 # ---- 断点续传 ----
 dl = os.path.join(tmp, "dl2"); got = [0]
@@ -146,5 +151,16 @@ ok("missing: direct available", pd.missing_for(eng, "en", "zh", best) == [("en",
 ok("missing: already possible", pd.missing_for(eng, "zh", "en", best) == [])
 ok("missing: via English needs 2 legs", pd.missing_for(eng, "ja", "zh", best) == [("ja", "en"), ("en", "zh")])
 ok("missing: impossible -> None", pd.missing_for(eng, "ja", "ko", best) is None)
+# 镜像预设展开（2026-11-21 回归：preferred 是 MIRROR_PRESETS 下标，
+# 0=自动，1..3 对应主站/官方镜像/R2；以前直接当 cands 下标用，选错站）
+_L = "https://argos-net.com/v1/translate-en_zh-1_9.argosmodel"
+_E = pd.expand_model_links(_L, 0)
+ok("mirror preset auto order", _E == ["https://argos-net.com/v1/translate-en_zh-1_9.argosmodel",
+    "https://data.argosopentech.com/argospm/v1/translate-en_zh-1_9.argosmodel",
+    "https://pub-dbae765fb25a4114aac1c88b90e94178.r2.dev/v1/translate-en_zh-1_9.argosmodel"])
+ok("mirror preset 1 puts main site first", pd.expand_model_links(_L, 1)[0].startswith("https://argos-net.com/"))
+ok("mirror preset 2 puts Argos mirror first", pd.expand_model_links(_L, 2)[0].startswith("https://data.argosopentech.com/"))
+ok("mirror preset 3 puts R2 first", pd.expand_model_links(_L, 3)[0].startswith("https://pub-dbae765fb25a4114aac1c88b90e94178.r2.dev/"))
+ok("mirror preset keeps all 3 candidates", len(set(pd.expand_model_links(_L, 2))) == 3)
 httpd.shutdown()
 print("ALL OK" if all(res) else "FAILED"); sys.exit(0 if all(res) else 1)

@@ -113,7 +113,8 @@ ok("H-04 apply_replace rejects non-hostname", pd.apply_replace(
 ok("H-04 apply_replace multi-pair (test compat)", pd.apply_replace(
     "https://pypi.org/a files.pythonhosted.org",
     "pypi.org=m1.cn;files.pythonhosted.org=m2.cn") == "https://m1.cn/a m2.cn")
-ok("H-03 http non-loopback rejected", not pd._url_ok("http://evil.cn/index.json"))
+# 校验拦截已按用户决定去掉（2026-11-21）：http 链接也允许下载，不再拦截。
+ok("H-03 http non-loopback now allowed (user decision)", pd._url_ok("http://evil.cn/index.json"))
 ok("H-03 https accepted", pd._url_ok("https://argos-net.com/x.argosmodel"))
 ok("H-03 http loopback accepted (local test server)", pd._url_ok("http://127.0.0.1:9/x"))
 
@@ -137,11 +138,9 @@ srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 url = "http://127.0.0.1:%d/good.argosmodel" % srv.server_address[1]
 dest = os.path.join(TMP, "dl.argosmodel")
-try:
-    pd.download(url, dest, expected_sha256="0" * 64)
-    ok("H-03 download wrong hash rejected", False)
-except oe.OfflineError:
-    ok("H-03 download wrong hash rejected", True)
+# 哈希校验已按用户决定去掉（2026-11-21）：错哈希也不再拒绝，文件照常留下。
+pd.download(url, dest, expected_sha256="0" * 64)
+ok("H-03 download wrong hash no longer rejected (user decision)", os.path.isfile(dest))
 good_sha = hashlib.sha256(open(os.path.join(TMP, "good.argosmodel"), "rb").read()).hexdigest()
 pd.download(url, dest, expected_sha256=good_sha)
 ok("H-03 download right hash accepted", os.path.isfile(dest))
@@ -344,11 +343,9 @@ ok("M-04 DPAPI unprotect passes legacy plaintext through",
    dtr._dpapi_unprotect("plain-old-password") == "plain-old-password")
 ok("M-04 DPAPI unprotect of dpapi: value fails closed on non-Windows",
    dtr._dpapi_unprotect("dpapi:AAAA") is None)
-ok("L-02 MS token regex accepts JWT-like",
-   bool(dtr._MS_TOKEN_RE.fullmatch("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature")))
-ok("L-02 MS token regex rejects HTML intercept page",
-   not dtr._MS_TOKEN_RE.fullmatch("<html><body>blocked</body></html>"))
-ok("L-02 MS token regex rejects short token", not dtr._MS_TOKEN_RE.fullmatch("abc"))
+# L-02 Edge token 格式校验已按用户决定去掉（2026-11-21）：拿到什么 token 就
+# 用什么，不再因格式拒绝；拦截页内容交给微软端点报 401/403。
+ok("L-02 MS token format check removed (user decision)", not hasattr(dtr, "_MS_TOKEN_RE"))
 
 # ---------------------------------------------------------------- M-05/L-04 docx 白名单与上限
 

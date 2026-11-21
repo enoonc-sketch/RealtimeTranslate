@@ -19,7 +19,6 @@ import shutil
 import sys
 import time
 import urllib.request
-import zipfile
 
 # Windows 控制台默认编码不一定是 UTF-8（如 cp1252），中文 print 会直接崩；
 # 把 stdout/stderr 强制成 UTF-8（失败也不影响主流程）。
@@ -54,19 +53,9 @@ def fetch(url, timeout=60):
     return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout)
 
 
-def _file_sha256(path):
-    import hashlib
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for b in iter(lambda: f.read(1 << 20), b""):
-            h.update(b)
-    return h.hexdigest()
-
-
-def download(url, dest, expected_sha256=None):
-    """H-03：只走 https（http 仅本机回环）；钉死的语言对下载后验 sha256，不符即拒。"""
-    if not pd._url_ok(url):
-        raise RuntimeError("下载地址必须用 https：%s" % url)
+def download(url, dest):
+    """下载语言包。校验拦截已按用户决定去掉（2026-11-21）：http 也允许，
+    不再验 zip、不再验哈希；文件能不能用由安装时解压 + 读 metadata.json 决定。"""
     tmp = dest + ".part"
     last = None
     for attempt in range(3):
@@ -83,11 +72,6 @@ def download(url, dest, expected_sha256=None):
                     if total:
                         print("\r    %.0f / %.0f MB (%d%%)" % (got / 1e6, total / 1e6, got * 100 // total), end="", flush=True)
             print()
-            if not zipfile.is_zipfile(tmp):
-                raise RuntimeError("下载内容不是有效的语言包（可能被网络劫持/拦截页替换）")
-            if expected_sha256 and _file_sha256(tmp) != expected_sha256:
-                raise RuntimeError("语言包校验失败（哈希不符），可能被中间人替换，已拒绝：%s"
-                                   % os.path.basename(dest))
             os.replace(tmp, dest)
             return
         except Exception as e:      # noqa: BLE001
@@ -134,8 +118,7 @@ def main():
     failed = []
     if todo and not a.from_dir:
         print("\n获取语言包索引 …")
-        if not pd._url_ok(a.index_url):
-            sys.exit("索引地址必须用 https：%s" % a.index_url)
+        # 索引地址的 https-only 校验已去掉（2026-11-21）：http 索引也允许。
         try:
             with fetch(a.index_url, 30) as r:
                 index = json.loads(r.read().decode("utf-8"))
@@ -148,12 +131,8 @@ def main():
                 failed.append("%s-%s" % (f, t))
                 continue
             p = max(cands, key=lambda x: oe._ver_tuple(x.get("package_version")))
-            # H-03：钉死表里没有的语言对没有哈希可验 —— 构建脚本打印醒目警告后继续
-            # （人工核对后再打进安装包；默认两对 en-zh / zh-en 1.9 在钉死表里，一定会验）。
-            sha = pd.pinned_sha256(p)
-            if sha is None:
-                print("    [警告] %s → %s v%s 未在哈希钉死表里，下载后无法校验完整性，"
-                      "请人工核对该语言包来源后再打包。" % (f, t, p.get("package_version")))
+            # 哈希钉死校验已去掉（2026-11-21）：下载后不再验哈希，安装时也不再按
+            # 索引核对；语言包来源和完整性不再验证，用户自己承担风险。
             links = [l for l in p.get("links", []) if pd._url_ok(l)]
             if a.replace:
                 links = [pd.apply_replace(l, a.replace) for l in links]
@@ -163,13 +142,9 @@ def main():
             for link in links:
                 try:
                     print("    " + link)
-                    # 已有旧文件且钉死哈希不符时删掉重下，不直接安装来历不明的文件。
-                    if os.path.exists(dest):
-                        if sha is not None and _file_sha256(dest) != sha:
-                            os.remove(dest)
                     if not os.path.exists(dest):
-                        download(link, dest, expected_sha256=sha)
-                    pkg = oe.install_package(dest, OUT, expected=(f, t, str(p.get("package_version"))))
+                        download(link, dest)
+                    pkg = oe.install_package(dest, OUT)
                     print("    已安装：%s" % pkg.name)
                     done = True
                     break
