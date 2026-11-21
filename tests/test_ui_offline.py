@@ -7,7 +7,7 @@ from make_fake_model import make_pkg
 from tkinter import filedialog
 
 tmp = tempfile.mkdtemp()
-dt.DATA_DIR = os.path.join(tmp, "data"); dt.CONFIG_PATH = os.path.join(dt.DATA_DIR, "config.json")
+dt.DATA_DIR = os.path.join(tmp, "data"); dt.CONFIG_PATH = os.path.join(dt.DATA_DIR, "config.json"); dt.HISTORY_PATH = os.path.join(dt.DATA_DIR, "history.db")
 dt.USER_MODELS_DIR = os.path.join(dt.DATA_DIR, "models")
 en = ["hello world this is a test", "good morning everyone"] * 8; zh = ["你好世界这是一个测试", "大家早上好"] * 8
 bundled = os.path.join(tmp, "bundled"); make_pkg(bundled, "en", "zh", en + zh)

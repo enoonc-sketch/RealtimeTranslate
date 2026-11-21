@@ -1,7 +1,7 @@
 import sys, os, time, tempfile, json
 import os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import desktop_translator as dt
-dt.DATA_DIR = tempfile.mkdtemp(); dt.CONFIG_PATH = os.path.join(dt.DATA_DIR, "config.json")
+dt.DATA_DIR = tempfile.mkdtemp(); dt.CONFIG_PATH = os.path.join(dt.DATA_DIR, "config.json"); dt.HISTORY_PATH = os.path.join(dt.DATA_DIR, "history.db")
 dt.g_translate = lambda t, sl, tl: ("译:" + t[:20], "en")
 app = dt.App()
 r = app.root
@@ -27,6 +27,9 @@ ok3 = bool(hits) and "iconify" in _src and "root.withdraw()" in _tray_src and "t
 print("Esc -> hide_window called:", bool(hits))
 app.show_window(); pump(0.3)
 # engine list / error path
+# 注意：先关掉自动离线回退，否则 g_translate 抛错后会走离线回退（那是预期行为，
+# ok4 测的是"在线失败且无离线可用时显示翻译失败"，不是"回退被禁用"）。
+dt.AUTO_OFFLINE = False
 dt.g_translate = lambda t, sl, tl: (_ for _ in ()).throw(RuntimeError("boom"))
 dt.CACHE.clear(); app._set_src("fail me"); app.translate_now(); pump(2.5)
 ok4 = "翻译失败" in app.dst.get("1.0", "end")

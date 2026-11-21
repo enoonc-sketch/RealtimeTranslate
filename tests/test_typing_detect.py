@@ -190,6 +190,75 @@ def test_pause_ms_clamped():
     assert b.pause_ms == 3000
 
 
+def test_sensitive_key_value_suppressed():
+    """B-1：键: 值按词拆开后也不翻 —— 键名跟了 :/= 时键名不翻，紧跟的值也不翻。"""
+    clock = Clock()
+    b = td.TypingBuffer(now_fn=clock.now)
+    assert feed_text(b, "password: abc123 ", clock) == []
+    b = td.TypingBuffer(now_fn=clock.now)
+    assert feed_text(b, "token: sk-abcdefghijklmnopqrst ", clock) == []
+    b = td.TypingBuffer(now_fn=clock.now)
+    assert feed_text(b, "账号：zhangsan ", clock) == []
+    b = td.TypingBuffer(now_fn=clock.now)
+    assert feed_text(b, "api-key=abcdef123456 ", clock) == []
+    b = td.TypingBuffer(now_fn=clock.now)
+    assert feed_text(b, "密码：abc123 ", clock) == []
+
+
+def test_sensitive_key_value_space_before_colon():
+    """B-1：键名与冒号之间隔了空格（password : abc123）——值仍抑制；
+    键名本身在冒号到之前已打完，无法撤回，只断言值不翻。"""
+    clock = Clock()
+    b = td.TypingBuffer(now_fn=clock.now)
+    evs = feed_text(b, "password : abc123 ", clock)
+    assert [e["text"] for e in evs] == ["password"]
+
+
+def test_sensitive_key_pending_clears_after_value():
+    """B-1：抑制只针对紧跟的那个值，之后正常词照常翻。"""
+    clock = Clock()
+    b = td.TypingBuffer(now_fn=clock.now)
+    evs = feed_text(b, "password: abc123 hello ", clock)
+    assert [e["text"] for e in evs] == ["hello"]
+
+
+def test_sensitive_key_live_suppressed_while_typing_value():
+    """B-1：正在打值的时候，live 跟进与停顿兜底都不出事件。"""
+    clock = Clock()
+    b = td.TypingBuffer(now_fn=clock.now)
+    feed_text(b, "password:", clock)
+    for ch in "ab":
+        b.feed(ch, now=clock.now())
+        clock.advance(0.05)
+    clock.advance(0.3)
+    assert b.tick(now=clock.now()) is None
+    clock.advance(1.0)
+    assert b.tick(now=clock.now()) is None
+    assert feed_text(b, "c123 ", clock) == []
+
+
+def test_sensitive_key_backspace_clears_pending():
+    """B-1：值被退格删空后，待命解除，后面的正常词照常翻。"""
+    clock = Clock()
+    b = td.TypingBuffer(now_fn=clock.now)
+    feed_text(b, "password: ab", clock)
+    b.feed("\b", now=clock.now())
+    b.feed("\b", now=clock.now())
+    evs = feed_text(b, "hello ", clock)
+    assert [e["text"] for e in evs] == ["hello"]
+
+
+def test_normal_keyword_without_colon_still_translates():
+    """B-1 反向：键名后面没跟 :/= 时照常翻，不误杀正常句子。"""
+    clock = Clock()
+    b = td.TypingBuffer(now_fn=clock.now)
+    evs = feed_text(b, "my password is strong ", clock)
+    assert [e["text"] for e in evs] == ["my", "password", "is", "strong"]
+    b = td.TypingBuffer(now_fn=clock.now)
+    evs = feed_text(b, "the token expires soon ", clock)
+    assert [e["text"] for e in evs] == ["the", "token", "expires", "soon"]
+
+
 def test_word_scope_live_is_current_word_only():
     """word 模式下 live 只跟当前词，不带上已打完的词。"""
     clock = Clock()

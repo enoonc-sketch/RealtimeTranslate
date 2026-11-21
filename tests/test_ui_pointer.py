@@ -6,7 +6,7 @@ import desktop_translator as dt, offline_engine as oe, pack_downloader as pd
 from make_fake_model import make_pkg
 
 tmp = tempfile.mkdtemp(); srv = os.path.join(tmp, "srv"); os.makedirs(srv)
-dt.DATA_DIR = os.path.join(tmp, "data"); dt.CONFIG_PATH = os.path.join(dt.DATA_DIR, "config.json")
+dt.DATA_DIR = os.path.join(tmp, "data"); dt.CONFIG_PATH = os.path.join(dt.DATA_DIR, "config.json"); dt.HISTORY_PATH = os.path.join(dt.DATA_DIR, "history.db")
 dt.USER_MODELS_DIR = os.path.join(dt.DATA_DIR, "models")
 en = ["hello world this is a test", "good morning everyone"] * 8; zh = ["你好世界这是一个测试", "大家早上好"] * 8
 mk = os.path.join(tmp, "mk")

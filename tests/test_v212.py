@@ -38,7 +38,7 @@ def pump(sec, until=None):
 
 got = dt.collect_diag_info(app)
 ok("collect diag from live app has six keys",
-   all(k in got for k in ("version", "python", "os", "dpi", "ocr", "hotkeys")) and got["version"] == "2.14.0")
+   all(k in got for k in ("version", "python", "os", "dpi", "ocr", "hotkeys")) and got["version"] == "2.15.4")
 ok("collect diag hotkeys cover all six hotkeys", len(got["hotkeys"]) == 6)
 ok("collect diag never crashes on missing pieces", all(isinstance(v, str) or isinstance(v, list) for v in got.values()))
 app._copy_diag_info()
@@ -48,7 +48,7 @@ try:
 except Exception:
     pass
 ok("copy diag puts text on clipboard and reports it",
-   "2.14.0" in clip and "诊断信息已复制" in app.status.cget("text"))
+   "2.15.4" in clip and "诊断信息已复制" in app.status.cget("text"))
 
 # ---- 2. 看门狗 ----
 log = os.path.join(tmp, "watchdog.log")

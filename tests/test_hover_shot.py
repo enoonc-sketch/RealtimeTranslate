@@ -12,6 +12,7 @@ import desktop_translator as dt
 
 tmp = tempfile.mkdtemp()
 dt.DATA_DIR = tmp
+dt.HISTORY_PATH = os.path.join(tmp, "history.db")
 dt.CONFIG_PATH = os.path.join(tmp, "config.json")
 dt.g_translate = lambda t, sl, tl, attempts=3, timeout=12: ("译:" + t[:20], "en")
 app = dt.App()

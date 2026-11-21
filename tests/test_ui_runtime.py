@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(HERE)); sys.path.insert(0, HERE)
 import desktop_translator as dt, offline_engine as oe, pack_downloader as pd, runtime_installer as ri
 
 tmp = tempfile.mkdtemp(); srv = os.path.join(tmp, "srv"); os.makedirs(os.path.join(srv, "whl"))
-dt.DATA_DIR = os.path.join(tmp, "data"); dt.CONFIG_PATH = os.path.join(dt.DATA_DIR, "config.json")
+dt.DATA_DIR = os.path.join(tmp, "data"); dt.CONFIG_PATH = os.path.join(dt.DATA_DIR, "config.json"); dt.HISTORY_PATH = os.path.join(dt.DATA_DIR, "history.db")
 dt.USER_MODELS_DIR = os.path.join(dt.DATA_DIR, "models")
 tag, LX = ri.py_tag(), "manylinux_2_17_x86_64"
 files = {}

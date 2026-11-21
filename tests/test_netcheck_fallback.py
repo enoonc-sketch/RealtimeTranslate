@@ -34,7 +34,7 @@ check("only offline -> 离线", R([C("net", True), C("google", False), C("ms", F
 r = R([C("net", False), C("google", False), C("ms", False), C("offline", None)])
 check("nothing -> None/bad, mentions 无法联网", r.engine is None and r.level == "bad" and "无法联网" in r.message)
 r = R([C("net", True), C("google", False), C("ms", False), C("offline", None)])
-check("net ok but engines blocked -> distinct message", r.engine is None and "拦截" in r.message)
+check("net ok but engines blocked -> distinct message", r.engine is None and "限流" in r.message and "已下线" in r.message)
 
 # ---- run_all with fake engines: failure classification + timeout doesn't hang
 nc.check_connectivity = lambda: nc.Check("net", "基础联网（外网 TCP 直连）", True, 20)

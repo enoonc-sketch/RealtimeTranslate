@@ -113,6 +113,10 @@ ok("translate_many keeps order", outs == ["译:t%d" % i for i in range(500)])
 ok("translate_many empty", dt.translate_many([], "en", "zh-CN", "Google") == [])
 
 # 一段失败：其余排队任务快速退出，抛的是真错误而不是 cancelled
+# 注意：先关掉自动离线回退，否则在线抛错后会走离线回退（那是预期行为），
+# 失败就不会向上传播；这里测的是"无回退可用时失败要传播、其余任务要停下"。
+_prev_auto_offline = dt.AUTO_OFFLINE
+dt.AUTO_OFFLINE = False
 calls = []
 
 
@@ -132,6 +136,7 @@ try:
 except Exception as e:      # noqa: BLE001
     ok("failure propagates as the real error", "boom" in str(e) or "ValueError" in repr(e))
 ok("after a failure the rest of 3000 are not all attempted (%d)" % len(calls), len(calls) < 600)
+dt.AUTO_OFFLINE = _prev_auto_offline
 dt.g_translate = lambda t, sl, tl: ("译:" + t[:20], "en")
 
 # 取消
@@ -220,7 +225,7 @@ ok("installer asks before deleting data",
    and "DelTree(DataDir" in iss)
 ok("default button is No, silent uninstall keeps data",
    "MB_DEFBUTTON2" in iss and "UninstallSilent" in iss)
-ok("installer version bumped", '#define MyAppVersion "2.14.0"' in iss and dt.__version__ == "2.14.0")
+ok("installer version bumped", '#define MyAppVersion "2.15.4"' in iss and dt.__version__ == "2.15.4")
 
 # ======================================================================
 # 5. 界面：关闭 / 最小化 / 整窗翻译 / 大文档 / 取消
