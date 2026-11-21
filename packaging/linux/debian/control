@@ -1,0 +1,14 @@
+Package: realtime-translate
+Version: 2.15.4
+Section: utils
+Priority: optional
+Architecture: ARCH
+Maintainer: Realtime Translate <noreply@realtimetranslate.invalid>
+Depends: libc6 (>= 2.31), libx11-6, libxtst6
+Recommends: tesseract-ocr, tesseract-ocr-chi-sim, xclip
+Installed-Size: SIZE
+Homepage: https://github.com/
+Description: 实时翻译 - 划词 / 取词 / 截图 OCR 翻译
+ 选中文字按快捷键即译；支持指针取词、截图 OCR，
+ Google / 微软 / Lingva / MyMemory / DeepL / 百度 / 有道等在线引擎和本地离线引擎。
+ 全局快捷键需要 X11 会话（Wayland 下不可用）。

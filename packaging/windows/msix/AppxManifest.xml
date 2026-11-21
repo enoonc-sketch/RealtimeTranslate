@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MSIX 清单（Microsoft Store / 企业 Intune 分发）。Publisher 必须和签名证书的 Subject 完全一致。 -->
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+         IgnorableNamespaces="uap desktop rescap">
+  <Identity Name="RealtimeTranslate.App" Publisher="CN=Realtime Translate" Version="2.15.4.0" ProcessorArchitecture="x64"/>
+  <Properties>
+    <DisplayName>实时翻译</DisplayName>
+    <PublisherDisplayName>Realtime Translate</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.22631.0"/>
+  </Dependencies>
+  <Resources><Resource Language="zh-CN"/><Resource Language="en-US"/></Resources>
+  <Applications>
+    <Application Id="RealtimeTranslate" Executable="RealtimeTranslate.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements DisplayName="实时翻译" Description="划词、取词、截图 OCR 翻译"
+                          BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png"
+                          Square44x44Logo="Assets\Square44x44Logo.png"/>
+      <Extensions>
+        <!-- MSIX 里注册表 Run 键不可用，开机自启改用 StartupTask（用户可在「任务管理器 → 启动」里关） -->
+        <desktop:Extension Category="windows.startupTask" Executable="RealtimeTranslate.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="RealtimeTranslateStartup" Enabled="false" DisplayName="实时翻译"/>
+        </desktop:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+  <Capabilities>
+    <Capability Name="internetClient"/>
+    <rescap:Capability Name="runFullTrust"/>
+  </Capabilities>
+</Package>

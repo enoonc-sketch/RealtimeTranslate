@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.realtimetranslate.app</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <name>实时翻译</name>
+  <name xml:lang="en">Realtime Translate</name>
+  <summary>划词、取词、截图 OCR 翻译</summary>
+  <description><p>选中文字按快捷键即译；支持指针取词、截图 OCR、Google / 微软 / DeepL / 百度 / 有道等引擎和本地离线引擎。</p></description>
+  <launchable type="desktop-id">realtime-translate.desktop</launchable>
+  <releases><release version="2.15.4" date="2026-11-22"/></releases>
+  <content_rating type="oars-1.1"/>
+</component>

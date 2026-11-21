@@ -1,0 +1,22 @@
+{
+    "version": "2.15.4",
+    "description": "实时翻译：划词、指针取词、截图 OCR 翻译",
+    "homepage": "https://github.com/OWNER/RealtimeTranslate",
+    "license": "Proprietary",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/OWNER/RealtimeTranslate/releases/download/v2.15.4/RealtimeTranslate_v2.15.4_portable.zip",
+            "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "extract_dir": "RealtimeTranslate"
+        }
+    },
+    "bin": "RealtimeTranslate.exe",
+    "shortcuts": [["RealtimeTranslate.exe", "实时翻译"]],
+    "notes": "设置和历史保存在 %APPDATA%\\RealtimeTranslate，卸载不会删除。",
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": { "url": "https://github.com/OWNER/RealtimeTranslate/releases/download/v$version/RealtimeTranslate_v$version_portable.zip" }
+        }
+    }
+}

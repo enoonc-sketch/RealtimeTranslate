@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=实时翻译
+Name[en]=Realtime Translate
+GenericName=Translator
+GenericName[zh_CN]=翻译工具
+Comment=划词、指针取词、截图 OCR 翻译，支持离线引擎
+Exec=realtime-translate %U
+Icon=realtime-translate
+Terminal=false
+Categories=Office;Utility;Dictionary;
+Keywords=translate;translation;dictionary;OCR;翻译;词典;
+StartupNotify=true
+StartupWMClass=Tk

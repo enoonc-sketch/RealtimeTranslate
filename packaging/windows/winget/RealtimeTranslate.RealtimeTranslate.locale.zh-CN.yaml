@@ -1,0 +1,11 @@
+PackageIdentifier: RealtimeTranslate.RealtimeTranslate
+PackageVersion: 2.15.4
+PackageLocale: zh-CN
+Publisher: Realtime Translate
+PackageName: 实时翻译
+License: Proprietary
+ShortDescription: 划词、指针取词、截图 OCR 翻译，支持离线引擎
+Tags: [translate, translation, ocr, dictionary, 翻译]
+ReleaseNotesUrl: https://github.com/OWNER/RealtimeTranslate/releases/tag/v2.15.4
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

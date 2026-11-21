@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "realtime-translate"
+version = "2.15.4"
+description = "实时翻译：划词 / 指针取词 / 悬停取词 / 截图 OCR 翻译，支持离线引擎"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "Realtime Translate" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications",
+    "Topic :: Text Processing :: Linguistic",
+]
+# Windows 上只用标准库；macOS / Linux 的全局快捷键需要 pynput
+dependencies = ["pynput>=1.7; sys_platform != 'win32'"]
+
+[project.optional-dependencies]
+# 离线翻译引擎（体积大，按需装）：pip install "realtime-translate[offline]"
+offline = ["ctranslate2>=4.0", "sentencepiece>=0.2", "numpy>=1.24", "pyyaml>=6"]
+build = ["pyinstaller==6.22.3"]
+test = ["pytest>=7"]
+
+[project.gui-scripts]
+realtime-translate = "desktop_translator:main"
+
+[tool.setuptools]
+py-modules = [
+    "desktop_translator", "tray_win32", "screen_win", "ocr_win", "ocr_backends", "history_store",
+    "tts_win", "stt_win", "doc_translate", "pdf_translate", "glossary", "update_check", "clip_image",
+    "single_instance", "settings_io", "runtime_stdlib", "runtime_installer", "pack_downloader",
+    "offline_engine", "netcheck", "ui_platform", "typing_detect", "translator_tools", "license", "pet_win", "pet_state",
+    "pet_pack", "pet_catalog",
+]
+
+[tool.setuptools.data-files]
+"share/realtime-translate" = ["app.ico", "winocr.ps1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

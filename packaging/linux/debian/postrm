@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+if command -v update-desktop-database >/dev/null 2>&1; then update-desktop-database -q /usr/share/applications || true; fi
+# purge 也不删用户家目录里的数据（Debian 政策：包不碰 $HOME）；提示一句
+if [ "$1" = "purge" ]; then
+  echo "实时翻译已清除。各用户的翻译历史和设置仍在 ~/.config/RealtimeTranslate，需要的话请手动删除。"
+fi
+exit 0

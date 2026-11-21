@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>realtime-translate</id>
+    <version>2.15.4</version>
+    <title>实时翻译 (Realtime Translate)</title>
+    <authors>Realtime Translate</authors>
+    <projectUrl>https://github.com/OWNER/RealtimeTranslate</projectUrl>
+    <tags>translate translation ocr dictionary</tags>
+    <summary>划词、指针取词、截图 OCR 翻译</summary>
+    <description>选中文字按快捷键即译；支持指针取词、截图 OCR、多种在线引擎和本地离线引擎。</description>
+  </metadata>
+  <files><file src="tools\**" target="tools"/></files>
+</package>

@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+# 卸载 / 升级前结束正在运行的程序（用户数据在各用户的 ~/.config/RealtimeTranslate，dpkg 不碰）
+pkill -f /opt/realtime-translate/realtime-translate 2>/dev/null || true
+exit 0
