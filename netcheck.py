@@ -61,7 +61,7 @@ def explain_error(exc):
         return "连接被重置", "被防火墙/代理中断，尝试换网络或换引擎"
     if isinstance(reason, OSError):
         return "网络不可达", "检查网线/Wi-Fi 是否已连接，以及是否开启了飞行模式"
-    return str(reason)[:100] or exc.__class__.__name__, "请检查网络后重试"
+    return str(reason)[:100] or type(exc).__name__, "请检查网络后重试"
 
 
 def is_connectivity_error(exc):
@@ -90,16 +90,32 @@ def _run_with_timeout(fn, timeout):
     return box.get("r"), box.get("e")
 
 
+def _tcp_probe(host, port, timeout=4):
+    """TCP 直连一次，返回耗时 ms；失败抛 OSError。"""
+    t0 = time.time()
+    with socket.create_connection((host, port), timeout=timeout):
+        return (time.time() - t0) * 1000
+
+
 def check_connectivity():
-    best, errs = None, []
-    for ip, port in PROBE_IPS:
-        t0 = time.time()
+    # v2.15.3：几个探针并行跑（旧版串行，全不通时要等 4 秒 × N）
+    best, errs, lock = None, [], threading.Lock()
+
+    def one(ip, port):
+        nonlocal best
         try:
-            with socket.create_connection((ip, port), timeout=4):
-                ms = (time.time() - t0) * 1000
+            ms = _tcp_probe(ip, port)
+            with lock:
                 best = ms if best is None else min(best, ms)
         except OSError as e:
-            errs.append(e)
+            with lock:
+                errs.append(e)
+
+    ts = [threading.Thread(target=one, args=pp, daemon=True) for pp in PROBE_IPS]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(5)
     if best is not None:
         return Check("net", "基础联网（外网 TCP 直连）", True, best)
     why, hint = explain_error(errs[-1]) if errs else ("无法连接", "")
@@ -144,6 +160,54 @@ def check_proxy():
                  "程序会自动使用系统代理；若翻译失败，请确认代理软件正在运行")
 
 
+def parse_proxy_hostport(url):
+    """'http://user:pw@127.0.0.1:7890' -> ('127.0.0.1', 7890)；解析不了返回 None（纯函数）。"""
+    try:
+        import urllib.parse as up
+        u = up.urlsplit(url if "://" in url else "http://" + url)
+        if not u.hostname:
+            return None
+        return u.hostname, int(u.port or (443 if u.scheme == "https" else 80))
+    except Exception:      # noqa: BLE001
+        return None
+
+
+def check_proxy_alive(url):
+    """v2.15.3：代理端口到底有没有在监听。国内最常见的故障是「系统 / 程序里配了代理，
+    但代理软件没开」——旧版只会报 Google 超时 / 连接被拒，用户看不出原因。"""
+    hp = parse_proxy_hostport(url or "")
+    if not hp:
+        return None
+    try:
+        ms = _tcp_probe(hp[0], hp[1], timeout=3)
+        return Check("proxy_alive", "代理端口", True, ms, "%s:%d 正在监听" % hp)
+    except OSError as e:
+        why, _ = explain_error(e)
+        return Check("proxy_alive", "代理端口", False, None, "%s:%d %s" % (hp[0], hp[1], why),
+                     "代理软件可能没开或端口填错：打开代理软件，或在设置里关掉代理 / 改成正确端口")
+
+
+def effective_proxy(app_proxy=None):
+    """程序内自定义代理优先，否则系统代理；都没有返回 None。"""
+    if app_proxy:
+        return app_proxy
+    try:
+        pr = urllib.request.getproxies()
+        return pr.get("https") or pr.get("http") or None
+    except Exception:      # noqa: BLE001
+        return None
+
+
+def check_endpoint_tcp(key, name, host, port=443):
+    """端点 TCP 可达性：DNS 通但 443 不通 = 被防火墙 / 运营商拦截，和「服务坏了」区分开。"""
+    try:
+        ms = _tcp_probe(host, port, timeout=4)
+        return Check(key, name, True, ms)
+    except OSError as e:
+        why, hint = explain_error(e)
+        return Check(key, name, False, None, why, hint)
+
+
 def check_engine(key, name, fn, timeout=15, http404_reason=None):
     """fn() 应发起一次最小翻译（单次尝试），成功返回非空译文。
 
@@ -178,6 +242,7 @@ def recommend(checks, current=None):
     by = {c.key: c for c in checks}
     ok = lambda k: bool(by.get(k) and by[k].ok)   # noqa: E731
     g, m, o = ok("google"), ok("ms"), ok("offline")
+    extra = [(k, n_) for k, n_ in (("lingva", "Lingva"), ("mymemory", "MyMemory")) if ok(k)]
 
     def faster():
         return "Google" if (by["google"].ms or 1e9) <= (by["ms"].ms or 1e9) else "微软"
@@ -189,8 +254,14 @@ def recommend(checks, current=None):
         return Recommendation("Google", "Google 可用，微软不可用；建议使用 Google。", "ok")
     if m:
         return Recommendation("微软", "Google 不可用但微软可用；建议使用「微软」引擎。", "warn")
+    if extra:
+        return Recommendation(extra[0][1], "Google 和微软都不可用，但内置的「%s」可用；建议切换到它，或选「自动」。"
+                              % extra[0][1], "warn")
     if o:
         return Recommendation("离线", "在线引擎都不可用，但离线引擎可用；建议使用「离线」，或开启「断网时自动改用离线」。", "warn")
+    pa = by.get("proxy_alive")
+    if pa is not None and pa.ok is False:
+        return Recommendation(None, "配置了代理但代理端口连不上（%s）：请先打开代理软件，或关闭代理后重试。" % pa.detail, "bad")
     if not ok("net"):
         return Recommendation(None, "本机无法联网，且没有可用的离线引擎。请先恢复网络连接。", "bad")
     return Recommendation(None, "能上外网，但 Google 被限流（HTTP 429，代理出口 IP 被 Google 限流，只能等一等或换网络）、"
@@ -198,7 +269,9 @@ def recommend(checks, current=None):
                           "建议装离线版用离线翻译，在线失败时会自动回退到离线。", "bad")
 
 
-def run_all(google_fn, ms_fn, offline_info, on_item=None, cancelled=None):
+def run_all(google_fn, ms_fn, offline_info, on_item=None, cancelled=None, proxy_url=None,
+            total_timeout=30, extra_engines=None):
+    """extra_engines：[(key, 名称, fn), ...] 额外的内置引擎（v2.15.4：Lingva / MyMemory）。"""
     """并行执行全部检测。on_item(Check) 每完成一项回调一次（可能在后台线程）。返回 (checks, Recommendation)。"""
     jobs = [
         ("net", check_connectivity),
@@ -210,12 +283,21 @@ def run_all(google_fn, ms_fn, offline_info, on_item=None, cancelled=None):
             "微软免费取 token 的接口已下线，不是代理拦截；微软引擎暂时不可用，请改用 Google 或离线"))),
         ("offline", lambda: check_offline(offline_info)),
     ]
+    for ek, ename, efn in (extra_engines or []):
+        jobs.insert(-1, (ek, lambda ek=ek, ename=ename, efn=efn: check_engine(ek, ename, efn)))
+    if proxy_url:
+        jobs.insert(3, ("proxy_alive", lambda: check_proxy_alive(proxy_url)))
     results, lock = {}, threading.Lock()
 
     def work(key, fn):
         if cancelled and cancelled():
             return
-        c = fn()
+        try:
+            c = fn()
+        except Exception as e:      # noqa: BLE001  一项检测出错不能拖垮整份报告
+            c = Check(key, key, False, None, "检测出错：%s" % str(e)[:80])
+        if c is None:
+            return
         with lock:
             results[key] = c
         if on_item:
@@ -224,8 +306,9 @@ def run_all(google_fn, ms_fn, offline_info, on_item=None, cancelled=None):
     threads = [threading.Thread(target=work, args=j, daemon=True) for j in jobs]
     for t in threads:
         t.start()
+    end = time.monotonic() + total_timeout     # v2.15.3：整体最多等 total_timeout 秒（旧版每项 40 秒串着等）
     for t in threads:
-        t.join(40)
+        t.join(max(0.0, end - time.monotonic()))
     checks = [results[k] for k, _ in jobs if k in results]
     return checks, recommend(checks)
 

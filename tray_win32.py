@@ -64,10 +64,39 @@ _TPM_RIGHTBUTTON = 0x0002
 _TPM_RETURNCMD = 0x0100
 
 
+def _wt():
+    """ctypes.wintypes 缺 LRESULT / HCURSOR 等类型（标准库从没定义过），
+    旧代码直接用 wt.LRESULT 会抛 AttributeError，被 _loop 的 except 吞掉，
+    表现为「托盘不可用」且没有任何报错。这里统一补齐。"""
+    import ctypes
+    import ctypes.wintypes as wt
+    if not hasattr(wt, "LRESULT"):
+        wt.LRESULT = ctypes.c_ssize_t
+    for n in ("HCURSOR", "HBRUSH", "HICON", "HMENU", "HINSTANCE", "HMODULE"):
+        if not hasattr(wt, n):
+            setattr(wt, n, wt.HANDLE)
+    if not hasattr(wt, "LPVOID"):
+        wt.LPVOID = ctypes.c_void_p
+    if not hasattr(wt, "ATOM"):
+        wt.ATOM = wt.WORD
+    return wt
+
+
+def _log(msg):
+    """托盘失败原因写到 %TEMP%/RealtimeTranslate_tray.log，便于排查。"""
+    try:
+        import tempfile, time
+        with open(os.path.join(tempfile.gettempdir(), "RealtimeTranslate_tray.log"),
+                  "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
 def _shell_notify(code, data):
     """Shell_NotifyIconW 的带类型声明封装（线程外也能用）。"""
     import ctypes
-    import ctypes.wintypes as wt
+    wt = _wt()
     fn = ctypes.WinDLL("shell32", use_last_error=True).Shell_NotifyIconW
     fn.restype = wt.BOOL
     fn.argtypes = [wt.DWORD, ctypes.c_void_p]
@@ -76,7 +105,7 @@ def _shell_notify(code, data):
 
 def _post_message(hwnd, msg, wparam=0, lparam=0):
     import ctypes
-    import ctypes.wintypes as wt
+    wt = _wt()
     fn = ctypes.WinDLL("user32", use_last_error=True).PostMessageW
     fn.restype = wt.BOOL
     fn.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
@@ -121,7 +150,7 @@ class TrayIcon:
             self._ready.clear()
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
-            self._ready.wait(5)
+            self._ready.wait(8)
             return self.is_running()
         except Exception:
             return False
@@ -157,7 +186,7 @@ class TrayIcon:
             return False
         try:
             import ctypes
-            import ctypes.wintypes as wt
+            wt = _wt()
 
             class NOTIFYICONDATAW(ctypes.Structure):
                 _fields_ = [
@@ -186,7 +215,7 @@ class TrayIcon:
     # -- 内部：消息循环线程 ---------------------------------------------
     def _notify_data(self, tip=None):
         import ctypes
-        import ctypes.wintypes as wt
+        wt = _wt()
 
         class NOTIFYICONDATAW(ctypes.Structure):
             _fields_ = [
@@ -254,7 +283,7 @@ class TrayIcon:
     def _show_menu(self, user32):
         try:
             import ctypes
-            import ctypes.wintypes as wt
+            wt = _wt()
 
             items = None
             if self.menu_provider is not None:
@@ -302,7 +331,7 @@ class TrayIcon:
     def _loop(self):
         try:
             import ctypes
-            import ctypes.wintypes as wt
+            wt = _wt()
 
             # 用 use_last_error 的独立 WinDLL，才能可靠拿到 GetLastError；
             # 并给用到的函数声明 argtypes / restype：不声明的话 64 位 Python 会把
@@ -357,7 +386,7 @@ class TrayIcon:
                 if msg == _WM_TRAY:
                     # lParam 是鼠标消息：左键双击 / 左键弹起显示，右键弹起出菜单
                     low = lparam & 0xFFFF
-                    if low in (0x0203, 0x0202):         # WM_LBUTTONDBLCLK / UP
+                    if low == 0x0202:                    # WM_LBUTTONUP（双击会先触发 UP，不再重复）
                         self._call(self.on_show)
                     elif low == 0x0205:                 # WM_RBUTTONUP
                         self._show_menu(user32)
@@ -404,7 +433,7 @@ class TrayIcon:
                 ]
 
             hinst = kernel32.GetModuleHandleW(None)
-            cls_name = "RealtimeTranslateTray"
+            cls_name = "RealtimeTranslateTray_%d_%d" % (os.getpid(), id(self))
             wc = WNDCLASSW()
             wc.style = 0
             wc.lpfnWndProc = self._wndproc
@@ -420,6 +449,7 @@ class TrayIcon:
             hwnd = user32.CreateWindowExW(
                 0, cls_name, self.tooltip, 0, 0, 0, 0, 0, None, None, hinst, None)
             if not hwnd:
+                _log("CreateWindowExW failed, err=%s" % ctypes.get_last_error())
                 self._ready.set()
                 return
             self._hwnd = hwnd
@@ -440,8 +470,16 @@ class TrayIcon:
                 hicon = user32.LoadIconW(None, _IDI_APPLICATION)
             self._hicon = hicon
 
+            import time
             data = self._notify_data()
-            if not shell32.Shell_NotifyIconW(_NIM_ADD, ctypes.byref(data)):
+            ok = False
+            for _ in range(10):          # 开机自启时资源管理器可能还没就绪，重试约 5 秒
+                if shell32.Shell_NotifyIconW(_NIM_ADD, ctypes.byref(data)):
+                    ok = True
+                    break
+                time.sleep(0.5)
+            if not ok:
+                _log("Shell_NotifyIconW(NIM_ADD) failed, err=%s" % ctypes.get_last_error())
                 user32.DestroyWindow(hwnd)
                 self._hwnd = None
                 self._ready.set()
@@ -450,10 +488,12 @@ class TrayIcon:
             self._started = True
             self._ready.set()
             msg = wt.MSG()
-            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
-        except Exception:
+        except Exception as e:
+            import traceback
+            _log("tray loop error: %r\n%s" % (e, traceback.format_exc()))
             self._ready.set()
         finally:
             try:

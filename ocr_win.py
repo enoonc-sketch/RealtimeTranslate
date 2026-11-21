@@ -288,25 +288,71 @@ def ocr_words(image_path, lang=None, timeout=20):
     return [w for w in words if w["text"]]
 
 
+_PUNCT = " \t\r\n.,;:!?\"'()[]{}<>«»“”‘’，。；：！？、（）【】《》「」『』…·—–-_/\\|*#@~`^"
+
+
+def clean_word(text):
+    """去掉 OCR 单词两头的标点（"world," → "world"，"(test)" → "test"）；去完为空返回原文。"""
+    t = (text or "").strip()
+    c = t.strip(_PUNCT)
+    return c or t
+
+
+def _cjk_run(words, idx, max_chars=8):
+    """中日韩：系统 OCR 常把每个汉字拆成一个「词」。把光标所在字左右同一行、
+    紧挨着的汉字连成一串（最多 max_chars 个字），翻译「一个字」没意义。"""
+    base = words[idx]
+    if not any(_is_cjk(ch) for ch in base.get("text", "")):
+        return base.get("text", "")
+    h = max(base["h"], 1)
+    row = [w for w in words
+           if abs((w["y"] + w["h"] / 2.0) - (base["y"] + base["h"] / 2.0)) <= h * 0.6
+           and any(_is_cjk(ch) for ch in w.get("text", ""))]
+    row.sort(key=lambda w: w["x"])
+    pos = row.index(base) if base in row else 0
+    lo = hi = pos
+    gap = h * 0.8
+    while lo > 0 and row[lo]["x"] - (row[lo - 1]["x"] + row[lo - 1]["w"]) <= gap:
+        lo -= 1
+    while hi < len(row) - 1 and row[hi + 1]["x"] - (row[hi]["x"] + row[hi]["w"]) <= gap:
+        hi += 1
+    seg = row[lo:hi + 1]
+    text = "".join(w["text"] for w in seg)
+    if len(text) > max_chars:           # 太长：以光标那个字为中心截一段
+        start = sum(len(w["text"]) for w in seg[:pos - lo])
+        a = max(0, min(start - max_chars // 2, len(text) - max_chars))
+        text = text[a:a + max_chars]
+    return text
+
+
 def pick_word_at(words, px, py):
     """在单词列表里挑离 (px, py) 最近的单词；没有返回 None。
 
-    优先选包住光标的单词，其次选中心点最近的（放宽到 1.5 倍字高，
-    否则光标刚好落在词间空隙时会取不到）。
+    优先选包住光标的单词（多个时取面积最小、最贴合的），其次选中心点最近的
+    （放宽到 1.5 倍字高，否则光标落在词间空隙时会取不到）。
+    v2.15.2：结果去掉两头标点；中文把相邻汉字连成词组。
     """
     if not words:
         return None
-    inside = [w for w in words
+    words = [w for w in words if isinstance(w, dict) and (w.get("text") or "").strip()]
+    if not words:
+        return None
+    inside = [i for i, w in enumerate(words)
               if w["x"] <= px <= w["x"] + w["w"] and w["y"] <= py <= w["y"] + w["h"]]
+    idx = None
     if inside:
-        return inside[0]["text"]
-    best, best_d = None, None
-    for w in words:
-        cx, cy = w["x"] + w["w"] / 2.0, w["y"] + w["h"] / 2.0
-        d = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
-        if d <= max(w["h"], 12) * 1.5 and (best_d is None or d < best_d):
-            best, best_d = w, d
-    return best["text"] if best else None
+        idx = min(inside, key=lambda i: words[i]["w"] * words[i]["h"])
+    else:
+        best_d = None
+        for i, w in enumerate(words):
+            cx, cy = w["x"] + w["w"] / 2.0, w["y"] + w["h"] / 2.0
+            dd = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+            if dd <= max(w["h"], 12) * 1.5 and (best_d is None or dd < best_d):
+                idx, best_d = i, dd
+    if idx is None:
+        return None
+    out = clean_word(_cjk_run(words, idx))
+    return out or None
 
 
 # ---------------------------------------------------------------------------

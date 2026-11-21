@@ -179,7 +179,173 @@ def apply_styles(root, family, size):
         style.configure("TNotebook.Tab", font=(family, max(8, size - 1)), padding=(10, 4))
     except Exception:      # noqa: BLE001
         pass
+    configure_common_labels(style, family, size)
     return style
+
+
+def configure_common_labels(style, family, size, gray="#5b6676", accent="#0a64d8"):
+    """v2.15.4：设置窗口用的说明文字 / 分组标题 / 搜索命中高亮样式，所有主题都要有。"""
+    small = max(8, size - 2)
+    try:
+        style.configure("Note.TLabel", foreground=gray, font=(family, small))
+        style.configure("Section.TLabel", foreground=gray, font=(family, max(8, size - 1), "bold"))
+        style.configure("Found.TCheckbutton", foreground=accent)
+        style.configure("Found.TLabel", foreground=accent, font=(family, max(8, size - 1), "bold"))
+    except Exception:      # noqa: BLE001
+        pass
+
+
+# ---------------------------------------------------------------- v2.15.1 苹果风格（macOS 质感）
+APPLE_LIGHT = {"bg": "#f5f5f7", "card": "#ffffff", "fg": "#1d1d1f", "gray": "#6e6e73",
+               "border": "#d2d2d7", "hover": "#e8e8ed", "press": "#dcdce1",
+               "accent": "#0071e3", "accent_hover": "#0077ed", "accent_press": "#006edb",
+               "accent_fg": "#ffffff", "select": "#b3d7ff", "error": "#d70015"}
+APPLE_DARK = {"bg": "#1c1c1e", "card": "#2c2c2e", "fg": "#f5f5f7", "gray": "#a1a1a6",
+              "border": "#3a3a3c", "hover": "#3a3a3c", "press": "#48484a",
+              "accent": "#0a84ff", "accent_hover": "#409cff", "accent_press": "#0071e3",
+              "accent_fg": "#ffffff", "select": "#1f4f8f", "error": "#ff453a"}
+APPLE_FONT_CANDIDATES = {
+    "win": ["Microsoft YaHei UI", "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei"],
+    "mac": ["PingFang SC", "SF Pro Text", "Helvetica Neue"],
+    "linux": UI_FONT_CANDIDATES["linux"],
+}
+
+
+def apple_palette(dark=False):
+    return dict(APPLE_DARK if dark else APPLE_LIGHT)
+
+
+def apply_apple_style(root, family, size, dark=False):
+    """苹果风格：浅灰底 + 白色卡片输入框 + 扁平按钮 + 系统蓝强调色 + 细分隔线。
+
+    Windows 原生 vista 主题不让改按钮颜色，所以这里切到 clam（可完全自定义），
+    macOS 上本来就是 aqua，同样切 clam 以保证两端外观一致。失败时静默保持原样。
+    返回调色板 dict。
+    """
+    p = apple_palette(dark)
+    style = ttk.Style(root)
+    try:
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+    except Exception:      # noqa: BLE001
+        return p
+    small = max(8, size - 1)
+    try:
+        style.configure(".", background=p["bg"], foreground=p["fg"], font=(family, small),
+                        bordercolor=p["border"], lightcolor=p["bg"], darkcolor=p["bg"],
+                        troughcolor=p["bg"], focuscolor=p["accent"],
+                        selectbackground=p["select"], selectforeground=p["fg"],
+                        fieldbackground=p["card"], insertcolor=p["fg"])
+        for s in ("TFrame", "TLabelframe"):
+            style.configure(s, background=p["bg"])
+        style.configure("TLabelframe", bordercolor=p["border"], relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background=p["bg"], foreground=p["gray"],
+                        font=(family, small, "bold"))
+        style.configure("TLabel", background=p["bg"], foreground=p["fg"], font=(family, small))
+        style.configure("Secondary.TLabel", background=p["bg"], foreground=p["gray"])
+        style.configure("Title.TLabel", background=p["bg"], foreground=p["fg"],
+                        font=(family, small, "bold"))
+        # 按钮：白色卡片 + 细边，悬停/按下变灰；Accent 是系统蓝主按钮
+        style.configure("TButton", background=p["card"], foreground=p["fg"], relief="flat",
+                        borderwidth=1, bordercolor=p["border"], lightcolor=p["card"],
+                        darkcolor=p["card"], padding=(12, 5), font=(family, small),
+                        focusthickness=0)
+        style.map("TButton",
+                  background=[("pressed", p["press"]), ("active", p["hover"]),
+                              ("disabled", p["bg"])],
+                  foreground=[("disabled", p["gray"])],
+                  lightcolor=[("pressed", p["press"]), ("active", p["hover"])],
+                  darkcolor=[("pressed", p["press"]), ("active", p["hover"])],
+                  bordercolor=[("focus", p["accent"])])
+        style.configure("Accent.TButton", background=p["accent"], foreground=p["accent_fg"],
+                        bordercolor=p["accent"], lightcolor=p["accent"], darkcolor=p["accent"])
+        style.map("Accent.TButton",
+                  background=[("pressed", p["accent_press"]), ("active", p["accent_hover"])],
+                  lightcolor=[("pressed", p["accent_press"]), ("active", p["accent_hover"])],
+                  darkcolor=[("pressed", p["accent_press"]), ("active", p["accent_hover"])],
+                  foreground=[("disabled", p["gray"])])
+        # 下拉框 / 输入框
+        for s in ("TCombobox", "TEntry", "TSpinbox"):
+            style.configure(s, fieldbackground=p["card"], background=p["card"],
+                            foreground=p["fg"], bordercolor=p["border"],
+                            lightcolor=p["card"], darkcolor=p["card"], arrowcolor=p["gray"],
+                            padding=(6, 4), relief="flat")
+            style.map(s, bordercolor=[("focus", p["accent"])],
+                      lightcolor=[("focus", p["accent"])],
+                      fieldbackground=[("readonly", p["card"]), ("disabled", p["bg"])],
+                      foreground=[("disabled", p["gray"])],
+                      selectbackground=[("readonly", p["card"])],
+                      selectforeground=[("readonly", p["fg"])])
+        try:     # 下拉列表本身是 Tk Listbox，用 option 数据库换色
+            root.option_add("*TCombobox*Listbox.background", p["card"])
+            root.option_add("*TCombobox*Listbox.foreground", p["fg"])
+            root.option_add("*TCombobox*Listbox.selectBackground", p["accent"])
+            root.option_add("*TCombobox*Listbox.selectForeground", p["accent_fg"])
+            root.option_add("*TCombobox*Listbox.font", (family, small))
+        except Exception:      # noqa: BLE001
+            pass
+        # 勾选 / 单选：蓝色指示器
+        for s in ("TCheckbutton", "TRadiobutton"):
+            style.configure(s, background=p["bg"], foreground=p["fg"], padding=3,
+                            indicatorbackground=p["card"], indicatorforeground=p["accent_fg"],
+                            font=(family, small))
+            style.map(s, background=[("active", p["bg"])],
+                      indicatorbackground=[("selected", p["accent"]), ("pressed", p["hover"])],
+                      foreground=[("disabled", p["gray"])])
+        # 分段式标签页（类似 macOS 偏好设置）
+        style.configure("TNotebook", background=p["bg"], borderwidth=0, tabmargins=(8, 6, 8, 0))
+        style.configure("TNotebook.Tab", background=p["bg"], foreground=p["gray"],
+                        bordercolor=p["bg"], lightcolor=p["bg"], padding=(14, 6),
+                        font=(family, small))
+        style.map("TNotebook.Tab",
+                  background=[("selected", p["card"]), ("active", p["hover"])],
+                  foreground=[("selected", p["fg"])],
+                  lightcolor=[("selected", p["card"])],
+                  bordercolor=[("selected", p["border"])])
+        # 细滚动条
+        for s in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(s, background=p["border"], troughcolor=p["card"],
+                            bordercolor=p["card"], lightcolor=p["border"], darkcolor=p["border"],
+                            arrowcolor=p["gray"], relief="flat", arrowsize=10)
+            style.map(s, background=[("active", p["gray"]), ("pressed", p["gray"])])
+        # 表格：白底、无竖线、选中系统蓝
+        style.configure("Treeview", background=p["card"], fieldbackground=p["card"],
+                        foreground=p["fg"], bordercolor=p["border"], relief="flat")
+        style.map("Treeview", background=[("selected", p["accent"])],
+                  foreground=[("selected", p["accent_fg"])])
+        style.configure("Treeview.Heading", background=p["bg"], foreground=p["gray"],
+                        relief="flat", bordercolor=p["border"], lightcolor=p["bg"],
+                        darkcolor=p["bg"])
+        style.map("Treeview.Heading", background=[("active", p["hover"])])
+        style.configure("TPanedwindow", background=p["bg"])
+        style.configure("Sash", sashthickness=6, gripcount=0, background=p["bg"],
+                        lightcolor=p["bg"], bordercolor=p["bg"])
+        style.configure("TSeparator", background=p["border"])
+        style.configure("Horizontal.TProgressbar", background=p["accent"], troughcolor=p["hover"],
+                        bordercolor=p["hover"], lightcolor=p["accent"], darkcolor=p["accent"])
+        style.configure("TScale", background=p["bg"], troughcolor=p["hover"])
+        style.configure("TEntry", padding=(6, 4))
+    except Exception:      # noqa: BLE001
+        pass
+    configure_common_labels(style, family, size, gray=p["gray"], accent=p["accent"])
+    for s_ in ("Note.TLabel", "Section.TLabel", "Found.TLabel", "Found.TCheckbutton"):
+        try:
+            style.configure(s_, background=p["bg"])
+        except Exception:      # noqa: BLE001
+            pass
+    return p
+
+
+def style_text_apple(widget, p, family=None, size=None):
+    """tk.Text 换成苹果式「白色卡片」：无粗边框，1px 细边，聚焦时变系统蓝，内边距加大。"""
+    try:
+        widget.configure(background=p["card"], foreground=p["fg"], insertbackground=p["accent"],
+                         relief="flat", borderwidth=0, highlightthickness=1,
+                         highlightbackground=p["border"], highlightcolor=p["accent"],
+                         selectbackground=p["select"], selectforeground=p["fg"],
+                         padx=10, pady=8, insertwidth=2, spacing1=2, spacing3=2)
+    except Exception:      # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------- 自动换行的一排控件

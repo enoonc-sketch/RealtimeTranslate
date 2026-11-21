@@ -19,13 +19,13 @@ _STR_KEYS = frozenset([
     "hotkey_main", "hotkey_pointer", "hotkey_shot", "hotkey_replace",
     "hotkey_clip", "hotkey_window",
     "update_last_check",
-    "proxy_host", "proxy_user", "tts_voice",
+    "proxy_host", "proxy_user", "tts_voice", "settings_tab", "input_trigger", "translate_style",
 ])
 _BOOL_KEYS = frozenset([
     "top", "watch", "smart", "bilingual", "reflow", "show_src",
     "auto_offline", "pointer", "hover", "tray_tip",
     "history_on", "history_reuse", "auto_copy", "dark_mode", "update_auto",
-    "proxy_enabled", "hover_window",
+    "proxy_enabled", "hover_window", "apple_theme", "hover_need_ctrl", "grab_spinner", "input_translate",
 ])
 _INT_KEYS = frozenset([
     "history_max", "mini_w", "mini_h", "hover_ms", "tts_rate", "font_size",
@@ -40,6 +40,8 @@ _HOTKEY_KEYS = frozenset([
 # _check_value 认不出它，永远不写进导出的 JSON；导入时 import_settings
 # 也明确跳过它（安全修复 H-04：别人给的设置文件不能悄悄改走本机代理密码，
 # 否则流量可被引到攻击者的代理上）。密码只存本机 config.json。
+# v2.15：license_*（激活码 / 授权状态 / 试用开始时间 / 已激活机器）同款处理——
+# 只存本机，导出不带出、导入不接受，别人给的设置文件不能悄悄改走本机授权。
 # 数值键的合法范围；mini_w / mini_h 只有下限（正整数）。
 _CLAMPS = {
     "font_size": (10, 18),
@@ -57,6 +59,11 @@ _CLAMPS = {
 # 列给用户确认（见 sensitive_import_changes），不在这里悄悄应用。
 SENSITIVE_IMPORT_KEYS = frozenset([
     "pack_mirror", "proxy_host", "proxy_port", "proxy_enabled", "proxy_user",
+])
+
+_SECRET_EXPORT_SKIP = frozenset([
+    "proxy_pass", "deepl_key", "baidu_key", "youdao_key", "baidu_appid", "youdao_appid",
+    "license_key", "license_status", "license_trial_start", "license_machines",
 ])
 
 _TOP_KEYS = frozenset(["app", "version", "config", "glossary"])
@@ -148,6 +155,8 @@ def export_settings(cfg):
         for key, value in cfg.items():
             if key == "glossary":
                 continue  # 术语表只放顶层，不在 config 里重复
+            if key in _SECRET_EXPORT_SKIP:
+                continue  # v2.15.4：密码 / 引擎 Key / 授权永不导出
             ok, clean = _check_value(key, value, None)
             if ok:
                 config[key] = clean
@@ -196,7 +205,14 @@ def import_settings(text, defaults):
             continue
         # H-04：导入的设置文件永远不接受 proxy_pass —— 别人给的文件不能悄悄
         # 改走本机代理密码；要改密码请在界面「代理密码」栏里自己填。
-        if key == "proxy_pass":
+        if key in ("proxy_pass", "deepl_key", "baidu_key", "youdao_key",
+                   "baidu_appid", "youdao_appid"):
+            # v2.15.4：引擎 Key 同款处理 —— 别人给的设置文件不能悄悄换掉你的 Key
+            ignored += 1
+            continue
+        # v2.15：授权键同款处理 —— 别人给的设置文件不能悄悄改走本机授权状态。
+        if key in ("license_key", "license_status", "license_trial_start",
+                   "license_machines"):
             ignored += 1
             continue
         ok, clean = _check_value(key, value, base)

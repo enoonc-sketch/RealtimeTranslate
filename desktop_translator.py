@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-实时翻译 — 桌面独立版 v2.14，Windows / macOS / Linux(X11)
+实时翻译 — 桌面独立版 v2.15，Windows / macOS / Linux(X11)
 
 功能
   1. 输入即译：窗口里打字或粘贴，停顿约 0.35 秒自动翻译
@@ -62,13 +62,19 @@
      同一气泡内实时更新译文；停顿 1 秒只作兜底。Windows 用标准库 ctypes
      低级键盘钩子 WH_KEYBOARD_LL，macOS / Linux 用 pynput。缓冲只放内存，
      密码框 / 终端 / 敏感内容不翻，关闭时立即停钩子、清空缓冲。
+ 21. v2.15 打字检测翻译改为专业版功能：免费版保留 v2.14 全部其他功能；
+     打字检测翻译需激活码（离线验证，见 license.py）或 7 天试用。
+     未激活时开关置灰、托盘点一下弹激活框；激活状态只存本机 config.json，
+     不随“导出设置”带出去（见 settings_io）。
 """
 import base64
 import collections
 import csv
 import hashlib
 import itertools
+import html
 import json
+import webbrowser
 import math
 import os
 import platform
@@ -108,6 +114,8 @@ except Exception:                      # pragma: no cover
     pet_win = None
 import single_instance
 import typing_detect
+import translator_tools
+import license
 import ui_platform
 import tempfile
 import zlib
@@ -258,7 +266,7 @@ CLOSE_NAMES = {"tray": "隐藏到托盘", "taskbar": "最小化到任务栏", "q
 CLOSE_CODES = {v: k for k, v in CLOSE_NAMES.items()}
 MINIMIZE_NAMES = {"taskbar": "留在任务栏", "tray": "收进托盘"}        # 点窗口 – 最小化时（v2.10）
 MINIMIZE_CODES = {v: k for k, v in MINIMIZE_NAMES.items()}
-__version__ = "2.14.0"
+__version__ = "2.15.4"
 APP_TITLE = "实时翻译"
 RUN_VALUE = "RealtimeTranslate"
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -339,16 +347,37 @@ ARGOS_CODE = {
 AUTO = "自动检测"
 NAME2CODE = {v: k for k, v in LANGS.items()}
 # 标准版 exe 不含离线运行库：此时不显示「离线」，避免选了必报错
-ENGINES = ["Google", "微软"] + (["离线"] if offline_engine.runtime_present() else [])
+# v2.15.4：新增内置免费引擎（都无需 Key）：Lingva（Google 镜像，国内常可直连）、MyMemory；
+# 「自动」= 按顺序试 Google → 微软 → Lingva → MyMemory，哪个先通用哪个，并记住上次成功的。
+ONLINE_ENGINES = ["自动", "Google", "微软", "Lingva", "MyMemory", "DeepL", "百度", "有道"]
+# v2.15.4：需要自备 Key 的引擎（Key 在「高级设置 → 翻译 → 需要 Key 的引擎」里填，盘上 DPAPI 加密）
+KEY_ENGINES = {"DeepL": ("deepl_key",), "百度": ("baidu_appid", "baidu_key"), "有道": ("youdao_appid", "youdao_key")}
+SECRET_KEYS = ("proxy_pass", "deepl_key", "baidu_key", "youdao_key")      # 存盘加密、不导出、不导入
+INPUT_TRIGGER_CODES = {v: k for k, v in translator_tools.INPUT_TRIGGERS.items()}
+STYLE_CODES = {v: k for k, v in translator_tools.STYLES.items()}
+ENGINE_KEY_FIELDS = ("deepl_key", "baidu_appid", "baidu_key", "youdao_appid", "youdao_key")
+ENGINES = ONLINE_ENGINES + (["离线"] if offline_engine.runtime_present() else [])
+ENGINE_HINTS = {
+    "自动": "依次尝试 Google → 微软 → Lingva → MyMemory，优先用上次成功的",
+    "Lingva": "Google 翻译的开源镜像，免费无需 Key；国内常可直连",
+    "MyMemory": "免费无需 Key，每天约 5000 字额度；单次最多 500 字",
+    "DeepL": "需要 DeepL API Key（免费版每月 50 万字）",
+    "百度": "需要百度翻译开放平台 APPID + 密钥（标准版每月 5 万字免费）",
+    "有道": "需要有道智云应用 ID + 应用密钥",
+}
 DEFAULTS = {
-    "pet_mode": "minimized", "pet_id": "cat", "pet_bubble": True, "cute_theme": False,
+    "pet_mode": "minimized", "pet_id": "cat", "pet_bubble": True, "cute_theme": False, "apple_theme": True,
     "sl": "auto", "tl": "zh-CN", "top": True, "watch": False, "smart": True,
     "bilingual": False, "reflow": True, "show_src": True, "geometry": "480x760",
     "engine": "Google", "auto_offline": True,
     "pointer": True, "pointer_scope": "word", "pack_mirror": "",
-    "hover": True, "hover_ms": 800,
+    "hover": True, "hover_ms": 800, "hover_need_ctrl": False, "grab_spinner": True, "input_translate": False, "input_trigger": "space3", "translate_style": "default", "compare_engines": [], "settings_tab": "general", "settings_geometry": "",
     # v2.14 打字检测翻译：默认全部关（typing 开关、停顿毫秒、范围）
     "typing": False, "typing_pause_ms": 1000, "typing_scope": "word",
+    # v2.15 授权：打字检测翻译是专业版功能。license_* 只存本机 config.json，
+    # 照 proxy_pass 的模式不进 settings_io 白名单、不随设置导出/导入。
+    "license_key": "", "license_status": "free", "license_trial_start": 0,
+    "license_machines": [],
     "close_action": "taskbar", "tray_tip": True, "minimize_action": "taskbar",   # v2.13：点 × 默认最小化到任务栏
     "hover_window": False, "live_interval": 5,      # v2.11：悬停整窗翻译、实时刷新间隔（秒）
     # L-05：最短 5 秒——2~3 秒一轮高频 OCR 会把窗口卡住、CPU 占满。
@@ -368,6 +397,8 @@ DEFAULTS = {
     # v2.9：在线翻译引擎代理（默认不用；勾上才走代理。密码只存本机，设置导出不带出）
     "proxy_enabled": False, "proxy_host": "", "proxy_port": 0,
     "proxy_user": "", "proxy_pass": "",
+    # v2.15.4：需要 Key 的引擎（DeepL / 百度 / 有道）。密钥存盘时 DPAPI 加密，不随设置导出 / 导入。
+    "deepl_key": "", "baidu_appid": "", "baidu_key": "", "youdao_appid": "", "youdao_key": "",
     # v2.9：朗读语音（空 = 系统默认语音；下拉框里选的是 Windows 已安装语音的名字）
     "tts_voice": "",
 }
@@ -669,13 +700,21 @@ def _urlopen(req, timeout=None):
     return opener.open(req, timeout=timeout)
 
 
-def g_translate_full(text, sl, tl, attempts=3, timeout=12):
+def g_translate_full(text, sl, tl, attempts=3, timeout=12, deadline=None):
     """Google 翻译（带原始 JSON）：返回 (译文, 检测到的源语言, 原始响应)。
 
     原始响应存在 _LAST_GOOGLE 里，供词典区解析 data[1] 的词典与
     data[0] 的 transliteration（拼音/读音）用；只在 Google 引擎、
     单个词或短词组时才读它。
+
+    deadline（B-4）：单调时钟上的总截止点；None 时先看调用链上 _online
+    在本线程里设好的共享预算（_tl.online_deadline），没有再按
+    ONLINE_TOTAL_TIMEOUT 现算。每次尝试的 socket 超时取 min(timeout,
+    剩余预算），预算耗尽直接抛 TimeoutError（do_translate 会把它当连通性
+    故障：进 30 秒熔断 + 离线回退）。
     """
+    if deadline is None:
+        deadline = getattr(_tl, "online_deadline", None) or (time.monotonic() + ONLINE_TOTAL_TIMEOUT)
     url = "%s?client=gtx&sl=%s&tl=%s&dt=t&ie=UTF-8&oe=UTF-8" % (
         GOOGLE_ENDPOINT, urllib.parse.quote(sl), urllib.parse.quote(tl))
     body = ("q=" + urllib.parse.quote(text)).encode("utf-8")
@@ -691,9 +730,13 @@ def g_translate_full(text, sl, tl, attempts=3, timeout=12):
     }
     last = None
     for attempt in range(attempts):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("在线翻译总耗时超过 %.0f 秒上限，已停止等待" % ONLINE_TOTAL_TIMEOUT)
         try:
             req = urllib.request.Request(url, data=body, headers=headers)
-            with _urlopen(req, timeout=timeout) as r:
+            # 单次尝试也不许超过剩余预算
+            attempt_timeout = min(timeout, max(0.05, deadline - time.monotonic()))
+            with _urlopen(req, timeout=attempt_timeout) as r:
                 # 稳定性：响应限流 4 MB —— 免费端点偶尔会返回超大内容，不全读进内存。
                 data = json.loads(_read_capped(r, 4 << 20).decode("utf-8"))
             out = "".join((seg[0] or "") for seg in (data[0] or []) if seg)
@@ -702,20 +745,22 @@ def g_translate_full(text, sl, tl, attempts=3, timeout=12):
             return out, det, data
         except Exception as e:
             last = e
+            if isinstance(e, TimeoutError) and time.monotonic() >= deadline:
+                raise TimeoutError("在线翻译总耗时超过 %.0f 秒上限，已停止等待" % ONLINE_TOTAL_TIMEOUT)
             if attempt + 1 >= attempts:
                 break
             if _is_rate_limit(e):
-                time.sleep(1.2 * (attempt + 1))
+                time.sleep(min(1.2 * (attempt + 1), max(0.0, deadline - time.monotonic())))
             else:
-                time.sleep(0.4)
+                time.sleep(min(0.4, max(0.0, deadline - time.monotonic())))
     raise last
 
 
 _LAST_GOOGLE = {"text": None, "sl": None, "tl": None, "data": None}
 
 
-def g_translate(text, sl, tl, attempts=3, timeout=12):
-    out, det, _data = g_translate_full(text, sl, tl, attempts, timeout)
+def g_translate(text, sl, tl, attempts=3, timeout=12, deadline=None):
+    out, det, _data = g_translate_full(text, sl, tl, attempts, timeout, deadline)
     return out, det
 
 
@@ -1082,14 +1127,15 @@ _UA_EDGE = (
 # Edge token 格式校验已按用户决定去掉（2026-11-21）：拿到什么 token 就用
 # 什么，不再因格式拒绝；代理返回拦截页内容时，微软端点会报 401/403，走正常
 # 重试/报错。只保留空值这一事实性检查（什么都没拿到就没法调接口）。
-def _ms_get_token(force=False):
-    """Edge 翻译端点需要一个免费的短期 token（约 10 分钟有效），缓存复用。"""
+def _ms_get_token(force=False, timeout=10):
+    """Edge 翻译端点需要一个免费的短期 token（约 10 分钟有效），缓存复用。
+    timeout（B-4）：取 token 的单次上限，调用方会按在线总预算再压小。"""
     with _ms_lock:
         if not force and _ms_token["value"] and time.time() - _ms_token["ts"] < 480:
             return _ms_token["value"]
         req = urllib.request.Request(MS_AUTH, headers={"User-Agent": _UA_EDGE})
         try:
-            with _urlopen(req, timeout=10) as r:
+            with _urlopen(req, timeout=timeout) as r:
                 # 稳定性：token 响应限流 64KB —— 正常 token 只有几百字节。
                 tok = _read_capped(r, 64 << 10).decode("utf-8").strip()
         except urllib.error.HTTPError as e:
@@ -1105,8 +1151,15 @@ def _ms_get_token(force=False):
         return tok
 
 
-def ms_translate(text, sl, tl, attempts=3, timeout=15):
-    """微软 Edge 免费翻译端点（无需自备 Key，token 自动获取并缓存）。"""
+def ms_translate(text, sl, tl, attempts=3, timeout=15, deadline=None):
+    """微软 Edge 免费翻译端点（无需自备 Key，token 自动获取并缓存）。
+
+    deadline（B-4）：与 g_translate_full 同款总预算；None 时先看调用链上
+    _online 在本线程里设好的共享预算，没有再按 ONLINE_TOTAL_TIMEOUT 现算。
+    取 token 与每次 POST 都不许超过剩余预算。
+    """
+    if deadline is None:
+        deadline = getattr(_tl, "online_deadline", None) or (time.monotonic() + ONLINE_TOTAL_TIMEOUT)
     src = to_ms(sl)
     tgt = to_ms(tl)
     if src == "auto":
@@ -1117,14 +1170,20 @@ def ms_translate(text, sl, tl, attempts=3, timeout=15):
     url = "%s?%s" % (MS_API, params)
     last = None
     for attempt in range(attempts):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("在线翻译总耗时超过 %.0f 秒上限，已停止等待" % ONLINE_TOTAL_TIMEOUT)
         try:
+            # 取 token 也受总预算约束（微软接口已下线时这里 404 会立刻抛，不等）
+            token_timeout = min(10, max(0.05, deadline - time.monotonic()))
             headers = {
                 "Content-Type": "application/json; charset=UTF-8",
                 "User-Agent": _UA_EDGE,
-                "Authorization": "Bearer " + _ms_get_token(force=attempt > 0 and _is_auth_error(last)),
+                "Authorization": "Bearer " + _ms_get_token(
+                    force=attempt > 0 and _is_auth_error(last), timeout=token_timeout),
             }
             req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-            with _urlopen(req, timeout=timeout) as r:
+            attempt_timeout = min(timeout, max(0.05, deadline - time.monotonic()))
+            with _urlopen(req, timeout=attempt_timeout) as r:
                 # 稳定性：响应限流 4 MB —— 正常翻译响应只有几 KB。
                 data = json.loads(_read_capped(r, 4 << 20).decode("utf-8"))
             item = data[0] if isinstance(data, list) and data else {}
@@ -1140,9 +1199,285 @@ def ms_translate(text, sl, tl, attempts=3, timeout=15):
             # 微软接口已下线是既定事实，重试也不会好，直接报，不白等三轮。
             if "接口已下线" in str(e):
                 raise
+            if isinstance(e, TimeoutError) and time.monotonic() >= deadline:
+                raise TimeoutError("在线翻译总耗时超过 %.0f 秒上限，已停止等待" % ONLINE_TOTAL_TIMEOUT)
             if attempt + 1 < attempts:
-                time.sleep(0.6 * (attempt + 1))
+                time.sleep(min(0.6 * (attempt + 1), max(0.0, deadline - time.monotonic())))
     raise last
+
+
+LINGVA_HOSTS = ["https://lingva.ml", "https://lingva.lunar.icu", "https://translate.plausibility.cloud"]
+MYMEMORY_API = "https://api.mymemory.translated.net/get"
+
+
+def _budget(deadline, timeout):
+    if deadline is None:
+        deadline = getattr(_tl, "online_deadline", None) or (time.monotonic() + ONLINE_TOTAL_TIMEOUT)
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("在线翻译总耗时超过 %.0f 秒上限，已停止等待" % ONLINE_TOTAL_TIMEOUT)
+    return deadline, min(timeout, max(0.05, left))
+
+
+def lingva_code(code):
+    """Lingva 用 Google 的语言代码；繁体 zh_HANT、简体 zh。"""
+    c = (code or "auto")
+    if c == "zh-CN":
+        return "zh"
+    if c == "zh-TW":
+        return "zh_HANT"
+    return c
+
+
+def lingva_translate(text, sl, tl, timeout=8, deadline=None):
+    """Lingva（Google 翻译开源前端）：GET /api/v1/{sl}/{tl}/{text}。多个公共实例依次试。"""
+    last = None
+    for host in LINGVA_HOSTS:
+        deadline, t = _budget(deadline, timeout)
+        url = "%s/api/v1/%s/%s/%s" % (host, urllib.parse.quote(lingva_code(sl)),
+                                      urllib.parse.quote(lingva_code(tl)), urllib.parse.quote(text, safe=""))
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": _UA_EDGE, "Accept": "application/json"})
+            with _urlopen(req, timeout=t) as r:
+                data = json.loads(_read_capped(r, 2 << 20).decode("utf-8"))
+            out = (data.get("translation") or "") if isinstance(data, dict) else ""
+            if not out:
+                raise RuntimeError("Lingva 返回为空")
+            det = ((data.get("info") or {}).get("detectedSource") or sl) if isinstance(data, dict) else sl
+            det = {"zh": "zh-CN", "zh_HANT": "zh-TW"}.get(det, det)
+            return out, det
+        except Exception as e:      # noqa: BLE001
+            last = e
+            if isinstance(e, TimeoutError) and "总耗时" in str(e):
+                raise
+    raise last or RuntimeError("Lingva 不可用")
+
+
+def mymemory_translate(text, sl, tl, timeout=8, deadline=None):
+    """MyMemory 免费接口：GET ?q=&langpair=en|zh-CN。不支持自动检测，auto 时按文字脚本猜。
+    单次最多 500 字节左右，超长交给上层 split_long（这里再按 450 字切一次保险）。"""
+    src = guess_lang(text) if sl == "auto" else sl
+    src = {"zh": "zh-CN"}.get(src, src)
+    if len(text) > 450:
+        parts = [text[i:i + 450] for i in range(0, len(text), 450)]
+        outs = [mymemory_translate(p, src, tl, timeout, deadline)[0] for p in parts]
+        return _join(outs, tl), src
+    deadline, t = _budget(deadline, timeout)
+    url = "%s?q=%s&langpair=%s|%s" % (MYMEMORY_API, urllib.parse.quote(text),
+                                      urllib.parse.quote(src), urllib.parse.quote(tl))
+    req = urllib.request.Request(url, headers={"User-Agent": _UA_EDGE})
+    with _urlopen(req, timeout=t) as r:
+        data = json.loads(_read_capped(r, 2 << 20).decode("utf-8"))
+    status = int(data.get("responseStatus") or 200) if isinstance(data, dict) else 500
+    out = ((data.get("responseData") or {}).get("translatedText") or "") if isinstance(data, dict) else ""
+    if status == 429 or "MYMEMORY WARNING" in out.upper():
+        raise urllib.error.HTTPError(url, 429, "MyMemory 今日免费额度已用完", None, None)
+    if status != 200 or not out:
+        raise RuntimeError("MyMemory 返回错误（%s）：%s" % (status, str(data.get("responseDetails", ""))[:80]))
+    return html.unescape(out), src
+
+
+# ---------------------------------------------------------------- v2.15.4 需要 Key 的引擎
+_ENGINE_KEYS = {k: "" for k in ENGINE_KEY_FIELDS}
+
+
+class EngineKeyError(RuntimeError):
+    """没填 Key / Key 无效 / 额度用完 —— 不是网络问题，不进熔断、不该被当成断网。"""
+
+
+def set_engine_keys(cfg):
+    for k in ENGINE_KEY_FIELDS:
+        _ENGINE_KEYS[k] = str((cfg or {}).get(k) or "").strip()
+    _ENGINE_KEYS["_style"] = str((cfg or {}).get("translate_style") or "default")
+
+
+def engine_configured(name):
+    return all(_ENGINE_KEYS.get(k) for k in KEY_ENGINES.get(name, ()))
+
+
+def _need_keys(name):
+    if not engine_configured(name):
+        raise EngineKeyError("「%s」引擎还没填 Key：请到「高级设置 → 翻译 → 需要 Key 的引擎」里填写。" % name)
+
+
+def deepl_lang(code, target=False):
+    c = (code or "auto")
+    if c == "auto":
+        return None
+    if c == "zh-CN":
+        return "ZH-HANS" if target else "ZH"
+    if c == "zh-TW":
+        return "ZH-HANT" if target else "ZH"
+    if target and c == "en":
+        return "EN-US"
+    if target and c == "pt":
+        return "PT-BR"
+    return base(c).upper()
+
+
+def deepl_translate(text, sl, tl, timeout=10, deadline=None):
+    _need_keys("DeepL")
+    key = _ENGINE_KEYS["deepl_key"]
+    host = "https://api-free.deepl.com" if key.endswith(":fx") else "https://api.deepl.com"
+    deadline, t = _budget(deadline, timeout)
+    form = {"text": text, "target_lang": deepl_lang(tl, True)}
+    fm = translator_tools.deepl_formality(_ENGINE_KEYS.get("_style", "default"))
+    if fm:
+        form["formality"] = fm          # v2.15.4 译文风格：只有部分目标语言支持，不支持时 DeepL 忽略 prefer_*
+    src = deepl_lang(sl)
+    if src:
+        form["source_lang"] = src
+    req = urllib.request.Request(host + "/v2/translate", data=urllib.parse.urlencode(form).encode("utf-8"),
+                                 headers={"Authorization": "DeepL-Auth-Key " + key,
+                                          "Content-Type": "application/x-www-form-urlencoded",
+                                          "User-Agent": "RealtimeTranslate/" + __version__})
+    try:
+        with _urlopen(req, timeout=t) as r:
+            data = json.loads(_read_capped(r, 2 << 20).decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise EngineKeyError("DeepL Key 无效（HTTP %d）：请检查 Key 是否填对；免费版 Key 以 :fx 结尾。" % e.code)
+        if e.code == 456:
+            raise EngineKeyError("DeepL 本月额度已用完（HTTP 456）。")
+        raise
+    tr = (data.get("translations") or [{}])[0] if isinstance(data, dict) else {}
+    out = tr.get("text") or ""
+    if not out:
+        raise RuntimeError("DeepL 返回为空")
+    det = (tr.get("detected_source_language") or sl or "auto").lower()
+    det = {"zh": "zh-CN"}.get(det, det)
+    return out, det
+
+
+BAIDU_CODE = {"zh-CN": "zh", "zh-TW": "cht", "ja": "jp", "ko": "kor", "fr": "fra", "es": "spa",
+              "ar": "ara", "vi": "vie", "sv": "swe", "auto": "auto"}
+BAIDU_BACK = {v: k for k, v in BAIDU_CODE.items()}
+BAIDU_ERRORS = {"52001": "请求超时", "52002": "百度服务出错", "52003": "APPID 未授权或填错",
+                "54000": "参数为空", "54001": "签名错误：密钥填错了", "54003": "请求太频繁（标准版每秒 1 次）",
+                "54004": "账户余额不足", "54005": "长文本请求太频繁", "58000": "IP 不在白名单里",
+                "58001": "不支持这个语种", "58002": "服务已关闭，请到百度翻译开放平台开通", "90107": "认证未通过或未生效"}
+
+
+def baidu_sign(appid, q, salt, key):
+    """百度翻译签名（纯函数）：md5(appid + q + salt + 密钥)。"""
+    return hashlib.md5((appid + q + str(salt) + key).encode("utf-8")).hexdigest()
+
+
+def baidu_translate(text, sl, tl, timeout=10, deadline=None):
+    _need_keys("百度")
+    appid, key = _ENGINE_KEYS["baidu_appid"], _ENGINE_KEYS["baidu_key"]
+    deadline, t = _budget(deadline, timeout)
+    salt = str(int(time.time() * 1000))
+    form = {"q": text, "from": BAIDU_CODE.get(sl, base(sl)), "to": BAIDU_CODE.get(tl, base(tl)),
+            "appid": appid, "salt": salt, "sign": baidu_sign(appid, text, salt, key)}
+    req = urllib.request.Request("https://fanyi-api.baidu.com/api/trans/vip/translate",
+                                 data=urllib.parse.urlencode(form).encode("utf-8"),
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with _urlopen(req, timeout=t) as r:
+        data = json.loads(_read_capped(r, 2 << 20).decode("utf-8"))
+    code = str(data.get("error_code") or "") if isinstance(data, dict) else "x"
+    if code and code != "52000":
+        msg = "百度翻译：%s（错误码 %s）" % (BAIDU_ERRORS.get(code, data.get("error_msg", "未知错误")), code)
+        if code == "54003":
+            raise urllib.error.HTTPError("baidu", 429, msg, None, None)
+        if code in ("52001", "52002"):
+            raise RuntimeError(msg)
+        raise EngineKeyError(msg)
+    out = "\n".join(x.get("dst", "") for x in data.get("trans_result") or [])
+    if not out:
+        raise RuntimeError("百度翻译返回为空")
+    det = data.get("from") or sl
+    return out, BAIDU_BACK.get(det, det)
+
+
+YOUDAO_CODE = {"zh-CN": "zh-CHS", "zh-TW": "zh-CHT", "auto": "auto"}
+YOUDAO_ERRORS = {"101": "缺少必填参数", "102": "不支持的语言类型", "103": "翻译文本过长", "108": "应用 ID 无效",
+                 "110": "没有绑定「文本翻译」服务", "111": "开发者账号无效", "113": "翻译内容为空",
+                 "202": "签名错误：应用密钥填错了", "206": "时间戳无效（检查电脑时间）", "401": "账户已欠费",
+                 "411": "访问太频繁", "412": "长请求太频繁"}
+
+
+def youdao_input(q):
+    """有道签名用的 input（纯函数）：长度 ≤ 20 原样；否则 前10字 + 长度 + 后10字。"""
+    return q if len(q) <= 20 else q[:10] + str(len(q)) + q[-10:]
+
+
+def youdao_sign(appid, q, salt, curtime, secret):
+    return hashlib.sha256((appid + youdao_input(q) + salt + curtime + secret).encode("utf-8")).hexdigest()
+
+
+def youdao_translate(text, sl, tl, timeout=10, deadline=None):
+    _need_keys("有道")
+    appid, secret = _ENGINE_KEYS["youdao_appid"], _ENGINE_KEYS["youdao_key"]
+    deadline, t = _budget(deadline, timeout)
+    salt, curtime = str(int(time.time() * 1000)), str(int(time.time()))
+    form = {"q": text, "from": YOUDAO_CODE.get(sl, base(sl)), "to": YOUDAO_CODE.get(tl, base(tl)),
+            "appKey": appid, "salt": salt, "sign": youdao_sign(appid, text, salt, curtime, secret),
+            "signType": "v3", "curtime": curtime}
+    req = urllib.request.Request("https://openapi.youdao.com/api", data=urllib.parse.urlencode(form).encode("utf-8"),
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with _urlopen(req, timeout=t) as r:
+        data = json.loads(_read_capped(r, 2 << 20).decode("utf-8"))
+    code = str(data.get("errorCode", "x")) if isinstance(data, dict) else "x"
+    if code != "0":
+        msg = "有道翻译：%s（错误码 %s）" % (YOUDAO_ERRORS.get(code, "未知错误"), code)
+        if code in ("411", "412"):
+            raise urllib.error.HTTPError("youdao", 429, msg, None, None)
+        raise EngineKeyError(msg)
+    out = "\n".join(data.get("translation") or [])
+    if not out:
+        raise RuntimeError("有道翻译返回为空")
+    det = str(data.get("l") or "").split("2")[0] or sl
+    return out, {"zh-CHS": "zh-CN", "zh-CHT": "zh-TW"}.get(det, det)
+
+
+_AUTO_ORDER = ["Google", "微软", "Lingva", "MyMemory"]
+_auto_state = {"last_ok": None}
+
+
+def auto_order(last_ok=None, keyed=None):
+    """「自动」引擎的尝试顺序（纯函数）：免费引擎在前，已填 Key 的引擎（keyed）排在后面兜底；
+    上次成功的排第一。"""
+    order = list(_AUTO_ORDER) + [k for k in (keyed or []) if k not in _AUTO_ORDER]
+    if last_ok in order:
+        order.remove(last_ok)
+        order.insert(0, last_ok)
+    return order
+
+
+def _engine_call(name, text, sl, tl):
+    if name == "Google":
+        return g_translate(text, sl, tl, attempts=1)
+    if name == "微软":
+        return ms_translate(text, sl, tl, attempts=1)
+    if name == "Lingva":
+        return lingva_translate(text, sl, tl)
+    if name == "MyMemory":
+        return mymemory_translate(text, sl, tl)
+    if name == "DeepL":
+        return deepl_translate(text, sl, tl)
+    if name == "百度":
+        return baidu_translate(text, sl, tl)
+    if name == "有道":
+        return youdao_translate(text, sl, tl)
+    raise ValueError("未知引擎：%s" % name)
+
+
+def auto_translate(text, sl, tl):
+    errs = []
+    for name in auto_order(_auto_state["last_ok"], [k for k in KEY_ENGINES if engine_configured(k)]):
+        try:
+            out = _engine_call(name, text, sl, tl)
+            _auto_state["last_ok"] = name
+            return out
+        except TimeoutError as e:
+            if "总耗时" in str(e):
+                raise
+            errs.append("%s：%s" % (name, netcheck.explain_error(e)[0]))
+        except Exception as e:      # noqa: BLE001
+            errs.append("%s：%s" % (name, netcheck.explain_error(e)[0]))
+    _auto_state["last_ok"] = None
+    raise RuntimeError("所有在线引擎都失败了：\n" + "\n".join(errs))
 
 
 def _is_auth_error(exc):
@@ -1178,6 +1513,9 @@ def offline_translate(text, sl, tl, cancelled=None):
 # ---- 在线引擎失败时自动改用离线 ----
 AUTO_OFFLINE = True            # 由界面复选框控制
 _DOWN_SECONDS = 30             # 判定「在线引擎不通」后，这段时间内直接走离线，不再逐条重试
+ONLINE_TOTAL_TIMEOUT = 10.0    # B-4：单次在线链路总时限（秒）——Google 重试 + 微软
+# 回退共享这一个预算，到时直接停、走离线回退；代理拖沓时最坏也只等约 10 秒，
+# 不再出现 3 次 × 12 秒超时 = 36 秒起的“点了半天没反应”。_DOWN_SECONDS 熔断不动。
 _state = {"down_until": 0.0, "fallback": 0}
 _tl = threading.local()
 
@@ -1205,21 +1543,41 @@ def _fallback(text, sl, tl):
 
 
 def _online(text, sl, tl, engine):
-    if engine == "微软":
-        return ms_translate(text, sl, tl)
-    # Google 为主，限流时回退微软
+    # B-4：整条在线链路（Google 重试 + 微软回退）共用一个总预算，到时即停，
+    # 由 do_translate 接住 TimeoutError 进熔断、走离线回退。预算经线程本地变量
+    # _tl.online_deadline 共享 —— 不改 g_translate/ms_translate 的调用签名，
+    # 否则打桩替换它们的测试（test_core.py 的 fake_google）会被多出的关键字参数打断。
+    _tl.online_deadline = time.monotonic() + ONLINE_TOTAL_TIMEOUT
     try:
-        return g_translate(text, sl, tl)
-    except Exception as e:
-        if _is_rate_limit(e):
-            try:
-                return ms_translate(text, sl, tl)
-            except Exception:
-                raise RuntimeError(
-                    "Google 请求过于频繁（429），且微软端点也失败。\n"
-                    "建议：稍等片刻，或切换到「微软 / 离线」引擎。\n"
-                    "原始错误：%s" % e)
-        raise
+        if engine == "微软":
+            return ms_translate(text, sl, tl)
+        if engine == "自动":
+            return auto_translate(text, sl, tl)
+        if engine == "Lingva":
+            return lingva_translate(text, sl, tl)
+        if engine == "MyMemory":
+            return mymemory_translate(text, sl, tl)
+        if engine in KEY_ENGINES:
+            return _engine_call(engine, text, sl, tl)
+        # Google 为主，限流时回退微软
+        try:
+            return g_translate(text, sl, tl)
+        except Exception as e:
+            if _is_rate_limit(e):
+                try:
+                    return ms_translate(text, sl, tl)
+                except TimeoutError:
+                    # B-4：总预算耗尽是连通性故障，原样抛出，让 do_translate 进熔断；
+                    # 不要包进 RuntimeError，否则 is_connectivity_error 认不出来。
+                    raise
+                except Exception:
+                    raise RuntimeError(
+                        "Google 请求过于频繁（429），且微软端点也失败。\n"
+                        "建议：稍等片刻，或切换到「微软 / 离线」引擎。\n"
+                        "原始错误：%s" % e)
+            raise
+    finally:
+        _tl.online_deadline = None
 
 
 def do_translate(text, sl, tl, engine):
@@ -1580,6 +1938,8 @@ def start_typing_hook_win(q):
                         q.put(("typing_key", "\x1b", vk))
                     elif vk == 0x09:
                         q.put(("typing_key", "\t", vk))
+                    elif vk == 0x78:                     # v2.15.4：F9 = 输入翻译的触发键
+                        q.put(("typing_key", "\x00F9", vk))
                     else:
                         ch = _vk_to_char(vk, info.scanCode)
                         if ch:
@@ -1677,6 +2037,33 @@ def send_copy_win():
     u.keybd_event(0x11, 0, KEYUP, 0)
 
 
+def ctrl_down_win():
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x11) & 0x8000)
+    except Exception:
+        return False
+
+
+def esc_pressed_win():
+    """全局 Esc（气泡不抢焦点，窗口自己的 <Escape> 绑定收不到按键）。"""
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000)
+    except Exception:
+        return False
+
+
+def send_backspaces_win(n):
+    """发 n 次退格（输入翻译：删掉刚打的那句话）。最多 400 次，防止误删太多。"""
+    import ctypes
+    u = ctypes.windll.user32
+    for _ in range(max(0, min(int(n), 400))):
+        u.keybd_event(0x08, 0, 0, 0)
+        u.keybd_event(0x08, 0, 2, 0)
+    time.sleep(0.02)
+
+
 def clip_seq_win():
     """Windows 剪贴板序号：内容一变就加 1，比固定等待可靠。"""
     try:
@@ -1689,6 +2076,72 @@ def clip_seq_win():
 # ---------------------------------------------------------------- Windows 指针取词
 _TERMINAL_CLASSES = ("ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "mintty",
                      "VirtualConsoleClass", "PuTTY")
+
+
+_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"), None)
+
+
+def normalize_grab_text(text):
+    """v2.15.3 取词文字清洗（纯函数）：去零宽字符 / 软连字符，行内多空白压成一个，
+    把硬换行断开的同一段重新接起来（英文行尾连字符直接拼，中文直接相连，其余加空格），
+    空行保留为段落分隔。"""
+    t = (text or "").translate(_ZERO_WIDTH).replace("\r\n", "\n").replace("\r", "\n")
+    paras, cur = [], []
+    for ln in t.split("\n"):
+        ln = re.sub(r"[ \t\u00a0\u3000]+", " ", ln).strip()
+        if ln:
+            cur.append(ln)
+        elif cur:
+            paras.append(cur); cur = []
+    if cur:
+        paras.append(cur)
+    out = []
+    for lines in paras:
+        s_ = ""
+        for ln in lines:
+            if not s_:
+                s_ = ln
+            elif s_.endswith("-") and s_[-2:-1].isalpha() and ln[:1].islower():
+                s_ = s_[:-1] + ln
+            elif ocr_win._is_cjk(s_[-1]) or ocr_win._is_cjk(ln[0]):
+                s_ += ln
+            else:
+                s_ += " " + ln
+        out.append(s_)
+    return "\n".join(out)
+
+
+def hover_worth_translating(word):
+    """悬停取到的东西值不值得翻（纯函数）：纯数字 / 标点 / 网址 / 单个字母不翻，免得满屏乱弹。"""
+    w = (word or "").strip()
+    if not w:
+        return False
+    if not any(ch.isalpha() for ch in w):
+        return False
+    if re.match(r"^(https?://|www\.)", w, re.I) or re.match(r"^[\w.+-]+@[\w-]+\.[\w.]+$", w):
+        return False
+    if len(w) == 1 and w.isascii():
+        return False
+    return True
+
+
+class HoverDedupe:
+    """同一个词在附近刚翻过就不再弹（纯逻辑）：气泡关掉后指针还停在原词上，
+    旧版会马上再取一次、再弹一次。"""
+
+    def __init__(self, ttl=4.0, radius=40):
+        self.ttl, self.radius = ttl, radius
+        self.last = None            # (word, pos, t)
+
+    def seen(self, word, pos, now=None):
+        now = time.time() if now is None else now
+        if self.last:
+            w, p, t = self.last
+            if (w == word and now - t < self.ttl
+                    and abs(p[0] - pos[0]) <= self.radius and abs(p[1] - pos[1]) <= self.radius):
+                return True
+        self.last = (word, pos, now)
+        return False
 
 
 def pointer_plan(ibeam, terminal, scope):
@@ -1722,11 +2175,13 @@ def tray_menu_items(snap, is_win=True):
         {"id": "shot", "label": "截图翻译(&C)　%s" % shot_label},
         {"id": "window", "label": "整窗翻译(&W)　%s" % window_label},
         {"id": "clip", "label": "翻译剪贴板内容(&V)"},
+        {"id": "compare", "label": "多引擎对照剪贴板内容…"},
         {"id": "replace", "label": "翻译并替换原文(&R)　%s" % replace_label},
         {"sep": True},
         {"id": "pointer", "label": "指针取词　%s" % pointer_label, "checked": bool(snap.get("pointer"))},
         {"id": "hover", "label": "悬停取词", "checked": bool(snap.get("hover"))},
         {"id": "typing", "label": "打字检测翻译", "checked": bool(snap.get("typing"))},
+        {"id": "input", "label": "输入翻译（打完替换成译文）", "checked": bool(snap.get("input"))},
         {"label": "取词范围", "sub": [
             {"id": "scope:%s" % k, "label": v, "checked": scope == k}
             for k, v in SCOPE_NAMES.items()]},
@@ -1819,6 +2274,178 @@ def screen_bounds():
     return None
 
 
+def exclude_from_capture_win(win):
+    """v2.15.3：让窗口不被截屏（Win10 2004+ 的 WDA_EXCLUDEFROMCAPTURE），
+    并且鼠标穿透（点击直接落到下面的软件上）。取词提示用，不能被 OCR 截进去、也不能挡住双击。
+    返回是否成功排除截屏；失败不抛异常。"""
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        u.GetParent.restype = ctypes.c_void_p
+        u.GetParent.argtypes = [ctypes.c_void_p]
+        hwnd = u.GetParent(win.winfo_id()) or win.winfo_id()
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW = 0x80000, 0x20, 0x08000000, 0x80
+        get = getattr(u, "GetWindowLongPtrW", u.GetWindowLongW)
+        sett = getattr(u, "SetWindowLongPtrW", u.SetWindowLongW)
+        get.restype = ctypes.c_ssize_t
+        get.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        sett.restype = ctypes.c_ssize_t
+        sett.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t]
+        st = get(hwnd, GWL_EXSTYLE)
+        sett(hwnd, GWL_EXSTYLE, st | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+        u.SetWindowDisplayAffinity.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        return bool(u.SetWindowDisplayAffinity(hwnd, 0x11))
+    except Exception:
+        return False
+
+
+def spinner_frames():
+    """取词提示的动画帧（纯函数，便于测试）。"""
+    return ["◐", "◓", "◑", "◒"]
+
+
+def spinner_position(pointer, size, bounds, avoid=(0, 0)):
+    """取词提示放在哪（纯函数）：默认指针右下；avoid=(半宽, 半高) 是 OCR 截图框，
+    截屏排除不可用时就放到框外面，免得被截进去。放不下就翻到左 / 上。"""
+    (x, y), (w, h) = pointer, size
+    l, t, r, b = bounds
+    ax, ay = avoid
+    px, py = x + 16, y + max(18, ay + 6)
+    if px + w > r - 4:
+        px = x - w - 16
+    if py + h > b - 4:
+        py = y - max(18, ay + 6) - h
+    return max(l + 4, min(px, r - w - 4)), max(t + 4, min(py, b - h - 4))
+
+
+class GrabSpinner:
+    """v2.15.3 取词加载提示：指针旁一个小胶囊「◐ 取词中…」。
+
+    - 延迟 250ms 才出现：快的取词（缓存命中、复制秒回）不闪一下。
+    - 不抢焦点、鼠标穿透、尽量不被截屏（WDA_EXCLUDEFROMCAPTURE），
+      排除失败时摆到 OCR 截图框外面。
+    - 结果 / 错误到了就收起；最多显示 8 秒防止残留。只在 Tk 线程里调用。
+    """
+    DELAY_MS, MAX_MS, TICK_MS = 250, 8000, 120
+
+    def __init__(self, app):
+        self.app = app
+        self.win = None
+        self.label = None
+        self._job = None
+        self._tick_job = None
+        self._token = 0
+        self._frame = 0
+        self._t0 = 0.0
+        self._text = "取词中…"
+        self._xy = (0, 0)
+        self._avoid = (0, 0)
+
+    def enabled(self):
+        return bool(self.app.cfg.get("grab_spinner", True))
+
+    def visible(self):
+        try:
+            return self.win is not None and bool(self.win.winfo_exists()) and self.win.state() != "withdrawn"
+        except Exception:
+            return False
+
+    def start(self, xy, text="取词中…", avoid=(0, 0)):
+        if not self.enabled():
+            return
+        self.stop()
+        self._token += 1
+        tok = self._token
+        self._xy, self._text, self._avoid = xy, text, avoid
+        self._t0 = time.time()
+        try:
+            self._job = self.app.root.after(self.DELAY_MS, lambda: self._show(tok))
+        except Exception:
+            self._job = None
+
+    def stop(self):
+        self._token += 1
+        for j in (self._job, self._tick_job):
+            if j is not None:
+                try:
+                    self.app.root.after_cancel(j)
+                except Exception:
+                    pass
+        self._job = self._tick_job = None
+        if self.win is not None:
+            try:
+                self.win.withdraw()
+            except Exception:
+                self.win = None
+
+    def _ensure(self):
+        if self.win is not None:
+            try:
+                if self.win.winfo_exists():
+                    return True
+            except Exception:
+                pass
+        try:
+            w = tk.Toplevel(self.app.root)
+            w.withdraw()
+            w.overrideredirect(True)
+            try:
+                w.attributes("-topmost", True)
+                w.attributes("-alpha", 0.94)
+            except tk.TclError:
+                pass
+            dark = bool(self.app.cfg.get("dark_mode", False))
+            bg, fg, acc = ("#2c2c2e", "#f5f5f7", "#0a84ff") if dark else ("#1d1d1f", "#f5f5f7", "#2997ff")
+            w.configure(background=bg)
+            fam = getattr(self.app, "ui_font", ("TkDefaultFont", 10))[0]
+            self.icon = tk.Label(w, text="◐", bg=bg, fg=acc, font=(fam, 10))
+            self.label = tk.Label(w, text=self._text, bg=bg, fg=fg, font=(fam, 9))
+            self.icon.pack(side="left", padx=(9, 3), pady=3)
+            self.label.pack(side="left", padx=(0, 10), pady=3)
+            self.win = w
+            self._excluded = False
+            return True
+        except Exception:
+            self.win = None
+            return False
+
+    def _show(self, tok):
+        self._job = None
+        if tok != self._token or not self._ensure():
+            return
+        w = self.win
+        try:
+            self.label.configure(text=self._text)
+            w.update_idletasks()
+            size = (w.winfo_reqwidth(), w.winfo_reqheight())
+            bounds = screen_bounds() or (0, 0, w.winfo_screenwidth(), w.winfo_screenheight())
+            avoid = (0, 0) if getattr(self, "_excluded", False) else self._avoid
+            w.geometry("+%d+%d" % spinner_position(self._xy, size, bounds, avoid))
+            w.deiconify()
+            if IS_WIN:
+                w.update_idletasks()
+                self._excluded = exclude_from_capture_win(w)
+                if not self._excluded:
+                    w.geometry("+%d+%d" % spinner_position(self._xy, size, bounds, self._avoid))
+        except Exception:
+            return
+        self._tick(tok)
+
+    def _tick(self, tok):
+        if tok != self._token or not self.visible():
+            return
+        if (time.time() - self._t0) * 1000 > self.MAX_MS:
+            self.stop()
+            return
+        self._frame = (self._frame + 1) % 4
+        try:
+            self.icon.configure(text=spinner_frames()[self._frame])
+            self._tick_job = self.app.root.after(self.TICK_MS, lambda: self._tick(tok))
+        except Exception:
+            self._tick_job = None
+
+
 def no_activate_win(win):
     """让气泡窗口永远不抢焦点（否则会打断你正在用的软件，并让它丢掉选区）。"""
     import ctypes
@@ -1880,6 +2507,40 @@ def set_autostart(on):
                 winreg.DeleteValue(k, RUN_VALUE)
             except FileNotFoundError:
                 pass
+
+
+def find_uninstaller(exe_dir=None):
+    """安装版的卸载程序路径（和 exe 同目录的 Uninstall.exe / unins000.exe）；免安装版返回 None。"""
+    if exe_dir is None:
+        if not FROZEN:
+            return None
+        exe_dir = os.path.dirname(sys.executable)
+    for name in ("Uninstall.exe", "unins000.exe"):
+        pth = os.path.join(exe_dir, name)
+        if os.path.isfile(pth):
+            return pth
+    return None
+
+
+def install_info_text():
+    if not FROZEN:
+        return "当前从源码运行，没有安装程序。数据在：%s" % DATA_DIR
+    if find_uninstaller():
+        return "安装位置：%s。卸载时会问你要不要删除翻译历史和设置（默认保留）。" % os.path.dirname(sys.executable)
+    return "免安装版：直接删除程序文件夹即可；数据在 %s。" % DATA_DIR
+
+
+def open_folder(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        if IS_WIN:
+            os.startfile(path)            # noqa: S606
+        else:
+            import subprocess
+            subprocess.Popen(["open" if IS_MAC else "xdg-open", path])
+        return True
+    except Exception:
+        return False
 
 
 def log_crash(text):
@@ -2191,6 +2852,7 @@ class App:
     def __init__(self):
         self.cfg = self._load_cfg()
         set_proxy_url(proxy_url(self.cfg))   # v2.9：启动时按配置决定在线引擎走不走代理
+        set_engine_keys(self.cfg)             # v2.15.4：DeepL / 百度 / 有道 的 Key
         # 首次运行（还没有配置文件）：状态栏给一句空态提示，告诉用户从哪开始
         self._first_run = not (os.path.exists(CONFIG_PATH)
                                or os.path.exists(OLD_CONFIG_PATH))
@@ -2261,6 +2923,7 @@ class App:
         self.root.report_callback_exception = self._on_tk_error
         self.bubble = Bubble(self)
         self.mini = MiniWin(self)
+        self.spinner = GrabSpinner(self)
         self.shot_overlay = None
         self._build_ui()
         self._fit_min_width()
@@ -2331,6 +2994,19 @@ class App:
         cfg["typing_pause_ms"] = max(500, min(cfg["typing_pause_ms"], 3000))
         if cfg.get("typing_scope") not in TYPING_SCOPE_NAMES:
             cfg["typing_scope"] = "word"
+        # v2.15 授权：坏的授权值一律回落免费版，绝不让坏配置让程序起不来
+        if not isinstance(cfg.get("license_key"), str):
+            cfg["license_key"] = ""
+        if cfg.get("license_status") not in ("free", "trial", "pro"):
+            cfg["license_status"] = "free"
+        try:
+            cfg["license_trial_start"] = float(cfg.get("license_trial_start") or 0)
+        except Exception:
+            cfg["license_trial_start"] = 0
+        if not isinstance(cfg.get("license_machines"), list):
+            cfg["license_machines"] = []
+        cfg["license_machines"] = [m for m in cfg["license_machines"]
+                                   if isinstance(m, str)]
         if cfg.get("close_action") not in CLOSE_NAMES:
             cfg["close_action"] = DEFAULTS["close_action"]
         # v2.13：旧版默认「点 × 隐藏到托盘」，窗口会从任务栏消失、很多人以为程序退出了。
@@ -2383,6 +3059,7 @@ class App:
         cfg["dark_mode"] = bool(cfg.get("dark_mode", False))
         # v2.14：萌系配色 + 桌面小宠物
         cfg["cute_theme"] = bool(cfg.get("cute_theme", False))
+        cfg["apple_theme"] = bool(cfg.get("apple_theme", True))
         if cfg.get("pet_mode") not in pet_catalog.PET_MODES:
             cfg["pet_mode"] = "minimized"
         if cfg.get("pet_id") not in pet_catalog.pet_ids():
@@ -2418,9 +3095,13 @@ class App:
             cfg["proxy_pass"] = ""
         # M-04：代理密码在盘上是 DPAPI 加密的 —— 读入后解开，内存里保持明文；
         # 旧版明文直接兼容；解不开（换了用户/机器）就清空，不让坏值进代理。
-        if cfg.get("proxy_pass"):
-            dec = _dpapi_unprotect(cfg["proxy_pass"])
-            cfg["proxy_pass"] = dec if isinstance(dec, str) else ""
+        for sk in ENGINE_KEY_FIELDS:
+            if not isinstance(cfg.get(sk), str):
+                cfg[sk] = ""
+        for sk in SECRET_KEYS:                      # v2.15.4：引擎密钥和代理密码同款加密
+            if cfg.get(sk):
+                dec = _dpapi_unprotect(cfg[sk])
+                cfg[sk] = dec if isinstance(dec, str) else ""
         if not isinstance(cfg.get("tts_voice"), str):
             cfg["tts_voice"] = ""
         if not re.match(r"^\d+x\d+([+-]-?\d+[+-]-?\d+)?$", str(cfg.get("geometry", ""))):
@@ -2564,6 +3245,7 @@ class App:
                 "top": self.top_var.get(), "watch": self.watch_var.get(),
                 "pointer": self.pointer_var.get(), "hover": self.hover_var.get(),
                 "typing": self.typing_var.get(),
+                "input": bool(self.cfg.get("input_translate", False)),
                 "scope": SCOPE_CODES.get(self.scope_cb.get(), "word"),
                 "auto_off": self.auto_off_var.get(),
                 "history_on": self.history_on_var.get(),
@@ -2590,6 +3272,7 @@ class App:
                    "pointer": ("pointer_var", "_on_pointer_opt"),
                    "hover": ("hover_var", "_on_pointer_opt"),
                    "typing": ("typing_var", "_on_typing_opt"),
+                   "input": ("input_var", "_on_input_opt"),
                    "auto_off": ("auto_off_var", "_on_auto_offline"),
                    "autostart": ("auto_var", "_on_autostart"),
                    "history_on": ("history_on_var", "_on_history_opt")}
@@ -2615,6 +3298,9 @@ class App:
                 self.status.configure(text="剪贴板里没有文字")
         elif cid == "replace":
             self._on_replace_hotkey()
+        elif cid == "compare":
+            self.show_window()
+            self.open_compare(self._get_clip())
         elif cid == "window":
             # 从托盘菜单点的时候指针在任务栏上：给 3 秒把指针移到目标菜单 / 窗口
             self.window_translate(delay_ms=3000)
@@ -2675,6 +3361,7 @@ class App:
         frame = ttk.Frame(parent)
         sb = ttk.Scrollbar(frame, orient="vertical")
         txt = tk.Text(frame, wrap="word", relief="solid", borderwidth=1, yscrollcommand=sb.set, **kw)
+
         sb.configure(command=txt.yview)
         sb.pack(side="right", fill="y")
         txt.pack(side="left", fill="both", expand=True)
@@ -2684,6 +3371,8 @@ class App:
         # v2.13：字体按「本机实际装了哪个」挑（Windows 雅黑 / macOS 苹方 / Linux 思源·文泉驿…），
         # 不再写死名字；ttk 主题、表格行高按系统和字号适配
         fam, base_size = ui_platform.ui_family(self.root), ui_platform.base_size()
+        if self.cfg.get("apple_theme", True):
+            fam = ui_platform.pick_family(self.root, ui_platform.APPLE_FONT_CANDIDATES[ui_platform.os_key()], fallback=fam)
         self._mono_family = ui_platform.mono_family(self.root)
         # v2.6 界面字号：默认 11（设置 → 常规里 10~18 可调，改完立刻生效）
         size = int(self.cfg.get("font_size", 11))
@@ -2714,7 +3403,7 @@ class App:
         eng_frame.pack(fill="x", padx=12, pady=(2, 6))
         ttk.Label(eng_frame, text="引擎").pack(side="left")
         self.engine = ttk.Combobox(
-            eng_frame, values=ENGINES, state="readonly", width=10)
+            eng_frame, values=ENGINES, state="readonly", width=11)
         eng = self.cfg.get("engine", "Google")
         if eng not in ENGINES:
             eng = "Google"
@@ -2737,7 +3426,7 @@ class App:
         paned.add(f2, weight=1)
         self.paned, self.f1 = paned, f1
 
-        ttk.Label(f1, text="原文").pack(anchor="w")
+        ttk.Label(f1, text="原文", style="Title.TLabel").pack(anchor="w", pady=(4, 0))
         box, self.src = self._text_with_scroll(f1, height=3, font=font, undo=True)
         box.pack(fill="both", expand=True, pady=(2, 6))
         self.src.bind("<<Modified>>", self._on_modified)
@@ -2745,7 +3434,7 @@ class App:
 
         row = ttk.Frame(f2)
         row.pack(fill="x")
-        ttk.Label(row, text="译文").pack(side="left")
+        ttk.Label(row, text="译文", style="Title.TLabel").pack(side="left")
         self.status = ttk.Label(row, text="", foreground="#5b6676")
         self.status.pack(side="right")
         box2, self.dst = self._text_with_scroll(f2, height=3, font=font, state="disabled")
@@ -2762,7 +3451,7 @@ class App:
         btns = ui_platform.FlowFrame(root)           # v2.13：放不下自动折行，不再把右边的按钮裁掉
         btns.pack(fill="x", padx=12, pady=(2, 0))
         B = lambda text, cmd: btns.add(ttk.Button(btns, text=text, command=cmd))      # noqa: E731
-        B("复制译文", self.copy_result)
+        btns.add(ttk.Button(btns, text="复制译文", command=self.copy_result, style="Accent.TButton"))
         B("复制原文", self.copy_source)
         B("🔊 原文", self.speak_source)
         B("🔊 译文", self.speak_result)
@@ -2770,6 +3459,9 @@ class App:
         B("网络检查", self.open_netcheck)
         B("离线语言包…", self._show_offline_packs)
         B("导入语言包…", self._import_packs)
+        B("⚖ 多引擎对照", self.open_compare)
+        B("Aa 命名格式", self.open_case_tool)
+        B("🧹 去格式", self.clean_source)
         B("截图翻译", self.start_screenshot)
         B("翻译文档…", self._translate_doc_file)
         B("翻译图片…", self._translate_image_file)
@@ -2805,6 +3497,9 @@ class App:
         self.typing_pause_var = tk.IntVar(value=int(self.cfg.get("typing_pause_ms", 1000)))
         self.typing_scope_var = tk.StringVar(
             value=TYPING_SCOPE_NAMES.get(self.cfg.get("typing_scope", "word"), "单词"))
+        self._hover_dedupe = HoverDedupe()
+        self.spinner_var = tk.BooleanVar(value=bool(self.cfg.get("grab_spinner", True)))
+        self.hover_mod_var = tk.BooleanVar(value=bool(self.cfg.get("hover_need_ctrl", False)))
         self.hover_win_var = tk.BooleanVar(value=bool(self.cfg.get("hover_window", False)))
         self.tray_tip_var = tk.BooleanVar(value=bool(self.cfg.get("tray_tip", True)))
         self.history_on_var = tk.BooleanVar(value=bool(self.cfg.get("history_on", True)))
@@ -2824,6 +3519,7 @@ class App:
         self.dark_var = tk.BooleanVar(value=bool(self.cfg.get("dark_mode", False)))
         set_cute(self.cfg.get("cute_theme", False))
         self.cute_var = tk.BooleanVar(value=bool(self.cfg.get("cute_theme", False)))
+        self.apple_var = tk.BooleanVar(value=bool(self.cfg.get("apple_theme", True)))
         self.pet_bubble_var = tk.BooleanVar(value=bool(self.cfg.get("pet_bubble", True)))
         self.update_auto_var = tk.BooleanVar(value=bool(self.cfg.get("update_auto", True)))
         self._stt_busy = False
@@ -2898,8 +3594,33 @@ class App:
             pass
         self.settings_win = win
 
+        # v2.15.4：搜索设置（输入关键字，回车 / 选中结果就跳到那一页并高亮）
+        sbar = ttk.Frame(win)
+        sbar.pack(fill="x", padx=10, pady=(10, 0))
+        ttk.Label(sbar, text="🔍").pack(side="left")
+        self.settings_search_var = tk.StringVar()
+        ent = ttk.Entry(sbar, textvariable=self.settings_search_var)
+        ent.pack(side="left", fill="x", expand=True, padx=(4, 6))
+        self.settings_search_entry = ent
+        self.settings_search_hint = ttk.Label(sbar, text="搜索设置（Ctrl+F）", style="Note.TLabel")
+        self.settings_search_hint.pack(side="left")
+        self.settings_results = tk.Listbox(win, height=0, activestyle="none", relief="flat",
+                                           highlightthickness=1, exportselection=False)
+        self.settings_search_var.trace_add("write", lambda *_: self._settings_search())
+        ent.bind("<Return>", lambda e: self._settings_search_go(0))
+        ent.bind("<Down>", lambda e: (self.settings_results.focus_set(),
+                                      self.settings_results.selection_set(0)) if self.settings_results.size() else None)
+        ent.bind("<Escape>", lambda e: (self.settings_search_var.set(""), "break")[1])
+        self.settings_results.bind("<Return>", lambda e: self._settings_search_go())
+        self.settings_results.bind("<Double-Button-1>", lambda e: self._settings_search_go())
+        self.settings_results.bind("<ButtonRelease-1>", lambda e: self._settings_search_go())
+        win.bind("<Control-f>", lambda e: (ent.focus_set(), ent.select_range(0, "end")))
+        self._settings_hits = []
+
         nb = ttk.Notebook(win)
-        nb.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        nb.pack(fill="both", expand=True, padx=10, pady=(8, 4))
+        nb.enable_traversal()          # Ctrl+Tab / Ctrl+Shift+Tab 切页
+        nb.bind("<<NotebookTabChanged>>", lambda e: self._remember_settings_tab())
         self.settings_nb = nb
         self.settings_tabs = {}
 
@@ -2908,13 +3629,28 @@ class App:
             sf = ui_platform.ScrollFrame(nb, padding=14)
             nb.add(sf, text=title)
             self.settings_tabs[key] = sf
+            cur["tab"] = key
             return sf.body
+
+        self._settings_index = []          # (tab_key, widget, 文字) 供搜索
+        self._settings_deps = []           # (控件列表, 条件函数) 依赖关系置灰
+        cur = {"tab": None}
+
+        def section(parent, title, first=False):
+            """分组小标题（苹果偏好设置式）：灰色粗体 + 细分隔线。"""
+            if not first:
+                ttk.Separator(parent).pack(fill="x", pady=(16, 6))
+            lab = ttk.Label(parent, text=title, style="Section.TLabel")
+            lab.pack(anchor="w", pady=(0 if first else 0, 2))
+            self._settings_index.append((cur["tab"], lab, title))
+            return lab
 
         def check(parent, text, var, cmd, note=None):
             cb = ttk.Checkbutton(parent, text=text, variable=var, command=cmd)
             cb.pack(anchor="w", pady=(6, 0))
+            self._settings_index.append((cur["tab"], cb, text + " " + (note or "")))
             if note:
-                lab = ttk.Label(parent, text=note, foreground="#5b6676", wraplength=500,
+                lab = ttk.Label(parent, text=note, style="Note.TLabel", wraplength=500,
                                 justify="left")
                 lab.pack(anchor="w", padx=(26, 0))
                 ui_platform.autowrap(lab, pad=60)
@@ -2922,6 +3658,7 @@ class App:
 
         # 常规
         f = tab("general", "常规")
+        section(f, "窗口", first=True)
         check(f, "窗口置顶", self.top_var, self._on_top, "翻译窗口始终显示在其他窗口上面。")
         if IS_WIN:
             check(f, "开机自启（自动缩在任务栏）", self.auto_var, self._on_autostart,
@@ -2936,7 +3673,7 @@ class App:
         ttk.Label(f, text="选「隐藏到托盘」时程序继续在后台运行，快捷键和取词照常可用；"
                           "选「最小化到任务栏」时窗口缩到任务栏、点任务栏图标就能还原（Esc 也一样）；"
                           "没有托盘图标（被安全软件拦截）时「隐藏到托盘」会改为最小化。",
-                  foreground="#5b6676", wraplength=500, justify="left").pack(anchor="w", padx=(0, 0), pady=(2, 0))
+                  style="Note.TLabel", wraplength=500, justify="left").pack(anchor="w", padx=(0, 0), pady=(2, 0))
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(10, 0))
         ttk.Label(row, text="点窗口 – 最小化：").pack(side="left")
@@ -2953,12 +3690,15 @@ class App:
         sp.bind("<Return>", lambda e: self._on_font_size())
         sp.bind("<FocusOut>", lambda e: self._on_font_size())
         ttk.Label(row, text="（10 ~ 18，改完立刻生效：原文 / 译文框、气泡 / 小窗口都跟着变）",
-                  foreground="#5b6676").pack(side="left", padx=6)
+                  style="Note.TLabel").pack(side="left", padx=6)
+        section(f, "外观")
         check(f, "深色外观", self.dark_var, self._on_dark_mode,
               "主窗口、设置、历史、气泡 / 小窗口换成深色；默认是浅色，不勾就是今天的样子。")
         check(f, "萌系配色（粉彩）", self.cute_var, self._on_cute_theme,
               "把浅色外观换成柔和的粉彩配色；和「深色外观」同时勾选时以深色为准。")
+        check(f, "苹果风格（macOS 质感：浅灰底、白卡片、系统蓝按钮）", self.apple_var, self._on_apple_theme)
         # v2.14：桌面小宠物
+        section(f, "桌面小宠物")
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(10, 0))
         ttk.Label(row, text="桌面小宠物：").pack(side="left")
@@ -2973,15 +3713,17 @@ class App:
         check(f, "译好后用气泡显示译文（宠物显示时）", self.pet_bubble_var, self._on_pet_opt,
               "小宠物会跟着翻译状态变化：复制文字时惊讶、翻译中思考、译好开心、失败难过、久不用会睡着。"
               "点它打开翻译窗口，双击翻译剪贴板，右键换宠物。")
+        section(f, "备份与迁移")
         row = ttk.Frame(f)
-        row.pack(anchor="w", pady=(14, 0))
+        row.pack(anchor="w", pady=(6, 0))
         ttk.Button(row, text="导出设置…", command=self._export_settings).pack(side="left")
         ttk.Button(row, text="导入设置…", command=self._import_settings).pack(side="left", padx=6)
         ttk.Label(row, text="设置存成一个 JSON 文件（含术语表和自定义快捷键，不含任何密码）。导入前会先全量校验，有问题的不应用。",
-                  foreground="#5b6676", wraplength=420, justify="left").pack(side="left", padx=8)
+                  style="Note.TLabel", wraplength=420, justify="left").pack(side="left", padx=8)
 
         # 翻译
         f = tab("translate", "翻译")
+        section(f, "翻译方式", first=True)
         check(f, "中英智能互译", self.smart_var, self._retranslate,
               "检测到中文就译成英文，检测到其他语言译成中文。")
         check(f, "双语对照", self.bi_var, self._on_bilingual, "译文按句与原文逐句对照显示。")
@@ -2994,7 +3736,46 @@ class App:
               "只对主窗口的翻译生效（气泡 / 小窗口 / 悬停取词 / 截图翻译不自动复制），"
               "复制后剪贴板监听不会把它当成新复制再翻一遍。")
         row = ttk.Frame(f)
-        row.pack(anchor="w", pady=(14, 0))
+        row.pack(anchor="w", pady=(10, 0))
+        ttk.Label(row, text="译文风格：").pack(side="left")
+        self.style_cb = ttk.Combobox(row, state="readonly", width=8, values=list(translator_tools.STYLES.values()))
+        self.style_cb.set(translator_tools.STYLES.get(self.cfg.get("translate_style", "default"), "默认"))
+        self.style_cb.pack(side="left")
+        self.style_cb.bind("<<ComboboxSelected>>", lambda e: self._on_style())
+        ttk.Label(row, text="（目前 DeepL 支持正式 / 口语；其他引擎不受影响）", style="Note.TLabel").pack(side="left", padx=6)
+
+        section(f, "需要 Key 的引擎")
+        ttk.Label(f, text="填好后在主窗口「引擎」里选它；也会作为「自动」模式的最后兜底。"
+                          "Key 只存在本机（加密保存），导出设置时不带出。",
+                  style="Note.TLabel", wraplength=520, justify="left").pack(anchor="w")
+        self.key_vars = {k: tk.StringVar(value=self.cfg.get(k, "")) for k in ENGINE_KEY_FIELDS}
+        self.key_status = {}
+        for eng, fields, url in (
+                ("DeepL", (("deepl_key", "API Key", True),), "https://www.deepl.com/pro-api"),
+                ("百度", (("baidu_appid", "APPID", False), ("baidu_key", "密钥", True)), "https://fanyi-api.baidu.com/"),
+                ("有道", (("youdao_appid", "应用 ID", False), ("youdao_key", "应用密钥", True)), "https://ai.youdao.com/")):
+            row = ttk.Frame(f)
+            row.pack(anchor="w", fill="x", pady=(6, 0))
+            ttk.Label(row, text=eng, width=6, style="Title.TLabel").pack(side="left")
+            for key, label, secret in fields:
+                ttk.Label(row, text=label + "：").pack(side="left", padx=(6, 0))
+                ttk.Entry(row, textvariable=self.key_vars[key], width=24 if len(fields) == 1 else 14,
+                          show="•" if secret else "").pack(side="left")
+            ttk.Button(row, text="测试", width=5, command=lambda e=eng: self._test_engine_key(e)).pack(side="left", padx=(8, 0))
+            ttk.Button(row, text="申请…", width=6, command=lambda u=url: webbrowser.open(u)).pack(side="left", padx=(4, 0))
+            st = ttk.Label(row, text="", style="Note.TLabel")
+            st.pack(side="left", padx=6)
+            self.key_status[eng] = st
+            self._settings_index.append((cur["tab"], row, "%s Key 密钥 APPID 引擎" % eng))
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(6, 0))
+        ttk.Button(row, text="保存 Key", command=self._save_engine_keys).pack(side="left")
+        ttk.Button(row, text="清除全部 Key", command=self._clear_engine_keys).pack(side="left", padx=6)
+        self._refresh_key_status()
+
+        section(f, "朗读")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(6, 0))
         ttk.Label(row, text="朗读语速：").pack(side="left")
         sp = ttk.Spinbox(row, from_=-10, to=10, increment=1, width=5,
                          textvariable=self.tts_rate_var, command=self._on_tts_rate)
@@ -3002,7 +3783,7 @@ class App:
         sp.bind("<Return>", lambda e: self._on_tts_rate())
         sp.bind("<FocusOut>", lambda e: self._on_tts_rate())
         ttk.Label(row, text="（-10 最慢 ~ 10 最快，0 是默认语速；朗读只在 Windows 上可用）",
-                  foreground="#5b6676").pack(side="left", padx=6)
+                  style="Note.TLabel").pack(side="left", padx=6)
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(10, 0))
         ttk.Label(row, text="朗读语音：").pack(side="left")
@@ -3011,9 +3792,10 @@ class App:
         self.tts_voice_cb.pack(side="left")
         self.tts_voice_cb.bind("<<ComboboxSelected>>", lambda e: self._on_tts_voice())
         ttk.Label(row, text="（只在 Windows 上有；选了就记住，重启仍生效）",
-                  foreground="#5b6676").pack(side="left", padx=6)
-        ttk.Label(f, text="术语表（专有名词按固定译文翻，每行一对，原文 = 译文）：",
-                  font=self.ui_font).pack(anchor="w", pady=(16, 2))
+                  style="Note.TLabel").pack(side="left", padx=6)
+        section(f, "术语表")
+        ttk.Label(f, text="专有名词按固定译文翻，每行一对，原文 = 译文：",
+                  style="Note.TLabel").pack(anchor="w", pady=(2, 2))
         self.glossary_text = tk.Text(f, height=4, font=self.ui_font, wrap="none")
         self.glossary_text.pack(fill="x")
         self._refresh_glossary_text()
@@ -3023,19 +3805,26 @@ class App:
         ttk.Button(row, text="导入…", command=self._import_glossary).pack(side="left", padx=6)
         ttk.Button(row, text="导出…", command=self._export_glossary).pack(side="left")
         ttk.Label(row, text="最多 200 对，每词不超过 40 字；空着就是没有术语表，翻译和今天一样。导入会替换掉现在的术语表。",
-                  foreground="#5b6676").pack(side="left", padx=8)
+                  style="Note.TLabel").pack(side="left", padx=8)
 
         # 取词
         f = tab("grab", "取词")
+        section(f, "取词方式", first=True)
         check(f, "监听剪贴板", self.watch_var, self._on_watch, "复制文字后自动翻译并显示主窗口。")
         self.pointer_check_btn = check(
             f, "指针取词（%s）" % self.hotkey_pointer_label, self.pointer_var, self._on_pointer_opt,
             "把鼠标放在文字上按快捷键，取到指针处的文字并翻译（按钮、菜单上的字也能取）。")
         check(f, "悬停取词（鼠标停住自动取词）", self.hover_var, self._on_pointer_opt,
               "鼠标在文字、按钮、菜单上停住后自动取词；鼠标压在本程序的原文 / 译文框或弹窗上时不触发。")
-        check(f, "悬停时翻译整个窗口（代替取词）", self.hover_win_var, self._on_pointer_opt,
+        hover_deps = []
+        hover_deps.append(check(f, "取词时在指针旁显示「取词中…」提示", self.spinner_var, self._on_spinner_opt,
+              "识别 / 复制超过 0.25 秒才出现，结果一到就消失；不会被截进识别图，也不挡鼠标点击。"))
+        hover_deps.append(check(f, "只在按住 Ctrl 时悬停取词", self.hover_mod_var, self._on_hover_mod,
+              "开了以后鼠标随便停不会弹词，按住 Ctrl 再停住才取词；适合长时间阅读、不想被打扰。"))
+        hover_deps.append(check(f, "悬停时翻译整个窗口（代替取词）", self.hover_win_var, self._on_pointer_opt,
               "开启「悬停取词」后，鼠标在菜单 / 窗口上停住就整窗翻译（用下面的悬停等待，最少 1.2 秒）；"
-              "同一个窗口只翻一次，指针离开再回来才会重翻。")
+              "同一个窗口只翻一次，指针离开再回来才会重翻。"))
+        hover_deps.pop(0)                   # 加载提示对指针取词也有用，不依赖悬停
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(14, 0))
         ttk.Label(row, text="取词范围：").pack(side="left")
@@ -3043,26 +3832,33 @@ class App:
         self.scope_cb.set(SCOPE_NAMES[self.cfg.get("pointer_scope", "word")])
         self.scope_cb.pack(side="left")
         self.scope_cb.bind("<<ComboboxSelected>>", lambda e: self._on_pointer_opt())
-        ttk.Label(row, text="（悬停取词和指针取词共用）", foreground="#5b6676").pack(side="left", padx=6)
+        ttk.Label(row, text="（悬停取词和指针取词共用）", style="Note.TLabel").pack(side="left", padx=6)
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(10, 0))
         ttk.Label(row, text="悬停等待：").pack(side="left")
         sp = ttk.Spinbox(row, from_=300, to=3000, increment=100, width=7,
                          textvariable=self.hover_ms_var, command=self._on_hover_ms)
         sp.pack(side="left")
+        hover_deps.append(sp)
+        self._settings_deps.append((hover_deps, lambda: bool(self.hover_var.get())))
         sp.bind("<Return>", lambda e: self._on_hover_ms())
         sp.bind("<FocusOut>", lambda e: self._on_hover_ms())
-        ttk.Label(row, text="毫秒（300 ~ 3000，鼠标停住多久后自动取词）", foreground="#5b6676").pack(side="left", padx=6)
+        ttk.Label(row, text="毫秒（300 ~ 3000，鼠标停住多久后自动取词）", style="Note.TLabel").pack(side="left", padx=6)
 
         # —— v2.14 打字检测翻译：在别的软件里打字时自动翻译 ——
-        ttk.Separator(f).pack(fill="x", pady=(16, 8))
-        ttk.Label(f, text="打字检测翻译", font=(self._font_family, 10, "bold")).pack(anchor="w")
-        check(f, "打字检测翻译（在别的软件里打字时自动翻译）", self.typing_var, self._on_typing_opt,
+        section(f, "打字检测翻译")
+        # v2.15：专业版功能。未激活且试用已用完时开关置灰，只能点「升级到专业版」。
+        self.typing_check = check(f, "打字检测翻译（在别的软件里打字时自动翻译）", self.typing_var, self._on_typing_opt,
               "默认关闭。主触发是打字过程中：每打完一个词（空格 / 标点 / 回车分隔）就立即翻译"
               "刚打完的词/句；正在打的当前词每多打一个字符就用约 250 毫秒防抖跟进，同一气泡内"
               "实时更新译文；停顿 1 秒只作兜底。开启后重启生效；关闭时立即停监听、清空缓冲。"
               "密码框 / 终端窗口 / 敏感内容（验证码、身份证号、API 密钥等）不翻译，缓冲只放内存，"
               "绝不写盘、不写日志、不进历史。")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(8, 0))
+        ttk.Button(row, text="升级到专业版…", command=self._show_license_dialog).pack(side="left")
+        ttk.Label(row, text="专业版解锁打字检测翻译；首次可免费试用 7 天。",
+                  style="Note.TLabel").pack(side="left", padx=6)
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(10, 0))
         ttk.Label(row, text="打字范围：").pack(side="left")
@@ -3071,7 +3867,7 @@ class App:
                                             state="readonly", width=8)
         self.typing_scope_cb.pack(side="left")
         self.typing_scope_cb.bind("<<ComboboxSelected>>", lambda e: self._on_typing_opt())
-        ttk.Label(row, text="（单词：按词翻；整句：按句翻）", foreground="#5b6676").pack(side="left", padx=6)
+        ttk.Label(row, text="（单词：按词翻；整句：按句翻）", style="Note.TLabel").pack(side="left", padx=6)
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(10, 0))
         ttk.Label(row, text="停顿兜底：").pack(side="left")
@@ -3081,20 +3877,35 @@ class App:
         sp.bind("<Return>", lambda e: self._on_typing_pause())
         sp.bind("<FocusOut>", lambda e: self._on_typing_pause())
         ttk.Label(row, text="毫秒（500 ~ 3000，打完停住多久后兜底翻译；主触发是按词即翻，不等停顿）",
-                  foreground="#5b6676").pack(side="left", padx=6)
+                  style="Note.TLabel").pack(side="left", padx=6)
         self.typing_status_label = ttk.Label(
-            f, text=self._typing_status_text(), foreground="#5b6676", wraplength=540, justify="left")
+            f, text=self._typing_status_text(), style="Note.TLabel", wraplength=540, justify="left")
         self.typing_status_label.pack(anchor="w", pady=(6, 0))
 
         # —— v2.11 整窗翻译（进阶）：整个菜单 / 对话框 / 软件窗口一次翻完 ——
-        ttk.Separator(f).pack(fill="x", pady=(16, 8))
-        ttk.Label(f, text="整窗翻译", font=(self._font_family, 10, "bold")).pack(anchor="w")
+        section(f, "输入翻译（打完一句，替换成译文）")
+        self.input_var = tk.BooleanVar(value=bool(self.cfg.get("input_translate", False)))
+        check(f, "输入翻译：在任意输入框里打一句，按触发键就把它替换成译文", self.input_var, self._on_input_opt,
+              "适合聊天 / 写邮件时用母语打字、直接发出外语。只替换本句（回车或切换窗口后重新开始）；"
+              "密码框 / 终端 / 敏感内容不翻。替换时会临时借用剪贴板，0.4 秒后还原。和打字检测共用一个键盘监听。")
+        row = ttk.Frame(f)
+        row.pack(anchor="w", pady=(6, 0))
+        ttk.Label(row, text="触发键：").pack(side="left")
+        self.input_trigger_cb = ttk.Combobox(row, state="readonly", width=26,
+                                             values=[v for k, v in translator_tools.INPUT_TRIGGERS.items() if k != "ctrl_enter"])
+        self.input_trigger_cb.set(translator_tools.INPUT_TRIGGERS.get(self.cfg.get("input_trigger", "space3"),
+                                                                     translator_tools.INPUT_TRIGGERS["space3"]))
+        self.input_trigger_cb.pack(side="left")
+        self.input_trigger_cb.bind("<<ComboboxSelected>>", lambda e: self._on_input_opt())
+        ttk.Label(row, text="（中文输入法下请先上屏再按；Windows 以外只放进剪贴板）", style="Note.TLabel").pack(side="left", padx=6)
+
+        section(f, "整窗翻译")
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(6, 0))
         ttk.Button(row, text="整窗翻译（3 秒后翻指针下的窗口）",
                    command=lambda: self._settings_then(lambda: self.window_translate(delay_ms=3000))
                    ).pack(side="left")
-        ttk.Label(row, text="或按 %s" % self.hotkey_window_label, foreground="#5b6676").pack(side="left", padx=8)
+        ttk.Label(row, text="或按 %s" % self.hotkey_window_label, style="Note.TLabel").pack(side="left", padx=8)
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(8, 0))
         ttk.Checkbutton(row, text="实时刷新", variable=self.live_var,
@@ -3103,12 +3914,13 @@ class App:
         lcb.pack(side="left", padx=(8, 0))
         lcb.bind("<<ComboboxSelected>>", lambda e: self._on_live_interval())
         lcb.bind("<Return>", lambda e: self._on_live_interval())
-        ttk.Label(row, text="秒（每隔几秒重新翻译）", foreground="#5b6676").pack(side="left", padx=6)
+        ttk.Label(row, text="秒（每隔几秒重新翻译）", style="Note.TLabel").pack(side="left", padx=6)
         ttk.Label(f, text="实时刷新：译文层点击穿透，可以照常操作下面的软件；再按整窗热键或取消勾选停止。",
-                  foreground="#5b6676", wraplength=500, justify="left").pack(anchor="w", pady=(2, 0))
+                  style="Note.TLabel", wraplength=500, justify="left").pack(anchor="w", pady=(2, 0))
 
+        section(f, "结果显示")
         row = ttk.Frame(f)
-        row.pack(anchor="w", pady=(14, 0))
+        row.pack(anchor="w", pady=(6, 0))
         ttk.Label(row, text="取词结果显示：").pack(side="left")
         self.popup_cb = ttk.Combobox(row, values=list(POPUP_NAMES.values()), state="readonly", width=24)
         self.popup_cb.set(POPUP_NAMES.get(self.cfg.get("popup_mode", "bubble"), POPUP_NAMES["bubble"]))
@@ -3116,23 +3928,26 @@ class App:
         self.popup_cb.bind("<<ComboboxSelected>>", lambda e: self._on_popup_opt())
         ttk.Label(f, text="气泡：出现在指针旁，移开就消失；小窗口：固定大小、一直跟着指针走；"
                           "不弹窗：不显示任何弹窗，译文写进主窗口和历史。",
-                  foreground="#5b6676", wraplength=540, justify="left").pack(anchor="w", pady=(2, 0))
+                  style="Note.TLabel", wraplength=540, justify="left").pack(anchor="w", pady=(2, 0))
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(8, 0))
         ttk.Label(row, text="小窗口大小：宽").pack(side="left")
         self.mini_w_var = tk.IntVar(value=int(self.cfg.get("mini_w", 320)))
         self.mini_h_var = tk.IntVar(value=int(self.cfg.get("mini_h", 110)))
+        mini_deps = []
         for var, key, unit in ((self.mini_w_var, "mini_w", "　高"), (self.mini_h_var, "mini_h", "")):
             lo, hi, _dv = MINI_SIZE[key]
             sp = ttk.Spinbox(row, from_=lo, to=hi, increment=10, width=5, textvariable=var,
                              command=self._on_mini_size)
+            mini_deps.append(sp)
             sp.pack(side="left", padx=(2, 0))
             sp.bind("<Return>", lambda e: self._on_mini_size())
             sp.bind("<FocusOut>", lambda e: self._on_mini_size())
             if unit:
                 ttk.Label(row, text=unit).pack(side="left", padx=(8, 0))
-        ttk.Label(row, text="像素（宽 160~800，高 60~500）", foreground="#5b6676").pack(side="left", padx=6)
+        ttk.Label(row, text="像素（宽 160~800，高 60~500）", style="Note.TLabel").pack(side="left", padx=6)
         ttk.Button(row, text="预览", command=self._preview_mini).pack(side="left")
+        self._settings_deps.append((mini_deps, lambda: self.cfg.get("popup_mode", "bubble") == "mini"))
 
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(14, 0))
@@ -3141,10 +3956,11 @@ class App:
         self.shot_cb.set(SHOT_NAMES.get(self.cfg.get("shot_mode", "overlay"), SHOT_NAMES["overlay"]))
         self.shot_cb.pack(side="left")
         self.shot_cb.bind("<<ComboboxSelected>>", lambda e: self._save())
-        ttk.Label(row, text="（Ctrl+Alt+S 框选后，译文直接盖在截图的原文位置上）", foreground="#5b6676").pack(side="left", padx=6)
+        ttk.Label(row, text="（Ctrl+Alt+S 框选后，译文直接盖在截图的原文位置上）", style="Note.TLabel").pack(side="left", padx=6)
 
         # 历史
         f = tab("history", "历史")
+        section(f, "翻译记录", first=True)
         check(f, "自动保存翻译记录", self.history_on_var, self._on_history_opt,
               "每次翻译成功都存下原文和译文（主窗口、指针取词、悬停取词、截图翻译都存）。"
               "只存在本机 history.db 里，不上传。")
@@ -3159,18 +3975,21 @@ class App:
         sp.pack(side="left")
         sp.bind("<Return>", lambda e: self._on_history_opt())
         sp.bind("<FocusOut>", lambda e: self._on_history_opt())
-        ttk.Label(row, text="条（超出时自动删最旧的；收藏的不会被删）", foreground="#5b6676").pack(side="left", padx=6)
+        ttk.Label(row, text="条（超出时自动删最旧的；收藏的不会被删）", style="Note.TLabel").pack(side="left", padx=6)
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(14, 0))
         ttk.Button(row, text="打开翻译历史…", command=self.open_history).pack(side="left")
         ttk.Button(row, text="导出全部…", command=lambda: self._hist_export(None)).pack(side="left", padx=8)
         ttk.Button(row, text="清空历史（保留收藏）", command=self._hist_clear).pack(side="left")
-        self.hist_info = ttk.Label(f, text="", foreground="#5b6676")
+        self.hist_info = ttk.Label(f, text="", style="Note.TLabel")
         self.hist_info.pack(anchor="w", pady=(10, 0))
         self._hist_update_info()
 
         # 托盘
         f = tab("tray", "托盘")
+        section(f, "托盘", first=True)
+        self.tray_state_label = ttk.Label(f, text="", style="Note.TLabel")
+        self.tray_state_label.pack(anchor="w")
         check(f, "第一次隐藏到托盘时提示一次", self.tray_tip_var, self._save,
               "只在第一次弹出气泡，告诉你程序没退出、去哪里找回。")
         ttk.Label(f, text="托盘图标右键菜单：", font=self.ui_font).pack(anchor="w", pady=(16, 2))
@@ -3178,49 +3997,56 @@ class App:
                           "指针取词、悬停取词、取词范围（可直接开关、切换）\n"
                           "监听剪贴板、窗口置顶、断网自动离线、开机自启\n"
                           "高级设置 / 网络检查 / 离线语言包 / 退出",
-                  foreground="#5b6676", justify="left").pack(anchor="w", padx=(12, 0))
-        ttk.Label(f, text="单击托盘图标显示主窗口。", foreground="#5b6676").pack(anchor="w", pady=(8, 0))
+                  style="Note.TLabel", justify="left").pack(anchor="w", padx=(12, 0))
+        ttk.Label(f, text="单击托盘图标显示主窗口。", style="Note.TLabel").pack(anchor="w", pady=(8, 0))
 
         # 离线与网络
         f = tab("offline", "离线与网络")
+        section(f, "离线翻译与网络检查", first=True)
         ttk.Label(f, text="离线语言包让你在没有网络时也能翻译；网络检查帮你判断是哪个翻译引擎连不上。",
-                  foreground="#5b6676", wraplength=500, justify="left").pack(anchor="w")
+                  style="Note.TLabel", wraplength=500, justify="left").pack(anchor="w")
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(14, 0))
         ttk.Button(row, text="网络检查", command=self.open_netcheck).pack(side="left")
         ttk.Button(row, text="离线语言包…", command=self._show_offline_packs).pack(side="left", padx=8)
         ttk.Label(f, text="「断网时自动改用离线翻译」的开关在「翻译」页。",
-                  foreground="#5b6676").pack(anchor="w", pady=(10, 0))
+                  style="Note.TLabel").pack(anchor="w", pady=(10, 0))
         # v2.9：代理（只影响 Google / 微软在线翻译引擎）
-        ttk.Label(f, text="代理（在线翻译引擎用）：", font=self.ui_font).pack(anchor="w", pady=(16, 2))
+        section(f, "代理（在线翻译引擎用）")
         check(f, "使用代理服务器", self.proxy_enabled_var, self._on_proxy,
               "公司 / 学校网络需要代理才能上网时勾上；不勾就和今天一样直连。")
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(8, 0))
         ttk.Label(row, text="地址：").pack(side="left")
-        ttk.Entry(row, textvariable=self.proxy_host_var, width=24).pack(side="left")
+        proxy_deps = [ttk.Entry(row, textvariable=self.proxy_host_var, width=24)]
+        proxy_deps[-1].pack(side="left")
         ttk.Label(row, text="端口：").pack(side="left", padx=(8, 0))
-        ttk.Entry(row, textvariable=self.proxy_port_var, width=7).pack(side="left")
+        proxy_deps.append(ttk.Entry(row, textvariable=self.proxy_port_var, width=7))
+        proxy_deps[-1].pack(side="left")
         row = ttk.Frame(f)
         row.pack(anchor="w", pady=(6, 0))
         ttk.Label(row, text="账号：").pack(side="left")
-        ttk.Entry(row, textvariable=self.proxy_user_var, width=16).pack(side="left")
+        proxy_deps.append(ttk.Entry(row, textvariable=self.proxy_user_var, width=16))
+        proxy_deps[-1].pack(side="left")
         ttk.Label(row, text="密码：").pack(side="left", padx=(8, 0))
-        ttk.Entry(row, textvariable=self.proxy_pass_var, width=16, show="*").pack(side="left")
+        proxy_deps.append(ttk.Entry(row, textvariable=self.proxy_pass_var, width=16, show="*"))
+        proxy_deps[-1].pack(side="left")
+        self._settings_deps.append((proxy_deps, lambda: bool(self.proxy_enabled_var.get())))
         ttk.Button(row, text="保存", command=self._on_proxy).pack(side="left", padx=8)
         ttk.Label(f, text="只影响 Google / 微软在线翻译引擎；离线翻译、检查更新、语言包下载不走这个代理。"
                           "密码只存本机，导出设置时不带出。",
-                  foreground="#5b6676", wraplength=500, justify="left").pack(anchor="w", pady=(4, 0))
+                  style="Note.TLabel", wraplength=500, justify="left").pack(anchor="w", pady=(4, 0))
 
         # 关于
         f = tab("about", "快捷键与关于")
+        section(f, "关于", first=True)
         ttk.Label(f, text="%s v%s" % (APP_TITLE, __version__), font=self.ui_font).pack(anchor="w")
         self.about_hotkey_label = ttk.Label(f, text="", justify="left")
         self.about_hotkey_label.pack(anchor="w", pady=(10, 0))
         self._refresh_hotkey_labels()
 
-        ttk.Label(f, text="自定义全局快捷键（和别的软件冲突时可以在这里改）：",
-                  font=self.ui_font).pack(anchor="w", pady=(16, 2))
+        section(f, "自定义全局快捷键")
+        ttk.Label(f, text="和别的软件冲突时可以在这里改：", style="Note.TLabel").pack(anchor="w", pady=(0, 2))
         self.hotkey_main_var = tk.StringVar(value=self.hotkey_main_label)
         self.hotkey_pointer_var = tk.StringVar(value=self.hotkey_pointer_label)
         self.hotkey_shot_var = tk.StringVar(value=self.hotkey_shot_label)
@@ -3248,34 +4074,160 @@ class App:
         row.pack(anchor="w", pady=(10, 0))
         ttk.Button(row, text="保存快捷键", command=self._save_hotkeys).pack(side="left")
         ttk.Label(row, text="保存后重启程序生效（热键注册只在启动时做一次）。",
-                  foreground="#5b6676").pack(side="left", padx=8)
-        ttk.Label(f, text="更新：", font=self.ui_font).pack(anchor="w", pady=(16, 2))
+                  style="Note.TLabel").pack(side="left", padx=8)
+        section(f, "更新")
         row = ttk.Frame(f)
         row.pack(anchor="w")
         ttk.Button(row, text="检查更新", command=self._check_update_manual).pack(side="left")
         self.update_label = ttk.Label(row, text="当前版本 v%s" % __version__,
-                                      foreground="#5b6676")
+                                      style="Note.TLabel")
         self.update_label.pack(side="left", padx=8)
         check(f, "每天启动时自动检查更新", self.update_auto_var, self._save,
               "每天只查一次；有新版才告诉你，从不自动下载、从不自动安装。")
-        ttk.Label(f, text="诊断信息：", font=self.ui_font).pack(anchor="w", pady=(16, 2))
+        section(f, "安装与卸载")
+        row = ttk.Frame(f)
+        row.pack(anchor="w")
+        self.uninst_btn = ttk.Button(row, text="卸载程序…", command=self._run_uninstaller)
+        self.uninst_btn.pack(side="left")
+        ttk.Button(row, text="打开数据文件夹", command=lambda: open_folder(DATA_DIR)).pack(side="left", padx=6)
+        ttk.Label(row, text=install_info_text(), style="Note.TLabel", wraplength=420,
+                  justify="left").pack(side="left", padx=8)
+        if not find_uninstaller():
+            self.uninst_btn.state(["disabled"])
+        section(f, "诊断信息")
         row = ttk.Frame(f)
         row.pack(anchor="w")
         ttk.Button(row, text="复制诊断信息", command=self._copy_diag_info).pack(side="left")
         ttk.Label(row, text="一键复制版本号、系统版本、DPI 缩放、OCR 是否可用和各热键注册状态；"
                             "报「某个热键没反应」时直接把这段贴出来定位，不用来回问。",
-                  foreground="#5b6676", wraplength=420, justify="left").pack(side="left", padx=8)
+                  style="Note.TLabel", wraplength=420, justify="left").pack(side="left", padx=8)
 
         bar = ttk.Frame(win)
         bar.pack(fill="x", padx=10, pady=(0, 10))
         ttk.Button(bar, text="恢复默认设置", command=self._reset_settings).pack(side="left")
-        ttk.Button(bar, text="关闭", command=self.close_settings).pack(side="right")
+        ttk.Button(bar, text="关闭", command=self.close_settings, style="Accent.TButton").pack(side="right")
+        ttk.Label(bar, text="勾选项改完立即生效；带「保存」按钮的（术语表 / 代理 / 快捷键）要点保存。",
+                  style="Note.TLabel").pack(side="left", padx=10)
+        # 标签页文字也进搜索索引
+        for key, sf in self.settings_tabs.items():
+            self._settings_index.append((key, None, nb.tab(sf, "text")))
+        self._refresh_settings_deps()
+
+    # ------------------------------------------------ v2.15.4 高级设置：搜索 / 依赖置灰 / 记住页签
+    @staticmethod
+    def _settings_match(index, query, limit=12):
+        """纯函数：在 [(tab, widget, text)] 里找含所有关键字（空格分隔、不区分大小写）的项。"""
+        q = [w for w in (query or "").lower().split() if w]
+        if not q:
+            return []
+        out = []
+        for item in index:
+            t = (item[2] or "").lower()
+            if all(w in t for w in q):
+                out.append(item)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def _settings_search(self):
+        lb = self.settings_results
+        q = self.settings_search_var.get()
+        self._settings_hits = self._settings_match(self._settings_index, q)
+        lb.delete(0, "end")
+        names = {k: self.settings_nb.tab(sf, "text") for k, sf in self.settings_tabs.items()}
+        for key, _w, text in self._settings_hits:
+            first = text.split("  ")[0].split("（")[0].strip()
+            first = first if len(first) <= 34 else first[:34] + "…"
+            lb.insert("end", "%s  ›  %s" % (names.get(key, ""), first))
+        if self._settings_hits:
+            lb.configure(height=min(6, len(self._settings_hits)))
+            if not lb.winfo_ismapped():
+                lb.pack(fill="x", padx=10, pady=(4, 0), before=self.settings_nb)
+            self.settings_search_hint.configure(text="%d 项" % len(self._settings_hits))
+        else:
+            lb.pack_forget()
+            self.settings_search_hint.configure(text="没有找到" if q.strip() else "搜索设置（Ctrl+F）")
+
+    def _settings_search_go(self, idx=None):
+        lb = self.settings_results
+        if idx is None:
+            sel = lb.curselection()
+            idx = sel[0] if sel else 0
+        if not (0 <= idx < len(self._settings_hits)):
+            return
+        key, w, _t = self._settings_hits[idx]
+        if key in self.settings_tabs:
+            self.settings_nb.select(self.settings_tabs[key])
+        if w is not None:
+            self.root.after(60, lambda: self._settings_flash(key, w))
+
+    def _settings_flash(self, key, w):
+        """滚到目标控件并闪一下（ttk 控件切到 focus 态 + 前景色短暂变蓝）。"""
+        sf = self.settings_tabs.get(key)
+        try:
+            sf.update_idletasks()
+            total = max(1, sf.body.winfo_height())
+            y = w.winfo_rooty() - sf.body.winfo_rooty()
+            sf.canvas.yview_moveto(max(0.0, (y - 40) / float(total)))
+        except Exception:
+            pass
+        try:
+            w.focus_set()
+        except Exception:
+            pass
+        try:
+            st = w.cget("style") or ""
+            w.configure(style="Found." + (st.split(".")[-1] if st else w.winfo_class()))
+            self.root.after(1200, lambda: w.configure(style=st))
+        except Exception:
+            pass
+
+    def _refresh_settings_deps(self):
+        """依赖关系：没开悬停取词时悬停相关选项置灰；不用代理时代理输入框置灰；
+        不是小窗口模式时小窗口大小置灰。"""
+        for widgets, cond in getattr(self, "_settings_deps", []):
+            try:
+                on = bool(cond())
+            except Exception:
+                on = True
+            for w in widgets:
+                try:
+                    w.state(["!disabled"] if on else ["disabled"])
+                except Exception:
+                    pass
+        try:
+            lab = getattr(self, "tray_state_label", None)
+            if lab is not None:
+                lab.configure(text="托盘状态：" + ("✅ 运行中" if self._tray_alive() else
+                              "❌ 没有托盘图标（详细原因见 %TEMP%\\RealtimeTranslate_tray.log）"))
+        except Exception:
+            pass
+
+    def _remember_settings_tab(self):
+        try:
+            cur = self.settings_nb.select()
+            for k, sf in self.settings_tabs.items():
+                if str(sf) == cur:
+                    self.cfg["settings_tab"] = k
+        except Exception:
+            pass
 
     def open_settings(self, tab=None):
         win = self.settings_win
         self._refresh_tts_voices()   # 打开设置时才枚举已安装语音，不拖慢启动
+        self._refresh_typing_ui()    # v2.15：每次打开设置都按授权状态刷新打字检测开关
+        if tab is None:
+            tab = self.cfg.get("settings_tab")        # v2.15.4：回到上次看的那一页
         if tab in self.settings_tabs:
             self.settings_nb.select(self.settings_tabs[tab])
+        g = ui_platform.clamp_geometry(self.cfg.get("settings_geometry") or "", win.winfo_screenwidth(),
+                                       win.winfo_screenheight()) if self.cfg.get("settings_geometry") else None
+        if g:
+            try:
+                win.geometry(g)
+            except Exception:
+                pass
+        self._refresh_settings_deps()
         win.deiconify()
         win.lift()
         win.attributes("-topmost", True)
@@ -3292,6 +4244,13 @@ class App:
         fn()
 
     def close_settings(self):
+        try:
+            self.cfg["settings_geometry"] = self.settings_win.geometry()
+            self._remember_settings_tab()
+            self.settings_search_var.set("")
+            self._save()
+        except Exception:
+            pass
         self.settings_win.withdraw()
 
     def _on_mini_follow(self):
@@ -3300,6 +4259,7 @@ class App:
         self._on_popup_opt()
 
     def _on_popup_opt(self):
+        self.root.after(0, self._refresh_settings_deps)
         self._save()
         if hasattr(self, "mini_follow_var"):
             self.mini_follow_var.set(self.cfg.get("popup_mode") == "mini")
@@ -3428,6 +4388,8 @@ class App:
         self.ui_font = (fam, max(8, size - 1))
         try:                                    # v2.13：表格行高 / 按钮字体跟着字号走，按钮行重新折行
             ui_platform.apply_styles(self.root, fam, size)
+            if self.cfg.get("apple_theme", True):
+                self._apply_theme()
             self._fit_min_width()
         except Exception:
             pass
@@ -3485,7 +4447,56 @@ class App:
         self.cfg["tts_voice"] = "" if v == "系统默认语音" else v
         self._save()
 
+    # ------------------------------------------------ v2.15.4 需要 Key 的引擎
+    def _save_engine_keys(self, quiet=False):
+        for k, v in self.key_vars.items():
+            self.cfg[k] = v.get().strip()
+        set_engine_keys(self.cfg)
+        self._save()
+        self._refresh_key_status()
+        if not quiet:
+            self.status.configure(text="引擎 Key 已保存")
+
+    def _clear_engine_keys(self):
+        if not messagebox.askyesno("清除 Key", "清除 DeepL / 百度 / 有道 的全部 Key？", parent=self.settings_win):
+            return
+        for v in self.key_vars.values():
+            v.set("")
+        self._save_engine_keys(quiet=True)
+        if self.engine.get() in KEY_ENGINES:
+            self.engine.set("自动")
+            self._save()
+
+    def _refresh_key_status(self):
+        for eng, lab in getattr(self, "key_status", {}).items():
+            try:
+                lab.configure(text="已填写" if engine_configured(eng) else "未填写")
+            except Exception:
+                pass
+
+    def _test_engine_key(self, eng):
+        """先保存，再用 hello 试翻一次；在后台线程里跑，结果回到 Tk 线程显示。"""
+        self._save_engine_keys(quiet=True)
+        lab = self.key_status.get(eng)
+        if not engine_configured(eng):
+            lab.configure(text="❌ 还没填完")
+            return
+        lab.configure(text="测试中…")
+
+        def job():
+            try:
+                _tl.online_deadline = time.monotonic() + 12
+                out = _engine_call(eng, "hello", "en", "zh-CN")[0]
+                msg = "✅ 可用：hello → %s" % out[:16]
+            except Exception as e:      # noqa: BLE001
+                msg = "❌ " + (str(e) if isinstance(e, EngineKeyError) else netcheck.explain_error(e)[0])[:60]
+            finally:
+                _tl.online_deadline = None
+            self.q.put(("key_test", eng, msg))
+        threading.Thread(target=job, daemon=True).start()
+
     def _on_proxy(self):
+        self.root.after(0, self._refresh_settings_deps)
         """代理设置改了就保存并立刻生效（不用重启）。"""
         try:
             port = int((self.proxy_port_var.get() or "").strip() or 0)
@@ -3608,6 +4619,28 @@ class App:
             if not self.pet_bubble_var.get():
                 p.bubble.hide()
 
+    def _on_spinner_opt(self):
+        self.cfg["grab_spinner"] = bool(self.spinner_var.get())
+        if not self.cfg["grab_spinner"]:
+            self.spinner.stop()
+        self._save()
+
+    def _on_hover_mod(self):
+        self.cfg["hover_need_ctrl"] = bool(self.hover_mod_var.get())
+        self.hover_last = None
+        self._save()
+
+    def _on_apple_theme(self):
+        self.cfg["apple_theme"] = self.apple_var.get()
+        if not self.apple_var.get():
+            try:                         # 关掉后回到系统原生主题
+                ui_platform.pick_theme(ttk.Style())
+                ui_platform.apply_styles(self.root, self._font_family, int(self.cfg.get("font_size", 11)))
+            except Exception:
+                pass
+        self._apply_theme()
+        self._save()
+
     def _on_cute_theme(self):
         self.cfg["cute_theme"] = self.cute_var.get()
         set_cute(self.cute_var.get())
@@ -3618,6 +4651,66 @@ class App:
         self.cfg["dark_mode"] = self.dark_var.get()
         self._apply_theme()
         self._save()
+
+    def _apply_apple_theme(self, dark):
+        """v2.15.1 苹果风格：整套 ttk 换成 clam 自定义样式，文本框变白色卡片。成功返回 True。"""
+        try:
+            fam = getattr(self, "_font_family", None) or ui_platform.ui_family(self.root)
+            size = int(self.cfg.get("font_size", 11))
+            p = ui_platform.apply_apple_style(self.root, fam, size, dark)
+        except Exception:
+            return False
+        try:
+            self.root.configure(background=p["bg"])
+        except Exception:
+            pass
+        for name in ("src", "dst", "hist_detail", "net_txt"):
+            w = getattr(self, name, None)
+            if w is not None:
+                ui_platform.style_text_apple(w, p)
+        lb = getattr(self, "settings_results", None)
+        if lb is not None:
+            try:
+                lb.configure(background=p["card"], foreground=p["fg"], selectbackground=p["accent"],
+                             selectforeground=p["accent_fg"], highlightbackground=p["border"],
+                             highlightcolor=p["accent"], borderwidth=0)
+            except Exception:
+                pass
+        gt = getattr(self, "glossary_text", None)
+        if gt is not None:
+            ui_platform.style_text_apple(gt, p)
+        try:
+            self.dst.tag_configure("src", foreground=p["gray"])
+        except Exception:
+            pass
+        for w in (getattr(self, "status", None), getattr(self, "hint", None),
+                  getattr(self, "engine_hint", None), getattr(self, "dict_label", None)):
+            try:
+                if w is not None:
+                    w.configure(foreground=p["gray"])
+            except Exception:
+                pass
+        th = theme_colors(dark)
+        bub = {"bubble_bg": p["card"], "bubble_fg": p["fg"], "bubble_gray": p["gray"],
+               "bubble_foot": p["gray"]}
+        for pop in (getattr(self, "bubble", None), getattr(self, "mini", None)):
+            try:
+                if pop is not None and pop.alive():
+                    pop._fill(pop.head.cget("text"), pop.body.cget("text"), False)
+                    for wd, key in ((pop.head, "bubble_gray"), (pop.body, "bubble_fg"),
+                                    (pop.foot, "bubble_foot")):
+                        wd.configure(background=bub["bubble_bg"], foreground=bub[key])
+            except Exception:
+                pass
+        try:
+            self._fit_min_width()
+        except Exception:
+            pass
+        try:
+            self.render()
+        except Exception:
+            pass
+        return True
 
     def _apply_theme(self):
         """应用当前外观：深色 / 浅色。
@@ -3631,6 +4724,17 @@ class App:
         """
         dark = bool(self.cfg.get("dark_mode", False))
         th = theme_colors(dark)
+        if self.cfg.get("apple_theme", True) and not (self.cfg.get("cute_theme") and not dark):
+            if self._apply_apple_theme(dark):
+                return
+        try:
+            ui_platform.configure_common_labels(ttk.Style(), getattr(self, "_font_family", "TkDefaultFont"),
+                                                int(self.cfg.get("font_size", 11)),
+                                                gray=th["gray"] if dark else "#5b6676")
+            for s_ in ("Note.TLabel", "Section.TLabel"):
+                ttk.Style().configure(s_, background=th["bg"])
+        except Exception:
+            pass
         try:
             self.root.configure(background=th["bg"])
         except Exception:
@@ -3781,6 +4885,21 @@ class App:
             len(self.cfg.get("glossary", [])), path))
 
     # ------------------------------------------------ v2.12 诊断信息 / 术语沉淀 / 对照表导出
+    def _run_uninstaller(self):
+        u = find_uninstaller()
+        if not u:
+            messagebox.showinfo("卸载", install_info_text(), parent=self.settings_win)
+            return
+        if not messagebox.askyesno("卸载", "确定要卸载%s吗？\n程序会先退出，然后打开卸载向导。" % APP_TITLE,
+                                   parent=self.settings_win):
+            return
+        try:
+            os.startfile(u)               # noqa: S606  卸载向导会自己请求管理员权限
+        except Exception as e:
+            messagebox.showerror("卸载", "无法启动卸载程序：%s" % e, parent=self.settings_win)
+            return
+        self.root.after(300, self.quit)   # 退出，释放互斥体和 exe 文件锁
+
     def _copy_diag_info(self):
         """设置 → 关于里的「复制诊断信息」：版本号、系统版本、DPI 缩放、OCR 是否可用、
         各热键注册状态，一键进剪贴板。任何一项探测失败都只写"不可用"，不弹窗、不崩。"""
@@ -3974,7 +5093,11 @@ class App:
         的同一套写法回填，再保存一次。
         """
         d = cfg
+        # v2.15：授权状态只存本机 —— 导入设置绝不能把已激活的专业版冲回免费版
+        #（import_settings 返回的 d 以 DEFAULTS 为底，license_* 都是空值）。
+        lic = {k: self.cfg.get(k) for k in license.LICENSE_KEYS}
         self.cfg.update(d)
+        self.cfg.update(lic)
         if d.get("sl") == "auto" or d.get("sl") in LANGS:
             self.sl.set(AUTO if d["sl"] == "auto" else lang_name(d["sl"]))
         if d.get("tl") in LANGS:
@@ -4404,6 +5527,11 @@ class App:
                 self.engine_hint.configure(text="尚无语言包，点「离线语言包…」下载或导入")
         elif eng == "微软":
             self.engine_hint.configure(text="Edge 免费端点，无需 Key")
+        elif eng in KEY_ENGINES and not engine_configured(eng):
+            self.engine_hint.configure(text="还没填 Key：高级设置 → 翻译 → 需要 Key 的引擎")
+        elif eng in ENGINE_HINTS:
+            last = _auto_state.get("last_ok") if eng == "自动" else None
+            self.engine_hint.configure(text=ENGINE_HINTS[eng] + ("（当前：%s）" % last if last else ""))
         else:
             self.engine_hint.configure(text="Google 免费端点" + ("" if offline_engine.runtime_present() else " · 点「离线语言包…」可下载离线组件"))
 
@@ -4993,6 +6121,7 @@ class App:
 
     # ------------------------------------------------ 指针取词
     def _on_pointer_opt(self):
+        self.root.after(0, self._refresh_settings_deps)
         self.cfg["pointer_scope"] = SCOPE_CODES.get(self.scope_cb.get(), "word")
         self.cfg["hover"] = self.hover_var.get()
         self.cfg["hover_window"] = self.hover_win_var.get()
@@ -5000,28 +6129,128 @@ class App:
         self._save()
 
     # ------------------------------------------------ 打字检测翻译（v2.14）
+    # v2.15：打字检测翻译是专业版功能（免费版 / 7 天试用 / 专业版，见 license.py）
+    def _license_state_text(self):
+        """授权状态一句话（v2.15）：专业版 / 试用剩余天数 / 免费版。"""
+        st = license.status_of(self.cfg)
+        if st == "pro":
+            return "专业版已激活"
+        if st == "trial":
+            return "试用中，剩余 %.1f 天" % license.trial_days_left(self.cfg)
+        if license.trial_available(self.cfg):
+            return "免费版（可免费试用 7 天）"
+        return "免费版（试用已结束）"
+
     def _typing_status_text(self):
         """打字检测翻译的状态说明（高级设置 → 取词里显示）。"""
+        lic = self._license_state_text()
         if not IS_WIN and keyboard is None:
-            return "打字检测翻译：本机不可用——未安装 pynput（pip install pynput 后重启）。"
+            return "打字检测翻译：本机不可用——未安装 pynput（pip install pynput 后重启）。%s。" % lic
         if self.cfg.get("typing"):
             return ("打字检测翻译：已开启，重启后生效。主触发是打字过程中按词即翻，"
-                    "停顿 %d 毫秒只作兜底；密码框 / 终端 / 敏感内容不翻译。" % self.cfg.get("typing_pause_ms", 1000))
-        return "打字检测翻译：已关闭（默认）。开启后在别的软件里打字时自动翻译。"
+                    "停顿 %d 毫秒只作兜底；密码框 / 终端 / 敏感内容不翻译。%s。" % (self.cfg.get("typing_pause_ms", 1000), lic))
+        return "打字检测翻译：已关闭（默认）。开启后在别的软件里打字时自动翻译。%s。" % lic
 
-    def _on_typing_opt(self):
-        """打字检测翻译开关 / 范围改动：保存；关闭时立即停监听、清空缓冲
-        （隐私优先）；开启后重启生效（与全局快捷键的配置方式一致）。"""
-        self.cfg["typing_scope"] = TYPING_SCOPE_CODES.get(self.typing_scope_var.get(), "word")
-        self.cfg["typing"] = self.typing_var.get()
-        self._save()
-        if not self.typing_var.get():
-            self._stop_typing()
+    def _refresh_typing_ui(self):
+        """v2.15：按授权状态刷新打字检测开关（置灰 / 放开）与状态说明。
+        试用还没用过：开关放开，点一下就开始 7 天试用；试用完又没买：置灰，
+        只能点旁边的「升级到专业版」按钮。"""
         try:
+            allowed = license.typing_allowed(self.cfg)
+            trial_ok = license.trial_available(self.cfg)
+            cb = getattr(self, "typing_check", None)
+            if cb is not None:
+                cb.configure(state="normal" if (allowed or trial_ok) else "disabled")
             if getattr(self, "typing_status_label", None) is not None:
                 self.typing_status_label.configure(text=self._typing_status_text())
         except Exception:
             pass
+
+    def _show_license_dialog(self):
+        """v2.15：专业版激活框（高级设置 → 取词的「升级到专业版」按钮、
+        托盘菜单点打字检测时也会弹到这里）。全程离线验证，不联网。"""
+        self.show_window()
+        try:
+            win = tk.Toplevel(self.root)
+        except Exception:
+            return
+        win.title("升级到专业版")
+        ui_platform.fit_window(win, 480, 320, 480, 320, parent=self.root)
+        try:
+            if IS_WIN:
+                win.iconbitmap(resource_path("app.ico"))
+        except Exception:
+            pass
+        ttk.Label(win, text="打字检测翻译是专业版功能", font=(self._font_family, 11, "bold")).pack(
+            anchor="w", padx=14, pady=(14, 4))
+        ttk.Label(win, text="在别的软件里打字就自动翻译，不用选中、不用按快捷键。\n"
+                            "免费版其他功能不受影响；买断制，一次购买终身使用。",
+                  wraplength=440, justify="left").pack(anchor="w", padx=14)
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=14, pady=(12, 4))
+        ttk.Label(row, text="激活码：").pack(side="left")
+        code_var = tk.StringVar()
+        ent = ttk.Entry(row, textvariable=code_var, width=26)
+        ent.pack(side="left", fill="x", expand=True)
+        ent.focus_set()
+        msg = ttk.Label(win, text=self._license_state_text(), foreground="#5b6676",
+                        wraplength=440, justify="left")
+        msg.pack(anchor="w", padx=14, pady=(4, 0))
+
+        def _do_activate():
+            code = code_var.get().strip()
+            if not code:
+                msg.configure(text="请先输入激活码。")
+                return
+            ok, text, _info = license.activate(self.cfg, code)
+            if not ok:
+                msg.configure(text=text)
+                return
+            self._save()
+            self._refresh_typing_ui()
+            self._refresh_tray_state()
+            msg.configure(text=text + "\n已解锁，打开打字检测开关后重启生效。")
+            self.status.configure(text="专业版已激活，打字检测翻译已解锁")
+
+        def _do_trial():
+            if license.start_trial(self.cfg):
+                self._save()
+                self._refresh_typing_ui()
+                self._refresh_tray_state()
+                msg.configure(text="已开始 7 天免费试用。打开打字检测开关后重启生效。")
+            else:
+                msg.configure(text="试用已经用过了，请输入激活码升级到专业版。")
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=14, pady=(12, 0))
+        ttk.Button(btns, text="激活", command=_do_activate).pack(side="left")
+        if license.trial_available(self.cfg):
+            ttk.Button(btns, text="开始 7 天免费试用", command=_do_trial).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="关闭", command=win.destroy).pack(side="right")
+        win.bind("<Return>", lambda e: _do_activate())
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    def _on_typing_opt(self):
+        """打字检测翻译开关 / 范围改动：保存；关闭时立即停监听、清空缓冲
+        （隐私优先）；开启后重启生效（与全局快捷键的配置方式一致）。
+        v2.15：专业版功能 —— 未激活时打开开关先给 7 天试用（只给一次），
+        试用用完又没买就弹激活框、开关打回去。"""
+        self.cfg["typing_scope"] = TYPING_SCOPE_CODES.get(self.typing_scope_var.get(), "word")
+        if self.typing_var.get() and not license.typing_allowed(self.cfg):
+            if license.trial_available(self.cfg):
+                license.start_trial(self.cfg)
+            else:
+                self.typing_var.set(False)
+                self.cfg["typing"] = False
+                self._save()
+                self._refresh_typing_ui()
+                self._show_license_dialog()
+                return
+        self.cfg["typing"] = self.typing_var.get()
+        self._save()
+        if not self.typing_var.get():
+            self._stop_typing()
+        self._refresh_typing_ui()
         self._refresh_tray_state()
 
     def _on_typing_pause(self):
@@ -5049,6 +6278,10 @@ class App:
         return "没有取到文字。这个位置的文字可能不可选（图片、按钮等）。"
 
     def _pointer_translate(self, text, xy):
+        try:
+            self.spinner.stop()
+        except Exception:
+            pass
         self.bseq += 1
         my = self.bseq
         mode = self.cfg.get("popup_mode", "bubble")
@@ -5058,7 +6291,11 @@ class App:
             else:
                 self._popup().show(xy, "指针取词", self._pointer_empty_msg(), error=True)
             return
-        text = text[:1000]
+        text = normalize_grab_text(text)[:1000]
+        if not text:
+            return
+        if "\n" not in text and len(text.split()) == 1:
+            text = ocr_win.clean_word(text)      # v2.15.2：单个词去掉两头标点，命中词典 / 缓存
         sl, tl = self._codes()
         kind = self.grab_mode if self.grab_mode in ("pointer", "hover") else "pointer"
         if mode == "main":
@@ -5138,7 +6375,7 @@ class App:
             return True
         try:
             top = w.winfo_toplevel()
-            return top in (self.bubble.win, self.mini.win)
+            return top in (self.bubble.win, self.mini.win, getattr(self.spinner, "win", None))
         except Exception:
             return False
 
@@ -5157,8 +6394,14 @@ class App:
         if self._hover_blocked(pos):
             self.hover_last = None
             return
+        if self.cfg.get("hover_need_ctrl") and not ctrl_down_win():
+            self.hover_last = None          # v2.15.3：只在按住 Ctrl 时悬停取词，平时不打扰
+            return
         now = time.time()
-        if pos != self.hover_last:
+        last = self.hover_last
+        # v2.15.2：手抖 3px 以内不算移动，否则鼠标轻微晃动会一直重置计时、永远取不到词
+        moved = last is None or abs(pos[0] - last[0]) > 3 or abs(pos[1] - last[1]) > 3
+        if moved:
             self.hover_last, self.hover_since, self.hover_fired = pos, now, False
             return
         if self.hover_fired:
@@ -5192,6 +6435,8 @@ class App:
         self.grab_xy = pos
         self.mini.hide_for_capture()            # 小窗口别被截进 OCR
         scope = SCOPE_CODES.get(self.scope_cb.get(), "word")     # 在 Tk 线程里读，别在 worker 里碰 Tk
+        bw, bh = self._OCR_BOX.get(scope, self._OCR_BOX["word"])
+        self.spinner.start(pos, "识别中…", avoid=(bw // 2, bh // 2))
         lang = self._ocr_lang()
         bounds = screen_bounds() or (0, 0, self.root.winfo_screenwidth(),
                                      self.root.winfo_screenheight())
@@ -5835,7 +7080,10 @@ class App:
                     ms_fn=lambda: ms_translate("hello", "en", "zh-CN", attempts=1, timeout=8)[0],
                     offline_info=info,
                     on_item=lambda c: self.q.put(("net_item", run, c)),
-                    cancelled=lambda: run != self.net_run)
+                    cancelled=lambda: run != self.net_run,
+                    proxy_url=netcheck.effective_proxy(get_proxy_url()),
+                    extra_engines=[("lingva", "Lingva", lambda: lingva_translate("hello", "en", "zh-CN", deadline=time.monotonic() + 12)[0]),
+                                   ("mymemory", "MyMemory", lambda: mymemory_translate("hello", "en", "zh-CN", deadline=time.monotonic() + 12)[0])])   # v2.15.3：程序内自定义代理也检查端口
             except Exception as e:      # noqa: BLE001  检测本身崩了也不能让界面一直卡在「检测中」
                 import traceback
                 log_crash("netcheck failed:\n" + traceback.format_exc())
@@ -5959,11 +7207,12 @@ class App:
             # 保持明文（代理还要用），盘上的 config.json 不再存明文密码。
             # 加密失败（非 Windows / DPAPI 不可用）时回落明文，不阻保存。
             to_save = dict(self.cfg)
-            pw = to_save.get("proxy_pass") or ""
-            if pw and not str(pw).startswith("dpapi:"):
-                enc = _dpapi_protect(pw)
-                if enc:
-                    to_save["proxy_pass"] = enc
+            for sk in SECRET_KEYS:
+                pw = to_save.get(sk) or ""
+                if pw and not str(pw).startswith("dpapi:"):
+                    enc = _dpapi_protect(pw)
+                    if enc:
+                        to_save[sk] = enc
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(to_save, f, ensure_ascii=False, indent=1)
             os.replace(tmp, CONFIG_PATH)
@@ -5975,6 +7224,7 @@ class App:
         except Exception:
             pass
         set_proxy_url(proxy_url(self.cfg))   # v2.9：保存后立刻按新配置决定走不走代理
+        set_engine_keys(self.cfg)             # v2.15.4
         self._update_engine_hint()
         self._refresh_tray_state()
 
@@ -6684,6 +7934,183 @@ class App:
         else:
             self.status.configure(text="翻译并替换只在 Windows 上可用，译文已放进剪贴板")
 
+    # ------------------------------------------------ v2.15.4 常用翻译软件功能
+    def _compare_engines(self):
+        want = [e for e in (self.cfg.get("compare_engines") or []) if e in ENGINES]
+        base_list = want or ENGINES
+        return translator_tools.compare_plan(
+            base_list, lambda e: (e not in KEY_ENGINES or engine_configured(e))
+            and (e != "离线" or offline_engine.runtime_present()), max_n=6 if want else 4)
+
+    def open_compare(self, text=None):
+        """多引擎对照：同一段原文同时交给几个引擎，结果按完成先后列出；点「用这个」写回主窗口。"""
+        text = (text if text is not None else self.src.get("1.0", "end")).strip()
+        if not text:
+            text = self._get_clip().strip()
+        if not text:
+            self.status.configure(text="先在原文框里输入，或复制一段文字，再点「多引擎对照」")
+            return
+        text = text[:MAX_LEN]
+        engines = self._compare_engines()
+        if not engines:
+            self.status.configure(text="没有可用的引擎")
+            return
+        w = getattr(self, "compare_win", None)
+        if w is None or not w.winfo_exists():
+            w = tk.Toplevel(self.root)
+            w.title("多引擎对照")
+            ui_platform.fit_window(w, 720, 520, 420, 300, parent=self.root)
+            w.bind("<Escape>", lambda e: w.withdraw())
+            self.compare_win = w
+            top = ttk.Frame(w)
+            top.pack(fill="x", padx=12, pady=(10, 4))
+            self.compare_head = ttk.Label(top, text="", style="Note.TLabel", wraplength=640, justify="left")
+            self.compare_head.pack(side="left", fill="x", expand=True)
+            ttk.Button(top, text="选择引擎…", command=self._pick_compare_engines).pack(side="right")
+            sf = ui_platform.ScrollFrame(w, padding=8)
+            sf.pack(fill="both", expand=True, padx=4, pady=(0, 8))
+            self.compare_body = sf.body
+        for c in self.compare_body.winfo_children():
+            c.destroy()
+        sl, tl = self._codes()
+        head = text.replace("\n", " ")
+        self.compare_head.configure(text="原文：" + (head if len(head) <= 120 else head[:120] + "…"))
+        self._compare_seq = getattr(self, "_compare_seq", 0) + 1
+        my = self._compare_seq
+        self._compare_res = translator_tools.CompareResult(engines)
+        self._compare_rows = {}
+        fam = getattr(self, "_font_family", "TkDefaultFont")
+        for eng in engines:
+            fr = ttk.Frame(self.compare_body)
+            fr.pack(fill="x", pady=(0, 10))
+            hd = ttk.Frame(fr)
+            hd.pack(fill="x")
+            ttk.Label(hd, text=eng, style="Section.TLabel").pack(side="left")
+            meta = ttk.Label(hd, text="翻译中…", style="Note.TLabel")
+            meta.pack(side="left", padx=8)
+            use = ttk.Button(hd, text="用这个", width=7)
+            use.pack(side="right")
+            cp = ttk.Button(hd, text="复制", width=5)
+            cp.pack(side="right", padx=4)
+            body = tk.Text(fr, height=3, wrap="word", font=(fam, int(self.cfg.get("font_size", 11))),
+                           relief="flat", borderwidth=0)
+            body.pack(fill="x", pady=(2, 0))
+            body.insert("1.0", "…")
+            body.configure(state="disabled")
+            if self.cfg.get("apple_theme", True):
+                ui_platform.style_text_apple(body, ui_platform.apple_palette(bool(self.cfg.get("dark_mode"))))
+            self._compare_rows[eng] = (meta, body, use, cp)
+            for b in (use, cp):
+                b.state(["disabled"])
+            threading.Thread(target=self._compare_worker, args=(my, eng, text, sl, tl), daemon=True).start()
+        w.deiconify()
+        w.lift()
+
+    def _compare_worker(self, my, eng, text, sl, tl):
+        t0 = time.time()
+        try:
+            out, det, _target = translate(text, sl, tl, False, eng, cancelled=lambda: my != self._compare_seq)
+            self.q.put(("compare", my, eng, True, out, (time.time() - t0) * 1000))
+        except Exception as e:      # noqa: BLE001
+            msg = str(e) if isinstance(e, (EngineKeyError, offline_engine.OfflineError)) else netcheck.explain_error(e)[0]
+            self.q.put(("compare", my, eng, False, msg, (time.time() - t0) * 1000))
+
+    def _on_compare(self, my, eng, ok, out, ms):
+        if my != getattr(self, "_compare_seq", 0) or eng not in getattr(self, "_compare_rows", {}):
+            return
+        self._compare_res.add(eng, ok, out, ms)
+        meta, body, use, cp = self._compare_rows[eng]
+        order = len(self._compare_res.done)
+        meta.configure(text=("#%d · %d ms" % (order, ms)) if ok else "失败")
+        body.configure(state="normal")
+        body.delete("1.0", "end")
+        body.insert("1.0", out)
+        lines = max(1, min(12, int(body.count("1.0", "end", "displaylines")[0]) if body.count("1.0", "end", "displaylines") else 3))
+        body.configure(height=lines, state="disabled")
+        if ok:
+            use.configure(command=lambda o=out, e=eng: self._compare_use(o, e))
+            cp.configure(command=lambda o=out: (self._set_clip(o), setattr(self, "last_clip", o),
+                                                self.status.configure(text="已复制 %s 的译文" % eng)))
+            use.state(["!disabled"]); cp.state(["!disabled"])
+        if self._compare_res.finished():
+            agree = self._compare_res.agreement()
+            tail = ("　·　%s 译文一致" % "、".join(agree)) if len(agree) >= 2 else ""
+            self.compare_head.configure(text=self.compare_head.cget("text").split("　·　")[0] + tail)
+
+    def _compare_use(self, out, eng):
+        self.pairs = [(self.src.get("1.0", "end").strip(), out)]
+        try:
+            self.render()
+        except Exception:
+            pass
+        self._set_clip(out)
+        self.last_clip = out
+        self.status.configure(text="已采用 %s 的译文并复制" % eng)
+
+    def _pick_compare_engines(self):
+        win = tk.Toplevel(self.compare_win)
+        win.title("对照哪些引擎")
+        win.transient(self.compare_win)
+        cur = set(self.cfg.get("compare_engines") or [])
+        vs = {}
+        for e in ENGINES:
+            if e == "自动":
+                continue
+            v = tk.BooleanVar(value=(e in cur) if cur else e in self._compare_engines())
+            usable = e not in KEY_ENGINES or engine_configured(e)
+            cb = ttk.Checkbutton(win, text=e + ("" if usable else "（未填 Key）"), variable=v)
+            cb.pack(anchor="w", padx=16, pady=2)
+            if not usable:
+                cb.state(["disabled"])
+            vs[e] = v
+
+        def done():
+            self.cfg["compare_engines"] = [e for e, v in vs.items() if v.get()][:6]
+            self._save()
+            win.destroy()
+            self.open_compare()
+        ttk.Label(win, text="最多 6 个；一个都不选就自动挑 4 个。", style="Note.TLabel").pack(anchor="w", padx=16, pady=(6, 0))
+        ttk.Button(win, text="确定", style="Accent.TButton", command=done).pack(pady=10)
+
+    def open_case_tool(self):
+        """命名格式：把原文（或译文）转成 camelCase / snake_case 等，点一下复制。
+        中文原文先取当前译文（例如「用户登录次数」→ user login count → userLoginCount）。"""
+        src = self.src.get("1.0", "end").strip()
+        cand = src if translator_tools.looks_like_identifier(src) else self.plain_result()
+        if not translator_tools.looks_like_identifier(cand or ""):
+            self.status.configure(text="命名格式需要一个短的英文词组：先把中文译成英文，或直接输入英文")
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+        for name, val in translator_tools.all_cases(cand):
+            menu.add_command(label="%s    %s" % (val, name),
+                             command=lambda v=val: (self._set_clip(v), setattr(self, "last_clip", v),
+                                                    self.status.configure(text="已复制 " + v)))
+        try:
+            x, y = self.root.winfo_pointerxy()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def clean_source(self):
+        src = self.src.get("1.0", "end").strip()
+        if not src:
+            return
+        out = translator_tools.clean_text(src, strip_line_numbers=True)
+        if out != src:
+            self._set_src(out)
+            self.translate_now()
+            self.status.configure(text="已去掉页码 / 行号 / 多余空行，并重新翻译")
+        else:
+            self.status.configure(text="没有需要清理的格式")
+
+    def _on_style(self):
+        self.cfg["translate_style"] = STYLE_CODES.get(self.style_cb.get(), "default")
+        set_engine_keys(self.cfg)
+        with _cache_lock:
+            CACHE.clear()
+        self._save()
+        self.translate_now()
+
     def swap(self):
         sl, tl = self._codes()
         new_tl = sl if sl != "auto" else (self.detected or "en")
@@ -6731,8 +8158,8 @@ class App:
         except Exception as e:
             err = str(e)
             offline_msg = isinstance(e, offline_engine.OfflineError)
-            if offline_msg:
-                tip = ""
+            if offline_msg or isinstance(e, EngineKeyError):
+                tip = ""                       # v2.15.4：Key 类错误本身就写清了原因和去哪改
             elif _is_rate_limit(e) or "429" in err:
                 tip = "\n\n建议：切换引擎到「微软」或「离线」，或稍后再试。"
             elif engine == "离线":
@@ -6864,8 +8291,20 @@ class App:
     def _start_typing(self):
         """按配置启动打字检测监听（默认关闭）。Windows 用 ctypes 低级键盘钩子，
         macOS/Linux 用 pynput；缺 pynput 时功能不可用并在界面明确提示，绝不崩溃。
-        开启后重启生效——这里只在启动时调一次，开关打开不立即启动。"""
-        if not self.cfg.get("typing", False):
+        开启后重启生效——这里只在启动时调一次，开关打开不立即启动。
+        v2.15：专业版功能 —— 没激活、试用也过期时直接不启动钩子；开关
+        状态不一致时（比如手改了配置文件）顺手把开关打回去，免得界面撒谎。"""
+        if not (self.cfg.get("typing", False) or self.cfg.get("input_translate", False)):
+            return
+        if not license.typing_allowed(self.cfg):
+            self.cfg["typing"] = False
+            self.cfg["input_translate"] = False
+            v = getattr(self, "typing_var", None)
+            if v is not None:
+                try:
+                    v.set(False)
+                except Exception:
+                    pass
             return
         if IS_WIN:
             try:
@@ -6966,7 +8405,11 @@ class App:
 
     def _on_typing_key(self, ch):
         """键盘钩子/pynput 转发来的一个按键（在 Tk 线程里处理）。"""
-        if not self.cfg.get("typing", False) or not ch:
+        if not ch:
+            return
+        if self.cfg.get("input_translate", False):
+            self._on_input_key(ch)
+        if ch == "\x00F9" or not self.cfg.get("typing", False):
             return
         buf = self._typing_buffer
         if IS_WIN:
@@ -6976,6 +8419,10 @@ class App:
             elif hwnd != self._typing_last_hwnd:
                 self._typing_last_hwnd = hwnd
                 buf.clear()         # 前台窗口一切换就清空缓冲
+        # B-3（已评估，不做）：pynput 路径没有窗口切换检测 —— pynput 本身不提供
+        # 当前窗口 API；Linux 上要补需另装 python-xlib（只覆盖 X11）或调 xdotool
+        # 外部命令（目标机器上一般没有），macOS 则要 pyobjc/AppKit。成本高于收益，
+        # 且本软件面向 Windows（Windows 走上面原生分支，已有检测），故不硬上。
         if self._typing_suppressed():
             buf.set_suppressed(True)
             return
@@ -6983,6 +8430,114 @@ class App:
         ev = buf.feed(ch)
         if ev is not None and ev.get("kind") == "word":
             self._typing_request(ev["text"], ev["kind"])
+
+    # ------------------------------------------------ v2.15.4 输入翻译（打字识别增强）
+    def _input_tr(self):
+        it = getattr(self, "_input_translator", None)
+        trig = self.cfg.get("input_trigger", "space3")
+        if it is None or it.trigger_kind != trig:
+            it = translator_tools.InputTranslator(trig, is_sensitive=is_sensitive_clip)
+            self._input_translator = it
+        return it
+
+    def _on_input_key(self, ch):
+        """在别的软件里打一句话 → 连按 3 次空格（或 F9）→ 这句话被替换成译文。
+        只在 Windows 上做替换（要注入退格和粘贴）；其他系统只把译文放进剪贴板。"""
+        it = self._input_tr()
+        if getattr(self, "_input_busy", False):
+            return                                   # 正在替换：自己注入的按键不算（钩子已过滤注入事件，这里再保险）
+        if IS_WIN:
+            hwnd = foreground_window_win()
+            if hwnd != getattr(self, "_input_hwnd", None):
+                self._input_hwnd = hwnd
+                it.clear()
+        if self._typing_suppressed():
+            it.clear()
+            return
+        ev = it.trigger() if ch == "\x00F9" else it.feed(ch)
+        if ev:
+            self._input_request(ev)
+
+    def _input_request(self, ev):
+        sl, tl = self._codes()
+        self._input_busy = True
+        self._input_seq = getattr(self, "_input_seq", 0) + 1
+        my = self._input_seq
+        try:
+            self.spinner.start(self.root.winfo_pointerxy(), "输入翻译中…")
+        except Exception:
+            pass
+        hwnd = foreground_window_win() if IS_WIN else 0
+
+        def job():
+            try:
+                out, _det, _t = translate(ev["text"], sl, tl, self.smart_var.get(), self.engine.get())
+                self.q.put(("input_done", my, True, out, ev, hwnd))
+            except Exception as e:      # noqa: BLE001
+                self.q.put(("input_done", my, False, str(e)[:200], ev, hwnd))
+        threading.Thread(target=job, daemon=True).start()
+
+    def _on_input_done(self, my, ok, out, ev, hwnd):
+        try:
+            self.spinner.stop()
+        except Exception:
+            pass
+        if my != getattr(self, "_input_seq", 0):
+            self._input_busy = False
+            return
+        if not ok or not out.strip():
+            self._input_busy = False
+            self.status.configure(text="输入翻译失败：%s" % out)
+            return
+        out = out.strip()
+        if not IS_WIN or foreground_window_win() != hwnd or foreground_is_terminal_win():
+            self._set_clip(out)
+            self.last_clip = out
+            self._input_busy = False
+            self.status.configure(text="输入翻译：窗口已切换 / 非 Windows，译文已放进剪贴板（Ctrl+V 粘贴）")
+            return
+        old = self._get_clip()
+
+        def do_replace():
+            try:
+                send_backspaces_win(ev["erase"])
+                self._set_clip(out)
+                self.root.update()
+                time.sleep(0.03)
+                send_paste_win()
+            finally:
+                # 粘贴完把剪贴板还给用户（等目标程序读完剪贴板）
+                self.root.after(400, lambda: (self._set_clip(old), setattr(self, "last_clip", old),
+                                              setattr(self, "_input_busy", False)))
+        self.root.after(10, do_replace)
+        if self.cfg.get("history_on", True) and not is_sensitive_clip(ev["text"]):
+            try:
+                sl, tl = self._codes()
+                self.history.add(ev["text"], out, sl, tl, self.engine.get(), "input", sl, tl)
+            except Exception:
+                pass
+        self.status.configure(text="输入翻译：已替换为译文")
+
+    def _on_input_opt(self):
+        self.cfg["input_translate"] = bool(self.input_var.get())
+        self.cfg["input_trigger"] = INPUT_TRIGGER_CODES.get(self.input_trigger_cb.get(), "space3")
+        if self.cfg["input_translate"] and not license.typing_allowed(self.cfg):
+            if license.trial_available(self.cfg):
+                license.start_trial(self.cfg)
+            else:
+                self.input_var.set(False)
+                self.cfg["input_translate"] = False
+                self._save()
+                self._show_license_dialog()
+                return
+        self._input_translator = None
+        self._save()
+        hooked = getattr(self, "_typing_stop", None) is not None or getattr(self, "_typing_listener", None) is not None
+        if self.cfg["input_translate"] and not hooked:
+            self._start_typing()                     # 和打字检测共用一个键盘钩子
+        if not (self.cfg["input_translate"] or self.cfg.get("typing")):
+            self._stop_typing()
+        self._refresh_tray_state()
 
     def _typing_tick(self):
         """每轮 _poll（约 100ms）调一次：当前词实时跟进 + 停顿兜底。"""
@@ -7092,6 +8647,8 @@ class App:
             self.grab_xy = self.root.winfo_pointerxy()
             self.grab_scope = SCOPE_CODES.get(self.scope_cb.get(), "word")
             self.grab_plan = []
+            bw, bh = self._OCR_BOX.get(self.grab_scope, self._OCR_BOX["word"])
+            self.spinner.start(self.grab_xy, "取词中…", avoid=(bw // 2, bh // 2))
         # OCR 语言/屏幕范围在 Tk 线程里读好：_pointer_grab_win 在 worker 线程里，
         # 不能碰 Tk 控件（v2.7 修复，见 _ocr_pick）。
         self._grab_ocr_lang = self._ocr_lang()
@@ -7174,6 +8731,10 @@ class App:
             self.q.put(("copied",))
 
     def _on_copied(self):
+        try:
+            self.spinner.stop()
+        except Exception:
+            pass
         # M-03：密码框里按了取词热键 —— _copy_selection 已跳过复制，
         # 这里直接收尾，不翻译剪贴板里原来的旧内容。
         if getattr(self, "_grab_aborted", False):
@@ -7291,6 +8852,12 @@ class App:
                     self._on_update_result(msg[1], msg[2], msg[3])
                 elif kind == "hover_ocr":
                     _, word, xy, ibeam = msg
+                    if not (not word and ibeam):
+                        self.spinner.stop()          # 退回双击取词时继续转，等复制结果
+                    if word and not hover_worth_translating(word):
+                        word, ibeam = None, False          # v2.15.3：数字 / 网址 / 标点不翻，也不退回双击
+                    elif word and getattr(self, "_hover_dedupe", None) is not None and self._hover_dedupe.seen(word, xy):
+                        word, ibeam = None, False          # 刚翻过同一个词：不重复弹
                     if word:
                         self._pointer_translate(word, xy)
                     elif ibeam:
@@ -7309,7 +8876,16 @@ class App:
                         self.root.clipboard_clear()
                         self._seq0 = clip_seq_win() if IS_WIN else 0
                         threading.Thread(target=self._copy_selection, daemon=True).start()
+                elif kind == "input_done":
+                    self._on_input_done(*msg[1:])
+                elif kind == "compare":
+                    self._on_compare(*msg[1:])
+                elif kind == "key_test":
+                    lab = self.key_status.get(msg[1])
+                    if lab is not None:
+                        lab.configure(text=msg[2])
                 elif kind == "hover_err":
+                    self.spinner.stop()
                     self._on_hover_err(msg[1], msg[2])
                 elif kind == "bubble":
                     self._on_bubble(*msg[1:])
@@ -7371,6 +8947,18 @@ class App:
         except queue.Empty:
             pass
         self._typing_tick()       # v2.14：打字检测的实时跟进（防抖）与停顿兜底都在这里判
+        if IS_WIN and esc_pressed_win():
+            try:
+                self.spinner.stop()
+            except Exception:
+                pass
+            for pop in (getattr(self, "bubble", None), getattr(self, "mini", None)):
+                try:
+                    if pop is not None and pop.alive():
+                        pop.close()
+                        self.bseq += 1              # 正在翻的结果也作废，别关了又弹出来
+                except Exception:
+                    pass
         self._hover_check()
         try:                                      # v2.12：每轮 poll 都给看门狗打一次心跳
             if getattr(self, "_watchdog", None) is not None:

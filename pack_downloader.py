@@ -171,7 +171,8 @@ def fetch_index(cache_path=None, urls=None, replace="", timeout=20, max_age=None
             continue
         try:
             with _open(apply_replace(url, replace), timeout) as r:
-                data = json.loads(r.read().decode("utf-8"))
+                # 顺手收紧：索引只是个小 JSON 列表，读上限 1MB，防异常大响应撑内存
+                data = json.loads(r.read(1 << 20).decode("utf-8"))
             if not isinstance(data, list) or not data:
                 raise ValueError("索引内容为空或格式不对")
             if cache_path:

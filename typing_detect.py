@@ -50,6 +50,18 @@ _SENSITIVE_KW_RE = re.compile(
     r"(password|passwd|pwd|token|secret|api[-_]?key|access[-_]?key)\s*[:=]\s*\S+",
     re.IGNORECASE)
 
+# 敏感键名（B-1）：出现在 "key: value" / "key=value" 里的键。词按分隔符拆开后，
+# 单看 "password" 或 "abc123" 都不触发敏感规则（见 _SENSITIVE_KW_RE），所以缓冲
+# 要记住“上一个词是敏感键名、后面跟了 : 或 =”，下一个完成的词就是值，也抑制；
+# 键名本身在跟了 :/= 时也不翻。误杀面很小：只有“键名 + :/=” 这种键值对写法才
+# 抑制，正常句子里的 password/token（后面没跟 :/=）照常翻。
+_SENSITIVE_KEY_RE = re.compile(
+    r"(password|passwd|pwd|token|secret|api[-_]?key|access[-_]?key"
+    r"|密码|账号|帳號|密钥|令牌)$",
+    re.IGNORECASE)
+# 能把键名“封口”的分隔符：英文冒号/等号、全角冒号（中文输入 "账号：xxx"）。
+_SENSITIVE_KEY_DELIMITERS = set(":=\uff1a")
+
 
 def is_sensitive_text(text):
     """文本像不像敏感信息（验证码、身份证号、API 密钥、密码/令牌）。纯函数。"""
@@ -109,6 +121,11 @@ class TypingBuffer:
         self.last_request_at = None
         self._live_dirty = False    # 当前词自上次 live 发送后又改了
         self._live_sent = None      # 上次 live 发出去的片段
+        self._sensitive_key_pending = False  # B-1：上一个词是敏感键名且跟了 :/=，
+        # 下一个完成的词就是它的值，也抑制（live/pause 跟进一并抑制）
+        self._last_word_text = ""   # B-1：上一个完成的词（处理 "password : value"
+        # 这种键名与冒号之间隔了空格的写法：冒号到时词已打完，先翻了键名，
+        # 但值仍可凭它抑制）
 
     # -- 配置 -------------------------------------------------------------
     def set_scope(self, scope):
@@ -134,6 +151,8 @@ class TypingBuffer:
         self._live_dirty = False
         self._live_sent = None
         self.last_key_at = None
+        self._sensitive_key_pending = False
+        self._last_word_text = ""
 
     def current_fragment(self):
         """当前实时跟进的目标：word 模式是当前词，sentence 模式是当前整句。"""
@@ -165,6 +184,9 @@ class TypingBuffer:
                 self.text = self.text[:-1]
                 self._live_dirty = True
                 self._mark_key(now)
+                if not self.text:
+                    # 值被删空了：没东西可抑制，待命的敏感键失效
+                    self._sensitive_key_pending = False
             return {"kind": "edit"}
         # 分隔符（空格/制表/换行/标点）先于可打印判定：\n、\t 不是可打印字符，
         # 但它们是打词的主触发，不能被挡掉。
@@ -184,6 +206,21 @@ class TypingBuffer:
             self.text = ""
             self._live_dirty = False
             self._live_sent = None
+            if word:
+                self._last_word_text = word
+                if ch in _SENSITIVE_KEY_DELIMITERS and _SENSITIVE_KEY_RE.search(word):
+                    # 键名 + :/=：键名本身不翻，下一个完成的词是值，也不翻
+                    self._sensitive_key_pending = True
+                    return None
+                if self._sensitive_key_pending:
+                    # 上一个词是敏感键名，这个词是它的值：抑制并解除待命
+                    self._sensitive_key_pending = False
+                    return None
+            elif ch in _SENSITIVE_KEY_DELIMITERS and _SENSITIVE_KEY_RE.search(self._last_word_text):
+                # "password : value"：键名与冒号之间隔了空格，冒号到时词已打完
+                # （键名已翻出，无法撤回），但值仍可凭上一个词抑制
+                self._sensitive_key_pending = True
+                return None
             if word and is_eligible(word) and word != self.last_translated:
                 return {"kind": "word", "text": word}
             return None
@@ -209,6 +246,10 @@ class TypingBuffer:
         """
         now = self._now() if now is None else now
         if self.suppressed or not self.text.strip() or self.last_key_at is None:
+            return None
+        if self._sensitive_key_pending:
+            # B-1：正在打的很可能是敏感键的值（password: abc***），live 跟进与
+            # 停顿兜底都抑制；值打完由 _feed_delimiter 在词完成时抑制
             return None
         fragment = self.current_fragment()
         if not fragment or not is_eligible(fragment) or fragment == self.last_translated:
