@@ -19,7 +19,7 @@ Unicode true
 !include "FileFunc.nsh"
 !include "x64.nsh"
 
-!define APP_VERSION "2.15.4"
+!define APP_VERSION "2.15.5"
 !define APP_NAME "实时翻译"
 !define APP_ID "RealtimeTranslate"
 !define APP_EXE "RealtimeTranslate.exe"

@@ -1,5 +1,5 @@
 PackageIdentifier: RealtimeTranslate.RealtimeTranslate
-PackageVersion: 2.15.4
+PackageVersion: 2.15.5
 MinimumOSVersion: 10.0.17763.0
 InstallModes: [interactive, silent, silentWithProgress]
 UpgradeBehavior: install
@@ -7,7 +7,7 @@ Installers:
   - Architecture: x64
     InstallerType: inno
     Scope: user
-    InstallerUrl: https://github.com/OWNER/RealtimeTranslate/releases/download/v2.15.4/RealtimeTranslate_Setup_v2.15.4.exe
+    InstallerUrl: https://github.com/OWNER/RealtimeTranslate/releases/download/v2.15.5/RealtimeTranslate_Setup_v2.15.5.exe
     InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
     InstallerSwitches:
       Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART

@@ -114,6 +114,7 @@ except Exception:                      # pragma: no cover
     pet_win = None
 import single_instance
 import typing_detect
+import text_detect
 import translator_tools
 import license
 import ui_platform
@@ -266,7 +267,7 @@ CLOSE_NAMES = {"tray": "隐藏到托盘", "taskbar": "最小化到任务栏", "q
 CLOSE_CODES = {v: k for k, v in CLOSE_NAMES.items()}
 MINIMIZE_NAMES = {"taskbar": "留在任务栏", "tray": "收进托盘"}        # 点窗口 – 最小化时（v2.10）
 MINIMIZE_CODES = {v: k for k, v in MINIMIZE_NAMES.items()}
-__version__ = "2.15.4"
+__version__ = "2.15.5"
 APP_TITLE = "实时翻译"
 RUN_VALUE = "RealtimeTranslate"
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -430,32 +431,11 @@ def _rotate_log(path, max_bytes=5 * 1024 * 1024):
 
 
 # H-01：剪贴板内容像不像敏感信息 —— 是就不要自动翻译、不要存历史、不要放进输入框。
-_SENSITIVE_CLIP_RES = [
-    re.compile(r"^\d{6,}$"),                                   # 一次性验证码 / 纯数字证件号
-    re.compile(r"^sk-[A-Za-z0-9\-_]{16,}$"),                   # API 密钥（sk- 开头）
-    re.compile(r"^\d{17}[\dXx]$"),                             # 18 位身份证号
-    re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[A-Za-z0-9\-_+/=]{32,}$"),  # 长串高熵 token
-]
-_SENSITIVE_KW_RE = re.compile(
-    r"(password|passwd|pwd|token|secret|api[-_]?key|access[-_]?key)\s*[:=]\s*\S+",
-    re.IGNORECASE)
-
-
+# v2.15.5：规则搬到 text_detect.py（和打字检测共用一份），新增银行卡号（Luhn 校验）、JWT /
+# AWS / GitHub / Slack / Google 密钥、Bearer 令牌、私钥、带密码的连接串、"验证码是 123456" 等。
 def is_sensitive_clip(text):
-    """H-01：剪贴板内容像不像敏感信息（验证码、身份证号、API 密钥、
-    密码/令牌、长串 token）。纯函数，便于测试。"""
-    t = (text or "").strip()
-    if not t:
-        return False
-    if _SENSITIVE_KW_RE.search(t):
-        return True
-    lines = [ln for ln in t.splitlines() if ln.strip()]
-    if len(lines) == 1:
-        s = lines[0]
-        for rx in _SENSITIVE_CLIP_RES:
-            if rx.match(s):
-                return True
-    return False
+    """H-01：剪贴板内容像不像敏感信息。纯函数，便于测试。"""
+    return text_detect.is_sensitive(text)
 
 
 def _dpapi_protect(plaintext):
@@ -812,17 +792,15 @@ def parse_dict(data):
 
 
 def is_dict_candidate(text):
-    """输入是不是值得查词典的单个词或短词组：去空白后 <=20 字符、1~3 个词、无换行。"""
-    t = (text or "").strip()
-    if not t or "\n" in t or len(t) > 20:
-        return False
-    return 1 <= len(t.split()) <= 3
+    """输入是不是值得查词典的单个词或短词组：去空白后 <=20 字符、1~3 个词、无换行、
+    中间没有句子标点；网址 / 数字 / 敏感内容不查；汉字连写最多 6 个字。"""
+    return text_detect.is_dict_candidate(text)
 
 
 def is_word_entry(src):
-    """一条历史记录的原文是不是单词：单个词、无空格、1~30 字符（生词本用）。"""
-    t = (src or "").strip()
-    return 1 <= len(t) <= 30 and not any(c.isspace() for c in t)
+    """一条历史记录的原文是不是单词：单个词、无空格、1~30 字符、含字母，
+    不是网址 / 邮箱 / 路径 / 敏感内容（生词本用）。"""
+    return text_detect.is_word_entry(src)
 
 
 def is_supported_image_file(path):
@@ -1256,7 +1234,7 @@ def lingva_translate(text, sl, tl, timeout=8, deadline=None):
 def mymemory_translate(text, sl, tl, timeout=8, deadline=None):
     """MyMemory 免费接口：GET ?q=&langpair=en|zh-CN。不支持自动检测，auto 时按文字脚本猜。
     单次最多 500 字节左右，超长交给上层 split_long（这里再按 450 字切一次保险）。"""
-    src = guess_lang(text) if sl == "auto" else sl
+    src = text_detect.detect_lang(text).lang if sl == "auto" else sl      # 繁体识别为 zh-TW
     src = {"zh": "zh-CN"}.get(src, src)
     if len(text) > 450:
         parts = [text[i:i + 450] for i in range(0, len(text), 450)]
@@ -1485,18 +1463,11 @@ def _is_auth_error(exc):
 
 
 def guess_lang(text):
-    """按文字脚本粗略判断语种（仅供离线引擎的「自动检测」使用）。"""
-    sample = text[:200]
-    ranges = [
-        ("ja", "\u3040", "\u30ff"), ("ko", "\uac00", "\ud7a3"),
-        ("ru", "\u0400", "\u04ff"), ("ar", "\u0600", "\u06ff"),
-        ("th", "\u0e00", "\u0e7f"), ("he", "\u0590", "\u05ff"),
-        ("hi", "\u0900", "\u097f"), ("zh", "\u3400", "\u9fff"),
-    ]
-    for code, lo, hi in ranges:
-        if any(lo <= c <= hi for c in sample):
-            return code
-    return "en"
+    """语种粗判（仅供离线引擎的「自动检测」和 MyMemory 用），返回基础语言代码。
+    v2.15.5：识别逻辑在 text_detect.detect_lang —— 假名 → 日语、谚文 → 韩语、
+    纯汉字按简 / 繁 / 日语专有字分，拉丁字母按停用词 + 特征字母分英 / 西 / 法 / 德 / 意 / 葡 等；
+    以前拉丁字母一律当英语、汉字一律当中文。"""
+    return text_detect.guess_lang(text)
 
 
 def offline_translate(text, sl, tl, cancelled=None):
@@ -8781,6 +8752,12 @@ class App:
                         # 不存历史、不放进输入框，只在状态栏提示一次。
                         if is_sensitive_clip(clip):
                             self.status.configure(text="剪贴板内容疑似敏感信息（验证码 / 密码等），已跳过自动翻译")
+                            return
+                        # v2.15.5：网址 / 邮箱 / 文件路径 / 纯数字 / 纯符号翻了没意义，自动监听时跳过
+                        # （想翻可以手动粘贴到输入框，或用取词热键）。
+                        info = text_detect.analyze(clip)
+                        if not info.translatable:
+                            self.status.configure(text="剪贴板内容是%s，已跳过自动翻译" % (info.reason or "非文本"))
                             return
                         self._set_src(clip.strip()[:MAX_LEN])
                         self.show_window()
