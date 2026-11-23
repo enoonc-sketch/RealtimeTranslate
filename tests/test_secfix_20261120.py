@@ -240,9 +240,11 @@ ok("H-06 cache root fallback is user temp, not shared",
    "Public" not in oe._ascii_cache_root() and "ProgramData" not in oe._ascii_cache_root())
 
 # ---------------------------------------------------------------- M-01 OCR 脚本校验
+# v2.15.6：比对归一化后的哈希 —— Windows 检出的 CRLF 版内容没变也必须通过，
+# 只比原始哈希会在云端 Windows 构建里误报“已被改动”。
 real_ps = os.path.join(ROOT, "winocr.ps1")
 ok("M-01 pinned winocr.ps1 hash matches tree",
-   ocr_win._sha256_file(real_ps) == ocr_win._SCRIPT_SHA256)
+   ocr_win._script_hash_ok(real_ps))
 
 _calls = {"run": 0, "cmd": None}
 

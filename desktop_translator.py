@@ -9178,7 +9178,9 @@ def run_selftest():
             except ocr_win.OcrError as e:
                 msg = str(e)
                 lines.append("系统 OCR：%s" % msg)
-                if "解析失败" in msg or "无法加载" in msg:
+                # v2.15.6：脚本被改动也算不通过 —— OCR 完全不可用，不能只记一行就放过去
+                #（以前只有“解析失败 / 无法加载”才判失败，2.15.5 的误报就是这么从自检里漏过去的）。
+                if "解析失败" in msg or "无法加载" in msg or "已被改动" in msg:
                     ok = False
             finally:
                 try:

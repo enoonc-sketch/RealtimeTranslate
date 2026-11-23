@@ -222,10 +222,15 @@ def _write_temp(text, suffix):
 
 def _write_script_temp(script_text, suffix=".ps1"):
     """M-01：把脚本写进临时文件后立即读回验哈希 —— 写入和执行之间文件若被
-    替换（同机其他程序 / 恶意软件），哈希不符就删文件并拒绝执行。"""
+    替换（同机其他程序 / 恶意软件），哈希不符就删文件并拒绝执行。
+    v2.15.6：比对前先把 CRLF 归一化成 LF —— Windows 文本模式写文件时
+    会把 \\n 转成 \\r\\n，内容没变但原始哈希会对不上（和 winocr.ps1 同一类问题），
+    朗读会在 Windows 上永远报“被改动”。"""
     path = _write_temp(script_text, suffix)
     try:
-        if _sha256_file(path) != _sha256_text(script_text):
+        with open(path, "rb") as f:
+            data = f.read()
+        if hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest() != _sha256_text(script_text):
             raise OSError("临时脚本文件写入后被改动")
     except OSError:
         _cleanup_files([path])

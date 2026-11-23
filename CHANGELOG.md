@@ -10,6 +10,13 @@
 - **开关打开立即生效**：以前打开打字检测开关要重启才启动钩子，装不上连重试的机会都没有；现在打开立即启动，重复启动会被拦下（`_start_typing` 加了“已在监听”保护）。
 - 新增 `tests/test_typing_hook_win.py`（19 项，fake user32 测安装成功 / 失败重试 / 一直失败报码 / 轮询转发 / 修饰键不转发），已加入 CI 纯逻辑测试列表。
 
+另外修截图 OCR 启动就报“winocr.ps1 已被改动，拒绝执行”（2.15.5 全新安装也报）。
+
+- **根因**：仓库没有 `.gitattributes`，Windows 上 git 检出默认把 `winocr.ps1` 的 LF 换成 CRLF；云端 Windows 构建打出来的包里就是 CRLF 版 —— 内容没变，原始 SHA256 却对不上，哈希校验误报。本地 Linux 测试全是 LF，所以一直没发现。
+- **修法**：`ocr_win.py` 新增 `_script_hash_ok`，比对前先把 CRLF 归一化成 LF 再算哈希（内容真被改了照样拦得住）；新增 `.gitattributes`（`winocr.ps1 -text`），以后 Windows 检出也不再转换。朗读的临时脚本有同一类问题（Windows 文本模式写文件会把 `\n` 转成 `\r\n`），`tts_win.py` 的验哈希同样改成归一化后比对。
+- **自检补洞**：`--selftest` 里“已被改动”以前只记一行、不判失败，2.15.5 的误报就是这么从自检里漏过去的；现在也判失败。
+- 新增 `tests/test_script_hash_newlines.py`（8 项：LF / CRLF / 被改 / 读不到 / 朗读临时脚本 CRLF 写入与被改拒绝），`test_secfix_20261120.py` 的 M-01 断言改成归一化后比对；两项都已加入 CI 纯逻辑测试列表。
+
 ## v2.15.5（2026-11-23）
 
 识别逻辑原来散在 `desktop_translator.py` 和 `typing_detect.py` 里，又粗又重复；现在统一收进新模块 `text_detect.py`（纯标准库、可单测），原来的函数名都保留，调用方不用改。
