@@ -32,7 +32,9 @@ jobs:
           for t in tests/test_grab_v2152.py tests/test_grab_v2153.py tests/test_spinner_v2153.py \
                    tests/test_netcheck_v2153.py tests/test_installer_v2154.py tests/test_tray_wintypes.py \
                    tests/test_packaging_v2154.py tests/test_translator_tools_v2154.py \
-                   tests/test_text_detect.py; do
+                   tests/test_text_detect.py tests/test_typing_hook_win.py \
+                   tests/test_script_hash_newlines.py tests/test_runtime_cancel.py \
+                   tests/test_runtime_mirror.py; do
             echo "== $t"; python "$t"
           done
       - name: Version consistency
