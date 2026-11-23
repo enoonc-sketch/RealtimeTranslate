@@ -7,8 +7,11 @@ import struct
 import sys
 
 CF_DIB = 8
+CF_DIBV5 = 17
 
 _BI_RGB = 0
+_BI_BITFIELDS = 3           # v2.15.8：Win 截图 / 浏览器 / 微信复制出的 32 位图基本都是这个
+_BI_ALPHABITFIELDS = 6
 _SUPPORTED_BIT_COUNTS = (8, 24, 32)
 
 # BITMAPFILEHEADER：14 字节，"BM" + 文件大小 + 保留字 x2 + 像素数据偏移
@@ -49,11 +52,12 @@ def dib_to_bmp(dib: bytes) -> bytes:
 
     if planes != 1:
         raise ValueError("unsupported DIB planes: %d (need 1)" % planes)
-    if bit_count not in _SUPPORTED_BIT_COUNTS:
+    bitfields = compression in (_BI_BITFIELDS, _BI_ALPHABITFIELDS)
+    if bit_count not in _SUPPORTED_BIT_COUNTS and not (bitfields and bit_count == 16):
         raise ValueError("unsupported DIB bit depth: %d (need 8, 24 or 32)"
                          % bit_count)
-    if compression != _BI_RGB:
-        raise ValueError("unsupported DIB compression: %d (need 0/BI_RGB)"
+    if compression != _BI_RGB and not bitfields:
+        raise ValueError("unsupported DIB compression: %d (need 0/BI_RGB or BI_BITFIELDS)"
                          % compression)
     if width <= 0:
         raise ValueError("bad DIB width: %d (need > 0)" % width)
@@ -66,6 +70,9 @@ def dib_to_bmp(dib: bytes) -> bytes:
         palette_size = num_colors * 4
     else:
         palette_size = 0
+    if bitfields and header_size == _INFO_HEADER_MIN:
+        # BITMAPINFOHEADER 之后紧跟 3（或 4）个 DWORD 颜色掩码；V4/V5 头里自带掩码，不用另算
+        palette_size += 16 if compression == _BI_ALPHABITFIELDS else 12
 
     # 行宽按 4 字节对齐。
     stride = ((width * bit_count + 31) // 32) * 4
@@ -134,3 +141,66 @@ def get_clipboard_dib():
             user32.CloseClipboard()
     except Exception:
         return None
+
+
+def get_clipboard_image():
+    """v2.15.8：取剪贴板上的图片，返回 (扩展名, 字节)；没有图片返回 (None, None)，永不抛错。
+
+    依次试：注册格式 "PNG"（浏览器 / 微信 / Snipaste 常只给这个，CF_DIB 取不到）→ CF_DIB →
+    CF_DIBV5。DIB 返回的是 .bmp（已转好），PNG 原样返回。非 Windows 平台返回 (None, None)。
+    """
+    if sys.platform != "win32":
+        return None, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.GetClipboardData.argtypes = [wintypes.UINT]
+        user32.GetClipboardData.restype = wintypes.HANDLE
+        user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+        user32.RegisterClipboardFormatW.restype = wintypes.UINT
+        user32.CloseClipboard.argtypes = []
+        user32.CloseClipboard.restype = wintypes.BOOL
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+        kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalSize.restype = ctypes.c_size_t
+
+        def grab(fmt):
+            handle = user32.GetClipboardData(fmt)
+            if not handle:
+                return None
+            ptr = kernel32.GlobalLock(handle)
+            if not ptr:
+                return None
+            try:
+                size = kernel32.GlobalSize(handle)
+                return ctypes.string_at(ptr, size) if size else None
+            finally:
+                kernel32.GlobalUnlock(handle)
+
+        if not user32.OpenClipboard(None):
+            return None, None
+        try:
+            png_fmt = user32.RegisterClipboardFormatW("PNG")
+            data = grab(png_fmt) if png_fmt else None
+            if data and data[:8] == b"\x89PNG\r\n\x1a\n":
+                return ".png", data
+            for fmt in (CF_DIB, CF_DIBV5):
+                dib = grab(fmt)
+                if dib:
+                    try:
+                        return ".bmp", dib_to_bmp(dib)
+                    except ValueError:
+                        continue
+            return None, None
+        finally:
+            user32.CloseClipboard()
+    except Exception:
+        return None, None

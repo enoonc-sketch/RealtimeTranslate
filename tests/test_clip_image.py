@@ -86,6 +86,14 @@ ok("8-bit palette copied, offset accounts for it",
 ok("8-bit bit count preserved", struct.unpack_from("<H", bmp8, 28)[0] == 8)
 ok("8-bit pixels round-trip", bmp8[62:] == pix8)
 
+# --- v2.15.8：BI_BITFIELDS（截图 / 浏览器 / 微信复制的 32 位图）---
+_hdr = dib_header(2, 2, 32, compression=3)
+_masks = struct.pack("<III", 0x00FF0000, 0x0000FF00, 0x000000FF)
+_pix32 = bytes(range(16))
+_bf = ci.dib_to_bmp(_hdr + _masks + _pix32)
+ok("BI_BITFIELDS 32 位：能转，像素偏移含 12 字节掩码", _bf[:2] == b"BM"
+   and struct.unpack_from("<I", _bf, 10)[0] == 14 + 40 + 12 and _bf[-16:] == _pix32)
+
 # --- 非法输入都抛 ValueError ---
 raises_valueerror("empty bytes raise ValueError", b"")
 raises_valueerror("truncated header raises ValueError",

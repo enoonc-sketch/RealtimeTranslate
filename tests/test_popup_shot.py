@@ -116,7 +116,7 @@ app.mini.update("h2", "译文来了")
 app.root.update()
 ok("mini reappears when result arrives", app.mini.win.winfo_viewable() and app.mini.body.cget("text") == "译文来了")
 app.mini.hide_for_capture()
-app.mini.hidden_at = time.time() - 3
+app.mini.hidden_at = time.time() - (dt.MiniWin.HIDE_TIMEOUT + 1)
 time.sleep(0.1)
 app.root.update()
 ok("hidden mini with no result closes itself", not app.mini.alive())

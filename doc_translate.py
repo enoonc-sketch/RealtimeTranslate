@@ -20,7 +20,7 @@ from xml.sax.saxutils import escape as _xml_escape
 from xml.sax.saxutils import unescape as _xml_unescape
 
 SUPPORTED_DOC_EXTS = {".txt", ".md", ".srt", ".docx"}
-SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".jfif", ".bmp", ".tif", ".tiff", ".gif", ".webp"}
 
 _TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}( .*)?$")
 

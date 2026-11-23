@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -137,8 +138,42 @@ def mirror_label(url):
     return url
 
 
-def _open(url, timeout):
-    return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout)
+def _open(url, timeout, headers=None):
+    h = dict(UA)
+    if headers:
+        h.update(headers)
+    return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
+
+
+def _is_timeout_error(e):
+    """是不是「超时」类错误（可重试、也可等取消）：socket 超时，或包在 URLError 里的超时。"""
+    if isinstance(e, (socket.timeout, TimeoutError)):
+        return True
+    if isinstance(e, urllib.error.URLError):
+        return isinstance(getattr(e, "reason", None), (socket.timeout, TimeoutError))
+    return False
+
+
+def _open_cancellable(url, timeout, cancelled=None, headers=None):
+    """可取消的 urlopen：每次连接最多等 10 秒，超时就查一次取消，没取消就继续等，
+    总预算仍是 timeout 秒；非超时错误（404、DNS 失败等）立即抛出，不空等。
+
+    修 2.15.6 的问题：以前 urlopen 一次等满 timeout（30/60 秒），这段时间里点
+    「取消」毫无反应，界面一直停在「正在取消…」。"""
+    deadline = time.time() + timeout
+    last = None
+    while True:
+        try:
+            return _open(url, min(timeout, 10), headers)
+        except Cancelled:
+            raise
+        except Exception as e:      # noqa: BLE001
+            last = e
+            if cancelled and cancelled():
+                raise Cancelled()
+            if not _is_timeout_error(e) or time.time() >= deadline:
+                raise last
+            time.sleep(min(1.0, max(0.0, deadline - time.time())))
 
 
 # ---------------------------------------------------------------- 索引
@@ -257,13 +292,18 @@ def missing_for(engine, from_code, to_code, best):
 
 # ---------------------------------------------------------------- 下载 / 安装
 def _fetch_into(url, tmp, progress, cancelled, timeout):
-    """把 url 下载到 tmp；tmp 已有内容就用 Range 续传（服务器不支持则自动从头来）。"""
+    """把 url 下载到 tmp；tmp 已有内容就用 Range 续传（服务器不支持则自动从头来）。
+
+    取消（2.15.9 修）：连接阶段走 _open_cancellable（10 秒一查取消）；传输中
+    服务器停滞时，读操作按响应的超时（10 秒）抛 socket.timeout，这里接住后
+    查取消、没取消就继续等，但连续无数据超过 timeout 秒就按中断报错，交给
+    上层重试续传 —— 以前停滞的读一次等满 60 秒，取消根本插不进来。"""
     have = os.path.getsize(tmp) if os.path.exists(tmp) else 0
     headers = dict(UA)
     if have:
         headers["Range"] = "bytes=%d-" % have
     try:
-        r = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout)
+        r = _open_cancellable(url, timeout, cancelled, headers)
     except urllib.error.HTTPError as e:
         if e.code == 416 and have:          # 服务器说「已经下完了」
             return
@@ -280,13 +320,23 @@ def _fetch_into(url, tmp, progress, cancelled, timeout):
             if free < need:
                 raise oe.OfflineError("磁盘空间不足：还需约 %.0f MB，现在只剩 %.0f MB" % (need / 1e6, free / 1e6))
         got = have
+        last_data = time.time()
         with open(tmp, "ab" if resumed else "wb") as f:
             while True:
                 if cancelled and cancelled():
                     raise Cancelled()
-                b = r.read(256 * 1024)
+                try:
+                    b = r.read(256 * 1024)
+                except (socket.timeout, TimeoutError):
+                    if cancelled and cancelled():
+                        raise Cancelled()
+                    if time.time() - last_data > timeout:
+                        raise ConnectionError("下载停滞超过 %d 秒，已中断（已下 %d / %d 字节）"
+                                              % (timeout, got, total))
+                    continue
                 if not b:
                     break
+                last_data = time.time()
                 f.write(b)
                 got += len(b)
                 if progress:
@@ -344,6 +394,8 @@ def download_pack(entry, models_dir, work_dir, replace="", progress=None, cancel
     tried = []
     for link in links:
         for cand in expand_model_links(link, preferred_mirror):
+            if cancelled and cancelled():       # 2.15.9：换候选地址前也查取消，别在失败重试里拖住
+                raise Cancelled()
             url = apply_replace(cand, replace)
             if url in tried:
                 continue

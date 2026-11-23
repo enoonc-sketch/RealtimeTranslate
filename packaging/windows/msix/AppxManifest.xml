@@ -5,7 +5,7 @@
          xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
          xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
          IgnorableNamespaces="uap desktop rescap">
-  <Identity Name="RealtimeTranslate.App" Publisher="CN=Realtime Translate" Version="2.15.5.0" ProcessorArchitecture="x64"/>
+  <Identity Name="RealtimeTranslate.App" Publisher="CN=Realtime Translate" Version="2.15.9.0" ProcessorArchitecture="x64"/>
   <Properties>
     <DisplayName>实时翻译</DisplayName>
     <PublisherDisplayName>Realtime Translate</PublisherDisplayName>

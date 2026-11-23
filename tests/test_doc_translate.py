@@ -77,7 +77,7 @@ for p, want in (("a.txt", True), ("a.MD", True), ("a.srt", True),
     ok("doc ext %s -> %s" % (p, want), d.supported_doc_ext(p) is want)
 for p, want in (("a.png", True), ("a.JPG", True), ("a.jpeg", True),
                 ("a.bmp", True), ("a.tif", True), ("a.tiff", True),
-                ("a.gif", False), ("a.webp", False), ("a.txt", False)):
+                ("a.gif", True), ("a.webp", True), ("a.heic", False), ("a.txt", False)):
     ok("image ext %s -> %s" % (p, want), d.supported_image_ext(p) is want)
 
 print("ALL OK" if all(res) else "FAILED")

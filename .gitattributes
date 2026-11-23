@@ -1,0 +1,5 @@
+# winocr.ps1 被 ocr_win.py 按 SHA256 验哈希：换行符一变，哈希就对不上。
+# 仓库以前没有 .gitattributes，Windows 上 git 检出默认会把 LF 转成 CRLF，
+# 云端 Windows 构建打出来的包里就是 CRLF 版 —— 内容没变，哈希却变了，
+# 全新安装都会误报“winocr.ps1 已被改动”。禁止转换，永远保持 LF。
+winocr.ps1 -text
