@@ -114,6 +114,7 @@ Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 {#MyAppName}"; Fla
 ; 那个目录里有翻译历史数据库（history.db）、设置（config.json）、
 ; 用户导入 / 下载的离线语言包（models）等，用户重装 / 升级时往往还想留着，
 ; 所以卸载最后一步（见下面 [Code]
+[Code]
 const
   NSIS_UNINST_KEY = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\RealtimeTranslate';
   INNO_UNINST_KEY = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{A8F3C2E1-9B4D-4E7A-8C1F-2D6E5B9A0F3C}_is1';
