@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "realtime-translate"
-version = "2.15.4"
+version = "2.15.5"
 description = "实时翻译：划词 / 指针取词 / 悬停取词 / 截图 OCR 翻译，支持离线引擎"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -36,7 +36,7 @@ py-modules = [
     "desktop_translator", "tray_win32", "screen_win", "ocr_win", "ocr_backends", "history_store",
     "tts_win", "stt_win", "doc_translate", "pdf_translate", "glossary", "update_check", "clip_image",
     "single_instance", "settings_io", "runtime_stdlib", "runtime_installer", "pack_downloader",
-    "offline_engine", "netcheck", "ui_platform", "typing_detect", "translator_tools", "license", "pet_win", "pet_state",
+    "offline_engine", "netcheck", "ui_platform", "typing_detect", "translator_tools", "text_detect", "license", "pet_win", "pet_state",
     "pet_pack", "pet_catalog",
 ]
 

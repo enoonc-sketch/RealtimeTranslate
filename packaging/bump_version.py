@@ -15,6 +15,7 @@ SKIP_FILES = {"CHANGELOG.md", "README.md"}
 EXTS = (".py", ".txt", ".iss", ".nsi", ".toml", ".plist", ".xml", ".yaml", ".yml", ".json", ".nuspec",
         ".ps1", ".sh", ".bat", ".md", ".desktop", ".spec")
 CONTROL = "control"
+VERSION_FILE = "VERSION"  # packaging/VERSION 无扩展名，也要跟着改（v2.15.5 修复：之前漏改它，--check 会报不一致）
 
 
 def current_version():
@@ -42,7 +43,7 @@ def bump(old, new, dry=False):
     for dp, dns, fns in os.walk(ROOT):
         dns[:] = [x for x in dns if x not in SKIP_DIRS]
         for fn in fns:
-            if fn in SKIP_FILES or not (fn.endswith(EXTS) or fn == CONTROL):
+            if fn in SKIP_FILES or not (fn.endswith(EXTS) or fn == CONTROL or fn == VERSION_FILE):
                 continue
             fp = os.path.join(dp, fn)
             rel = os.path.relpath(fp, ROOT)

@@ -1,0 +1,181 @@
+name: release
+# 全平台打包（v2.15.4）：Windows 标准版 / 离线版（Inno + NSIS + 免安装 zip）、macOS（.app + .dmg）、
+# Linux（tar.gz + .deb + AppImage）。推 v* 标签自动跑并挂到 Release；也可以在 Actions 里手动运行。
+#
+# 可选 Secrets（没配就跳过签名，照样出包）：
+#   WIN_PFX_BASE64 / WIN_PFX_PASS            Windows 代码签名证书（.pfx 的 base64）和密码
+#   MAC_CERT_P12_BASE64 / MAC_CERT_PASS      macOS「Developer ID Application」证书
+#   MAC_SIGN_ID                              例如 Developer ID Application: 名字 (TEAMID)
+#   MAC_NOTARY_APPLE_ID / MAC_NOTARY_TEAM_ID / MAC_NOTARY_PASSWORD   公证用（App 专用密码）
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: Syntax check
+        run: python -m compileall -q . -x '(\.buildenv|build|dist|tools/pet_render)'
+      - name: Pure-logic tests (no display needed)
+        run: |
+          for t in tests/test_grab_v2152.py tests/test_grab_v2153.py tests/test_spinner_v2153.py \
+                   tests/test_netcheck_v2153.py tests/test_installer_v2154.py tests/test_tray_wintypes.py \
+                   tests/test_packaging_v2154.py tests/test_translator_tools_v2154.py \
+                   tests/test_text_detect.py; do
+            echo "== $t"; python "$t"
+          done
+      - name: Version consistency
+        run: python packaging/bump_version.py --check
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    env:
+      # 步骤的 if 读不到步骤自己的 env，所以在 job 级别引入 Secrets
+      HAS_WIN_CERT: ${{ secrets.WIN_PFX_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12", architecture: x64 }
+      - name: Build standard exe
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements-lock.txt
+          python -m PyInstaller --noconfirm --clean realtime_translate.spec
+          Copy-Item dist\RealtimeTranslate.exe RealtimeTranslate.exe -Force
+      - name: Self-test
+        shell: pwsh
+        run: |
+          $p = Start-Process RealtimeTranslate.exe -ArgumentList "--selftest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "self-test failed" }
+      - name: Import signing cert (optional)
+        if: env.HAS_WIN_CERT == 'true'
+        shell: pwsh
+        env: { WIN_PFX_BASE64: "${{ secrets.WIN_PFX_BASE64 }}" }
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\sign.pfx", [Convert]::FromBase64String($env:WIN_PFX_BASE64))
+          "SIGN_PFX=$env:RUNNER_TEMP\sign.pfx" >> $env:GITHUB_ENV
+      - name: Sign exe
+        shell: cmd
+        env: { SIGN_PFX_PASS: "${{ secrets.WIN_PFX_PASS }}" }
+        run: call packaging\windows\sign.bat RealtimeTranslate.exe
+      - name: Installers (Inno + NSIS) and portable zip
+        shell: pwsh
+        run: |
+          choco install innosetup nsis -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer.iss
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /INPUTCHARSET UTF8 RealtimeTranslate_Setup.nsi
+          $env:NOPAUSE = "1"; cmd /c packaging\windows\make_portable.bat
+      - name: Sign installers
+        shell: cmd
+        env: { SIGN_PFX_PASS: "${{ secrets.WIN_PFX_PASS }}" }
+        run: for %%f in (Output\*.exe) do call packaging\windows\sign.bat "%%f"
+      - uses: actions/upload-artifact@v7
+        with: { name: windows-standard, path: "Output/*" }
+
+  windows-offline:
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12", architecture: x64 }
+      - name: Build offline
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements-lock.txt -r requirements-runtime-lock.txt
+          python prepare_offline_models.py
+          if ($LASTEXITCODE -eq 2) { throw "no language packs" }
+          $global:LASTEXITCODE = 0
+          python -m PyInstaller --noconfirm --clean realtime_translate_offline.spec
+          $p = Start-Process dist\RealtimeTranslateOffline\RealtimeTranslate.exe -ArgumentList "--selftest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "offline self-test failed" }
+      - name: Offline installers and portable zip
+        shell: pwsh
+        run: |
+          choco install innosetup nsis -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DOFFLINE=1 installer.iss
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /INPUTCHARSET UTF8 RealtimeTranslate_Setup_Offline.nsi
+          $env:NOPAUSE = "1"; cmd /c packaging\windows\make_portable.bat
+      - uses: actions/upload-artifact@v7
+        with: { name: windows-offline, path: "Output/*" }
+
+  macos:
+    needs: test
+    runs-on: macos-14
+    env:
+      HAS_MAC_CERT: ${{ secrets.MAC_CERT_P12_BASE64 != '' }}
+      HAS_NOTARY: ${{ secrets.MAC_NOTARY_APPLE_ID != '' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: Import signing cert (optional)
+        env:
+          P12: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          PASS: ${{ secrets.MAC_CERT_PASS }}
+        if: env.HAS_MAC_CERT == 'true'
+        run: |
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import "$RUNNER_TEMP/cert.p12" -k build.keychain -P "$PASS" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
+      - name: Notary profile (optional)
+        env:
+          AID: ${{ secrets.MAC_NOTARY_APPLE_ID }}
+          TID: ${{ secrets.MAC_NOTARY_TEAM_ID }}
+          PW: ${{ secrets.MAC_NOTARY_PASSWORD }}
+        if: env.HAS_NOTARY == 'true'
+        run: |
+          xcrun notarytool store-credentials ci --apple-id "$AID" --team-id "$TID" --password "$PW"
+          echo "MAC_NOTARY_PROFILE=ci" >> "$GITHUB_ENV"
+      - name: Build .app and .dmg
+        env: { MAC_SIGN_ID: "${{ secrets.MAC_SIGN_ID }}" }
+        run: bash packaging/macos/build_macos.sh
+      - uses: actions/upload-artifact@v7
+        with: { name: macos, path: "Output/*.dmg" }
+
+  linux:
+    needs: test
+    runs-on: ubuntu-22.04          # 老一点的 glibc，生成的包能在更多发行版上跑
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.12" }
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y python3-tk fakeroot libfuse2 xvfb
+      - name: tar.gz / .deb / AppImage
+        run: |
+          xvfb-run -a bash packaging/linux/build_linux.sh
+          bash packaging/linux/build_deb.sh
+          bash packaging/linux/build_appimage.sh
+      - uses: actions/upload-artifact@v7
+        with: { name: linux, path: "Output/*" }
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, windows-offline, macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
+        with: { path: out, merge-multiple: true }
+      - name: Checksums
+        run: cd out && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          body_path: CHANGELOG.md

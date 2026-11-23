@@ -10,7 +10,7 @@ a = Analysis(
     # tray_win32 / tts_win / stt_win 在非 Windows 上 import 安全（功能自动关闭），主程序启动时会 import，不能排除
     hiddenimports=['tray_win32', 'tts_win', 'stt_win', 'pack_downloader', 'runtime_installer', 'screen_win', 'ocr_win', 'ocr_backends', 'history_store',
     'doc_translate', 'glossary', 'update_check', 'pdf_translate', 'clip_image', 'single_instance', 'settings_io',
-    'runtime_stdlib', 'ui_platform', 'sqlite3', 'typing_detect', 'translator_tools', 'license', 'netcheck', 'offline_engine',
+    'runtime_stdlib', 'ui_platform', 'sqlite3', 'typing_detect', 'translator_tools', 'text_detect', 'license', 'netcheck', 'offline_engine',
     'pet_win', 'pet_state', 'pet_pack', 'pet_catalog',
     'pynput', 'pynput.keyboard', 'pynput.mouse'] + ['pynput.keyboard._xorg', 'pynput.mouse._xorg'],
     excludes=[ 'ctranslate2', 'sentencepiece', 'numpy',

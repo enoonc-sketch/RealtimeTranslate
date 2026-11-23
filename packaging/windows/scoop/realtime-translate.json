@@ -1,11 +1,11 @@
 {
-    "version": "2.15.4",
+    "version": "2.15.5",
     "description": "实时翻译：划词、指针取词、截图 OCR 翻译",
     "homepage": "https://github.com/OWNER/RealtimeTranslate",
     "license": "Proprietary",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/OWNER/RealtimeTranslate/releases/download/v2.15.4/RealtimeTranslate_v2.15.4_portable.zip",
+            "url": "https://github.com/OWNER/RealtimeTranslate/releases/download/v2.15.5/RealtimeTranslate_v2.15.5_portable.zip",
             "hash": "0000000000000000000000000000000000000000000000000000000000000000",
             "extract_dir": "RealtimeTranslate"
         }

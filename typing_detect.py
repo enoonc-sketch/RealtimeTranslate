@@ -23,6 +23,8 @@ translate()，气泡由调用方复用悬停取词的 Bubble/MiniWin。
 import re
 import time
 
+import text_detect          # v2.15.5：敏感内容判定与主程序共用（纯逻辑，无循环依赖）
+
 MAX_FRAGMENT = 200          # 片段上限（字符）
 MIN_CHARS = 2               # 太短不翻
 LIVE_DEBOUNCE_MS = 250      # 当前词实时跟进的防抖（毫秒）
@@ -37,18 +39,8 @@ SENTENCE_TERMINATORS = set(".!?。！？\n\r")
 BACKSPACE_CHARS = {"\b", "\x7f"}
 ESCAPE_CHARS = {"\x1b"}
 
-# 敏感内容判定：与 desktop_translator.is_sensitive_clip 同款规则（镜像，
-# 本模块不能 import desktop_translator，会循环依赖）。验证码 / 身份证号 /
-# API 密钥 / 密码令牌 / 长串高熵 token —— 像敏感剪贴板一样不翻译。
-_SENSITIVE_RES = [
-    re.compile(r"^\d{6,}$"),
-    re.compile(r"^sk-[A-Za-z0-9\-_]{16,}$"),
-    re.compile(r"^\d{17}[\dXx]$"),
-    re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[A-Za-z0-9\-_+/=]{32,}$"),
-]
-_SENSITIVE_KW_RE = re.compile(
-    r"(password|passwd|pwd|token|secret|api[-_]?key|access[-_]?key)\s*[:=]\s*\S+",
-    re.IGNORECASE)
+# 敏感内容判定：v2.15.5 起与 desktop_translator.is_sensitive_clip 共用 text_detect.is_sensitive
+# （原来这里镜像了一份规则，两边改一处漏一处）。
 
 # 敏感键名（B-1）：出现在 "key: value" / "key=value" 里的键。词按分隔符拆开后，
 # 单看 "password" 或 "abc123" 都不触发敏感规则（见 _SENSITIVE_KW_RE），所以缓冲
@@ -64,19 +56,8 @@ _SENSITIVE_KEY_DELIMITERS = set(":=\uff1a")
 
 
 def is_sensitive_text(text):
-    """文本像不像敏感信息（验证码、身份证号、API 密钥、密码/令牌）。纯函数。"""
-    t = (text or "").strip()
-    if not t:
-        return False
-    if _SENSITIVE_KW_RE.search(t):
-        return True
-    lines = [ln for ln in t.splitlines() if ln.strip()]
-    if len(lines) == 1:
-        s = lines[0]
-        for rx in _SENSITIVE_RES:
-            if rx.match(s):
-                return True
-    return False
+    """文本像不像敏感信息（验证码、身份证号、银行卡号、API 密钥、密码/令牌）。纯函数。"""
+    return text_detect.is_sensitive(text)
 
 
 def _has_letter(text):
