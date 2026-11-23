@@ -1,4 +1,4 @@
-"""一键改全部版本号：python packaging/bump_version.py 2.15.5
+"""一键改全部版本号：python packaging/bump_version.py 2.15.7
 
 改：desktop_translator.__version__、version_info.txt、installer.iss、NSIS 脚本、
 packaging/VERSION、pyproject.toml、macOS Info.plist、deb control、MSIX 清单、
@@ -96,7 +96,7 @@ def main(argv):
     if len(argv) == 2 and argv[1] == "--check":
         return check()
     if len(argv) != 2 or not re.match(r"^\d+\.\d+\.\d+$", argv[1]):
-        print("用法：python packaging/bump_version.py 主.次.修订（例如 2.15.5）")
+        print("用法：python packaging/bump_version.py 主.次.修订（例如 2.15.7）")
         return 2
     old, new = current_version(), argv[1]
     if old == new:

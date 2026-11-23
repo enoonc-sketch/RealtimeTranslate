@@ -30,7 +30,7 @@
    建独立虚拟环境 → 下载语言包到 `offline_models\` → 打包 → **自动自检**（真正加载模型翻译一句）
 4. 得到 `dist\RealtimeTranslateOffline\`，里面的 `RealtimeTranslate.exe` 可直接运行，整个文件夹可复制给别人
 5. 做成安装向导：安装 [Inno Setup 6](https://jrsoftware.org/isdl.php)，运行 `build_installer.bat offline`
-   → `Output\RealtimeTranslate_Offline_Setup_v2.15.5.exe`
+   → `Output\RealtimeTranslate_Offline_Setup_v2.15.7.exe`
 
 **语言包下载不下来？**（`argos-net.com` 在部分网络下不通）
 用浏览器 / 代理从 [索引](https://github.com/argosopentech/argospm-index)（`index.json` 的 `links` 字段）下载 `.argosmodel`，

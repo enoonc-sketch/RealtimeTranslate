@@ -205,7 +205,7 @@ def _fake_index(versions):
 
 _orig_open = pd._open
 try:
-    pd._open = lambda url, timeout: _FakeResp(_fake_index([
+    pd._open = lambda url, timeout, headers=None: _FakeResp(_fake_index([
         ("2.6.0", "numpy-2.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"),
         ("2.5.5", "numpy-2.5.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl")]))
     try:
@@ -213,14 +213,14 @@ try:
         ok("H-05 newer-than-pinned version refused", False)
     except oe.OfflineError as e:
         ok("H-05 newer-than-pinned version refused", "只信任钉死的" in str(e))
-    pd._open = lambda url, timeout: _FakeResp(_fake_index([
+    pd._open = lambda url, timeout, headers=None: _FakeResp(_fake_index([
         ("2.5.5", "numpy-2.5.5-cp312-cp312-manylinux_2_27_x86_64.whl")]))
     try:
         ri.find_wheel("numpy", "cp312")
         ok("H-05 unlisted wheel filename refused", False)
     except oe.OfflineError as e:
         ok("H-05 unlisted wheel filename refused", "校验表" in str(e))
-    pd._open = lambda url, timeout: _FakeResp(_fake_index([
+    pd._open = lambda url, timeout, headers=None: _FakeResp(_fake_index([
         ("2.5.5", "numpy-2.5.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl")]))
     w = ri.find_wheel("numpy", "cp312")
     ok("H-05 pinned wheel accepted with pinned sha",
@@ -240,9 +240,11 @@ ok("H-06 cache root fallback is user temp, not shared",
    "Public" not in oe._ascii_cache_root() and "ProgramData" not in oe._ascii_cache_root())
 
 # ---------------------------------------------------------------- M-01 OCR 脚本校验
+# v2.15.6：比对归一化后的哈希 —— Windows 检出的 CRLF 版内容没变也必须通过，
+# 只比原始哈希会在云端 Windows 构建里误报“已被改动”。
 real_ps = os.path.join(ROOT, "winocr.ps1")
 ok("M-01 pinned winocr.ps1 hash matches tree",
-   ocr_win._sha256_file(real_ps) == ocr_win._SCRIPT_SHA256)
+   ocr_win._script_hash_ok(real_ps))
 
 _calls = {"run": 0, "cmd": None}
 

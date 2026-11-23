@@ -267,7 +267,7 @@ CLOSE_NAMES = {"tray": "隐藏到托盘", "taskbar": "最小化到任务栏", "q
 CLOSE_CODES = {v: k for k, v in CLOSE_NAMES.items()}
 MINIMIZE_NAMES = {"taskbar": "留在任务栏", "tray": "收进托盘"}        # 点窗口 – 最小化时（v2.10）
 MINIMIZE_CODES = {v: k for k, v in MINIMIZE_NAMES.items()}
-__version__ = "2.15.5"
+__version__ = "2.15.7"
 APP_TITLE = "实时翻译"
 RUN_VALUE = "RealtimeTranslate"
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -1846,15 +1846,102 @@ def start_hotkey_win(q, specs=None):
     return state["ok"]
 
 
-def start_typing_hook_win(q):
+# ---------------------------------------------------------------- 打字检测：Windows 键盘监听
+# v2.15.6：钩子安装失败是 2.15.5 上报的 bug，本版修了三处硬伤并加了兜底：
+#   1) SetWindowsHookExW / UnhookWindowsHookEx 从没设过 argtypes/restype，
+#      ctypes 默认把 64 位钩子句柄截成 32 位 int 传回 / 传出；
+#   2) hMod 传 None：部分机器 / 安全软件下 SetWindowsHookExW 直接报
+#      ERROR_HOOK_NEEDS_HMOD（1428），改传 GetModuleHandleW(None)；
+#   3) 原来只等 2 秒就判失败，失败也不说错误码。改成线程内重试 3 次、
+#      用 Event 交握（最多等 5 秒）、失败时把 GetLastError 错误码带回队列；
+#      钩子实在装不上时改用 GetAsyncKeyState 轮询兜底（start_typing_poll_win）。
+_TYPING_HOOK_ERROR_TEXT = {
+    5: "拒绝访问（5，可能被安全软件拦截）",
+    87: "参数错误（87）",
+    1428: "需要模块句柄（1428）",
+    1429: "钩子已存在（1429）",
+    1460: "安装超时（1460）",
+}
+
+
+def _typing_hook_error_text(code):
+    """Win32 错误码 → 一句中文说明；未知码只报数字，不瞎猜原因。"""
+    if code in _TYPING_HOOK_ERROR_TEXT:
+        return _TYPING_HOOK_ERROR_TEXT[code]
+    return "错误码 %s" % (code,) if code else "未知错误"
+
+
+def _typing_win32_setup(user32, kernel32=None):
+    """给真实 WinDLL 设好 argtypes/restype（64 位句柄不能截成 int）。
+    传入 fake 对象（测试用）时设不上就跳过，不报错。"""
+    import ctypes
+    import ctypes.wintypes as wt
+    try:
+        user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        user32.GetAsyncKeyState.restype = ctypes.c_short
+        user32.GetKeyboardState.argtypes = [ctypes.POINTER(ctypes.c_ubyte)]
+        user32.GetKeyboardState.restype = wt.BOOL
+        user32.GetKeyboardLayout.argtypes = [wt.DWORD]
+        user32.GetKeyboardLayout.restype = ctypes.c_void_p
+        user32.ToUnicodeEx.argtypes = [ctypes.c_uint, ctypes.c_uint,
+                                       ctypes.POINTER(ctypes.c_ubyte),
+                                       ctypes.c_wchar_p, ctypes.c_int,
+                                       ctypes.c_uint, ctypes.c_void_p]
+        user32.ToUnicodeEx.restype = ctypes.c_int
+        user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wt.WPARAM, wt.LPARAM]
+        user32.CallNextHookEx.restype = wt.LPARAM
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                                             ctypes.c_void_p, wt.DWORD]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        user32.UnhookWindowsHookEx.restype = wt.BOOL
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), ctypes.c_void_p,
+                                       ctypes.c_uint, ctypes.c_uint]
+        user32.GetMessageW.restype = wt.BOOL
+        user32.PostThreadMessageW.argtypes = [wt.DWORD, ctypes.c_uint, wt.WPARAM, wt.LPARAM]
+        user32.PostThreadMessageW.restype = wt.BOOL
+        user32.GetCurrentThreadId.restype = wt.DWORD
+    except (AttributeError, TypeError):
+        pass
+    if kernel32 is not None:
+        try:
+            kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+            kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+        except (AttributeError, TypeError):
+            pass
+
+
+def _typing_modifiers_down(user32):
+    """Ctrl / Alt / Win 任一按住（钩子与轮询共用）。"""
+    return any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in (0x11, 0x12, 0x5B, 0x5C))
+
+
+def _typing_vk_to_char(user32, vk, scan):
+    """虚拟键 → 字符（按当前键盘布局；转不出来返回 None。钩子与轮询共用）。"""
+    import ctypes
+    kb = (ctypes.c_ubyte * 256)()
+    if not user32.GetKeyboardState(kb):
+        return None
+    buf = ctypes.create_unicode_buffer(8)
+    n = user32.ToUnicodeEx(vk, scan, kb, buf, 8, 0, user32.GetKeyboardLayout(0))
+    if n >= 1:
+        return buf.value[:1]
+    return None
+
+
+def start_typing_hook_win(q, _win=None, _kernel=None):
     """Windows 打字检测翻译的低级键盘钩子（WH_KEYBOARD_LL，标准库 ctypes，
     不装第三方依赖）。只转发按键事件到队列，绝不在钩子回调里做翻译/弹窗/
     读配置：回调里只判断“是不是可打印字符 / 空格 / 回车 / 退格 / Esc”，
     修饰键组合（Ctrl/Alt/Win 按住时）一律不转发，注入的按键事件也不转发。
-    返回 stop()；安装失败返回 None（调用方在界面明确提示，绝不崩溃）。"""
+    返回 stop()；安装失败返回 None（并把错误码记在
+    start_typing_hook_win.last_error、同时往队列发 ("typing_hook_error", 码)，
+    调用方按码提示，绝不崩溃）。_win / _kernel 只供测试注入 fake user32。"""
     import ctypes
     import ctypes.wintypes as wt
-    user32 = ctypes.windll.user32
+    user32 = _win if _win is not None else ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = _kernel if _kernel is not None else ctypes.WinDLL("kernel32", use_last_error=True)
+    _typing_win32_setup(user32, kernel32)
     WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN = 13, 0x0100, 0x0104
     LLKHF_INJECTED = 0x10
 
@@ -1863,41 +1950,23 @@ def start_typing_hook_win(q):
                     ("flags", wt.DWORD), ("time", wt.DWORD),
                     ("dwExtraInfo", ctypes.c_void_p)]
 
-    state = {"hook": None, "thread_id": 0, "stopped": False}
-    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
-    user32.GetAsyncKeyState.restype = ctypes.c_short
-    user32.GetKeyboardState.argtypes = [ctypes.POINTER(ctypes.c_ubyte)]
-    user32.GetKeyboardState.restype = wt.BOOL
-    user32.GetKeyboardLayout.argtypes = [wt.DWORD]
-    user32.GetKeyboardLayout.restype = ctypes.c_void_p
-    user32.ToUnicodeEx.argtypes = [ctypes.c_uint, ctypes.c_uint,
-                                   ctypes.POINTER(ctypes.c_ubyte),
-                                   ctypes.c_wchar_p, ctypes.c_int,
-                                   ctypes.c_uint, ctypes.c_void_p]
-    user32.ToUnicodeEx.restype = ctypes.c_int
-    user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wt.WPARAM, wt.LPARAM]
-    user32.CallNextHookEx.restype = wt.LPARAM
+    state = {"hook": None, "thread_id": 0, "stopped": False, "err": 0}
+    ready = threading.Event()
 
-    def _modifiers_down():
-        return any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in (0x11, 0x12, 0x5B, 0x5C))
-
-    def _vk_to_char(vk, scan):
-        kb = (ctypes.c_ubyte * 256)()
-        if not user32.GetKeyboardState(kb):
-            return None
-        buf = ctypes.create_unicode_buffer(8)
-        n = user32.ToUnicodeEx(vk, scan, kb, buf, 8, 0, user32.GetKeyboardLayout(0))
-        if n == 1:
-            return buf.value
-        if n > 1:
-            return buf.value[:1]
-        return None
+    def _last_error():
+        err = getattr(user32, "last_error", None)
+        if err is None:
+            try:
+                err = ctypes.get_last_error()
+            except Exception:
+                err = 0
+        return err or 0
 
     def _callback(n_code, w_param, l_param):
         try:
             if n_code >= 0 and w_param in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                if not (info.flags & LLKHF_INJECTED) and not _modifiers_down():
+                if not (info.flags & LLKHF_INJECTED) and not _typing_modifiers_down(user32):
                     vk = info.vkCode
                     if vk == 0x20:
                         q.put(("typing_key", " ", vk))
@@ -1912,25 +1981,42 @@ def start_typing_hook_win(q):
                     elif vk == 0x78:                     # v2.15.4：F9 = 输入翻译的触发键
                         q.put(("typing_key", "\x00F9", vk))
                     else:
-                        ch = _vk_to_char(vk, info.scanCode)
+                        ch = _typing_vk_to_char(user32, vk, info.scanCode)
                         if ch:
                             q.put(("typing_key", ch, vk))
         except Exception:
             pass
         return user32.CallNextHookEx(state["hook"], n_code, w_param, l_param)
 
-    HOOKPROC = ctypes.WINFUNCTYPE(wt.LPARAM, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+    # WINFUNCTYPE 只在 Windows 上有（stdcall）；Linux 单测用 CFUNCTYPE，
+    # x86-64 下两者调用约定相同，只为让这段逻辑能在 Linux 上跑测试。
+    _winfunctype = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+    HOOKPROC = _winfunctype(wt.LPARAM, ctypes.c_int, wt.WPARAM, wt.LPARAM)
     proc = HOOKPROC(_callback)
     state["_proc"] = proc  # 钩子回调绝不能被 GC 回收
 
     def loop():
-        user32.GetCurrentThreadId.restype = wt.DWORD
         state["thread_id"] = user32.GetCurrentThreadId()
-        hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, proc, None, 0)
+        try:
+            hmod = kernel32.GetModuleHandleW(None)
+        except Exception:
+            hmod = None
+        hook = None
+        for _attempt in range(3):
+            if state["stopped"]:
+                break
+            hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, proc, hmod, 0)
+            if hook:
+                break
+            state["err"] = _last_error()
+            time.sleep(0.2)
         if not hook:
-            q.put(("typing_hook_error",))
+            state["err"] = state["err"] or _last_error()
+            q.put(("typing_hook_error", state["err"]))
+            ready.set()
             return
         state["hook"] = hook
+        ready.set()
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
             user32.TranslateMessage(ctypes.byref(msg))
@@ -1939,12 +2025,11 @@ def start_typing_hook_win(q):
         state["hook"] = None
 
     threading.Thread(target=loop, daemon=True).start()
-    for _ in range(20):
-        if state["hook"] is not None:
-            break
-        time.sleep(0.1)
+    ready.wait(5)
     if state["hook"] is None:
+        start_typing_hook_win.last_error = state["err"]
         return None
+    start_typing_hook_win.last_error = 0
 
     def stop():
         if state["stopped"]:
@@ -1964,6 +2049,61 @@ def start_typing_hook_win(q):
     return stop
 
 
+start_typing_hook_win.last_error = 0
+
+
+# 轮询兜底要扫的虚拟键：退格 / Tab / 回车 / Esc / 空格 / F9 + 数字 + 字母 +
+# 小键盘数字 + 常见标点键（修饰键本身不在里面）。
+_TYPING_POLL_VKS = ((0x08, 0x09, 0x0D, 0x1B, 0x20, 0x78)
+                    + tuple(range(0x30, 0x3A)) + tuple(range(0x41, 0x5B))
+                    + tuple(range(0x60, 0x6A))
+                    + (0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0,
+                       0xDB, 0xDC, 0xDD, 0xDE, 0xE2))
+_TYPING_POLL_SPECIAL = {0x08: "\b", 0x09: "\t", 0x0D: "\n",
+                        0x1B: "\x1b", 0x20: " ", 0x78: "\x00F9"}
+
+
+def start_typing_poll_win(q, _win=None, _interval=0.01):
+    """轮询兜底：键盘钩子装不上时，用 GetAsyncKeyState 每 10ms 扫一遍按键，
+    检测“按下边沿”后按钩子同样的规则转发（修饰键组合不转发）。
+    认不出注入按键：替换粘贴期间按住 Ctrl/Alt 时不转发（和钩子一致）；
+    替换用的退格注入会被当成真退格，但替换完成时会清空缓冲，影响有限。
+    返回 stop()；线程起不来返回 None。_win 只供测试注入 fake user32。"""
+    import ctypes
+    user32 = _win if _win is not None else ctypes.WinDLL("user32", use_last_error=True)
+    _typing_win32_setup(user32)
+    state = {"stopped": False}
+    prev = {}
+
+    def loop():
+        while not state["stopped"]:
+            try:
+                for vk in _TYPING_POLL_VKS:
+                    down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
+                    was = prev.get(vk, False)
+                    prev[vk] = down
+                    if not down or was:
+                        continue
+                    if _typing_modifiers_down(user32):
+                        continue
+                    ch = _TYPING_POLL_SPECIAL.get(vk)
+                    if ch is None:
+                        ch = _typing_vk_to_char(user32, vk, 0)
+                    if ch:
+                        q.put(("typing_key", ch, vk))
+            except Exception:
+                pass
+            time.sleep(_interval)
+
+    try:
+        threading.Thread(target=loop, daemon=True).start()
+    except Exception:
+        return None
+
+    def stop():
+        state["stopped"] = True
+
+    return stop
 def foreground_window_win():
     """当前前台窗口句柄（翻译并替换用：粘贴前校验还是刚才那个窗口）。失败返回 0。"""
     try:
@@ -2872,7 +3012,8 @@ class App:
             scope=self.cfg.get("typing_scope", "word"),
             pause_ms=self.cfg.get("typing_pause_ms", 1000))
         self._typing_seq = 0
-        self._typing_stop = None                # Windows 钩子的 stop()
+        self._typing_stop = None                # Windows 钩子 / 轮询兜底的 stop()
+        self._typing_poll_fallback = False      # v2.15.6：钩子装不上时改用轮询
         self._typing_listener = None            # pynput 监听器（macOS/Linux）
         self._typing_last_hwnd = None           # 前台窗口一切换就清空缓冲
         self._typing_bubble_active = False
@@ -5507,6 +5648,20 @@ class App:
             self.engine_hint.configure(text="Google 免费端点" + ("" if offline_engine.runtime_present() else " · 点「离线语言包…」可下载离线组件"))
 
     # ------------------------------------------------ 在线安装离线翻译组件（标准版）
+    @staticmethod
+    def _rt_preset_label(replace):
+        """镜像替换串属于哪个预设（下拉框显示用）；手动填的返回 ''（不属于任何预设）。"""
+        for label, val in runtime_installer.MIRROR_PRESETS:
+            if val == (replace or ""):
+                return label
+        return ""
+
+    def _rt_preset_selected(self, _event=None):
+        for label, val in runtime_installer.MIRROR_PRESETS:
+            if label == self.rt_mirror_preset.get():
+                self.rt_mirror.set(val)
+                return
+
     def _offer_runtime_install(self):
         ok, why = runtime_installer.supported()
         if not ok:
@@ -5531,6 +5686,7 @@ class App:
         win.transient(self.root)
         self.rt_win = win
         self.rt_busy, self.rt_cancel = True, False
+        self._rt_closed = False          # 2.15.7：用户在取消中强行关了窗口就记下来，后台装完不再弹对话框
         self._rt_speed = {"label": None, "t": 0.0, "done": 0, "v": 0.0}
         _l = ttk.Label(win, text="正在下载离线翻译组件（numpy、ctranslate2 等）。下载中途断网可再次点击，会接着下。",
                        wraplength=580)
@@ -5543,10 +5699,18 @@ class App:
         ui_platform.autowrap(self.rt_msg)
         mrow = ttk.Frame(win)
         mrow.pack(fill="x", padx=12)
-        ttk.Label(mrow, text="镜像（可选）").pack(side="left")
+        ttk.Label(mrow, text="镜像").pack(side="left")
+        self.rt_mirror_preset = tk.StringVar(value=self._rt_preset_label(self.cfg.get("pack_mirror", "")))
+        _preset = ttk.Combobox(mrow, textvariable=self.rt_mirror_preset, state="readonly",
+                               values=[label for label, _ in runtime_installer.MIRROR_PRESETS], width=38)
+        _preset.pack(side="left", padx=(6, 0))
+        _preset.bind("<<ComboboxSelected>>", self._rt_preset_selected)
         self.rt_mirror = tk.StringVar(value=self.cfg.get("pack_mirror", ""))
-        ttk.Entry(mrow, textvariable=self.rt_mirror).pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Label(win, text="连不上 PyPI 时填，如 pypi.org=镜像域名;files.pythonhosted.org=镜像域名",
+        _entry = ttk.Entry(mrow, textvariable=self.rt_mirror)
+        _entry.pack(side="left", fill="x", expand=True, padx=6)
+        _entry.bind("<KeyRelease>",
+                    lambda _e: self.rt_mirror_preset.set(self._rt_preset_label(self.rt_mirror.get())))
+        ttk.Label(win, text="下载慢时选个镜像（只换轮子下载地址，查询仍走 PyPI）；也可手动填，如 files.pythonhosted.org=镜像域名",
                   foreground="#8a93a2", wraplength=580).pack(anchor="w", padx=12, pady=(2, 0))
         brow = ttk.Frame(win)
         brow.pack(fill="x", padx=12, pady=12, side="bottom")
@@ -5562,6 +5726,7 @@ class App:
 
     def _rt_start(self):
         self.rt_busy, self.rt_cancel = True, False
+        self._rt_closed = False
         self.rt_retry.configure(state="disabled")
         self.rt_btn.configure(text="取消")
         self.rt_bar.configure(value=0)
@@ -5575,7 +5740,8 @@ class App:
                 versions = runtime_installer.install(
                     _runtime_dir(), replace=mirror,
                     progress=lambda i, n, fn, d, t: self.q.put(("rt_prog", i, n, fn, d, t)),
-                    cancelled=lambda: self.rt_cancel)
+                    cancelled=lambda: self.rt_cancel,
+                    status=lambda s: self.q.put(("rt_prog", -1, 0, s, 0, 0)))
                 self.q.put(("rt_prog", -1, 0, "正在检查组件能否加载…", 0, 0))
                 runtime_installer.activate(_runtime_dir())
                 runtime_installer.verify_import()
@@ -5588,8 +5754,16 @@ class App:
 
     def _rt_cancel_or_close(self):
         if self.rt_busy:
-            self.rt_cancel = True
-            self.rt_msg.configure(text="正在取消…（已下载的部分会保留）")
+            if self.rt_cancel:
+                # 2.15.7：已经在取消中了，再点一次（或点右上角 ×）就直接关窗口，
+                # 不用干等后台线程；后台是 daemon 线程，随程序退出结束；装完不再弹对话框。
+                self._rt_closed = True
+                if self._rt_alive():
+                    self.rt_win.destroy()
+            else:
+                self.rt_cancel = True
+                self.rt_msg.configure(text="正在取消…（已下载的部分会保留）")
+                self.rt_btn.configure(text="关闭")
         elif self._rt_alive():
             self.rt_win.destroy()
 
@@ -5622,6 +5796,8 @@ class App:
             self._update_engine_hint()
             if self._rt_alive():
                 self.rt_win.destroy()
+            if getattr(self, "_rt_closed", False):
+                return          # 2.15.7：用户在取消中强行关了窗口，别再自动弹语言包对话框
             self._show_offline_packs()
             self._show_pack_download()          # 接着就是下载语言包
             return
@@ -6203,7 +6379,8 @@ class App:
 
     def _on_typing_opt(self):
         """打字检测翻译开关 / 范围改动：保存；关闭时立即停监听、清空缓冲
-        （隐私优先）；开启后重启生效（与全局快捷键的配置方式一致）。
+        （隐私优先）；开启后立即启动监听（v2.15.6：以前要重启才生效，
+        钩子装不上时连重试的机会都没有）。
         v2.15：专业版功能 —— 未激活时打开开关先给 7 天试用（只给一次），
         试用用完又没买就弹激活框、开关打回去。"""
         self.cfg["typing_scope"] = TYPING_SCOPE_CODES.get(self.typing_scope_var.get(), "word")
@@ -6221,6 +6398,8 @@ class App:
         self._save()
         if not self.typing_var.get():
             self._stop_typing()
+        else:
+            self._start_typing()  # v2.15.6：打开立即启动（已在监听时内部直接返回）
         self._refresh_typing_ui()
         self._refresh_tray_state()
 
@@ -8267,6 +8446,8 @@ class App:
         状态不一致时（比如手改了配置文件）顺手把开关打回去，免得界面撒谎。"""
         if not (self.cfg.get("typing", False) or self.cfg.get("input_translate", False)):
             return
+        if getattr(self, "_typing_stop", None) is not None or getattr(self, "_typing_listener", None) is not None:
+            return  # v2.15.6：已经在监听，别重复装钩子
         if not license.typing_allowed(self.cfg):
             self.cfg["typing"] = False
             self.cfg["input_translate"] = False
@@ -8278,15 +8459,27 @@ class App:
                     pass
             return
         if IS_WIN:
+            # v2.15.6：钩子装不上不再直接放弃 —— 先报真实错误码，再改用轮询兜底。
+            stop = None
             try:
                 stop = start_typing_hook_win(self.q)
             except Exception as e:
-                stop = None
                 self.status.configure(text="打字检测翻译：键盘钩子启动失败：%s" % e)
             if stop is None:
-                self.status.configure(text="打字检测翻译：键盘钩子安装失败（可能被安全软件拦截），已保持关闭")
+                err = getattr(start_typing_hook_win, "last_error", 0)
+                try:
+                    stop = start_typing_poll_win(self.q)
+                except Exception:
+                    stop = None
+                if stop is not None:
+                    self._typing_stop = stop
+                    self._typing_poll_fallback = True
+                    self.status.configure(text="打字检测翻译：键盘钩子安装失败（%s），已改用轮询监听" % _typing_hook_error_text(err))
+                else:
+                    self.status.configure(text="打字检测翻译：键盘钩子安装失败（%s），轮询监听也启动失败" % _typing_hook_error_text(err))
             else:
                 self._typing_stop = stop
+                self._typing_poll_fallback = False
             return
         if keyboard is None:
             self.status.configure(text="打字检测翻译：未安装 pynput，本机不可用（pip install pynput 后重启）")
@@ -8339,6 +8532,7 @@ class App:
         except Exception:
             pass
         self._typing_stop = None
+        self._typing_poll_fallback = False
         try:
             if self._typing_listener is not None:
                 self._typing_listener.stop()
@@ -8871,7 +9065,11 @@ class App:
                 elif kind == "typing_bubble":
                     self._on_typing_bubble(*msg[1:])
                 elif kind == "typing_hook_error":
-                    self.status.configure(text="打字检测翻译：键盘钩子安装失败（可能被安全软件拦截），已保持关闭")
+                    # v2.15.6：已改用轮询兜底时别把状态栏盖回“已保持关闭”；
+                    # 钩子线程是先报错、调用方后处理，所以这里只在确实没监听时才报。
+                    if getattr(self, "_typing_stop", None) is None and getattr(self, "_typing_listener", None) is None:
+                        code = msg[1] if len(msg) > 1 else 0
+                        self.status.configure(text="打字检测翻译：键盘钩子安装失败（%s），已保持关闭" % _typing_hook_error_text(code))
                 elif kind == "rt_prog":
                     self._on_rt_prog(*msg[1:])
                 elif kind == "rt_done":
@@ -9015,7 +9213,9 @@ def run_selftest():
             except ocr_win.OcrError as e:
                 msg = str(e)
                 lines.append("系统 OCR：%s" % msg)
-                if "解析失败" in msg or "无法加载" in msg:
+                # v2.15.6：脚本被改动也算不通过 —— OCR 完全不可用，不能只记一行就放过去
+                #（以前只有“解析失败 / 无法加载”才判失败，2.15.5 的误报就是这么从自检里漏过去的）。
+                if "解析失败" in msg or "无法加载" in msg or "已被改动" in msg:
                     ok = False
             finally:
                 try:

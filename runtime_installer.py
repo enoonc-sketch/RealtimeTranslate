@@ -11,6 +11,7 @@ import re
 import shutil
 import struct
 import sys
+import urllib.parse
 import zipfile
 
 import offline_engine as oe
@@ -26,6 +27,18 @@ PKGS = ["numpy", "pyyaml", "sentencepiece", "ctranslate2"]
 DEFAULT_INDEX = "https://pypi.org/pypi/%s/json"
 INDEX = DEFAULT_INDEX
 SIZE_HINT_MB = 35                      # 提示用户的大致下载量
+
+# 镜像预设（2.15.7，下载对话框下拉框用）：只换轮子下载地址 files.pythonhosted.org，
+# 查询仍走 PyPI 官方 —— 2026-11-23 沙箱实测：阿里云、中科大的 JSON API 是 404，
+# 清华的 JSON 数据滞后（numpy 只有 2.0.1），直接换 pypi.org 会查不到包；但三家
+# 镜像的轮子文件本身都在（simple 索引 + packages 路径均 200），只换轮子地址最稳。
+# 预设只列裸域名能用的两家：阿里云的轮子在 /pypi/packages/ 下，带路径前缀，
+# 替换规则（H-04，只认裸域名）不接受，所以没进预设，手动填也不行。
+MIRROR_PRESETS = [
+    ("默认（PyPI 官方）", ""),
+    ("清华镜像（pypi.tuna.tsinghua.edu.cn）", "files.pythonhosted.org=pypi.tuna.tsinghua.edu.cn"),
+    ("中科大镜像（pypi.mirrors.ustc.edu.cn）", "files.pythonhosted.org=pypi.mirrors.ustc.edu.cn"),
+]
 
 # 安全修复（2026-11-20，按安全评估报告）：
 #   H-05：运行库轮子只取 PyPI 的「最新版」，无钉死 —— 下面是 2026-11-20 从 PyPI
@@ -114,34 +127,86 @@ def pick_wheel(data, tag):
     return None
 
 
-def find_wheel(pkg, tag, replace="", index=None, timeout=30):
+def find_wheel(pkg, tag, replace="", index=None, timeout=30, cancelled=None):
     eff_index = index if index is not None else INDEX
+    if cancelled and cancelled():            # 2.15.7：查询前查取消，别在 4 次查询里拖住
+        raise pd.Cancelled()
+    # 1) 先走 JSON API（默认 PyPI；镜像替换后仍走同一地址）。
+    json_err = None
+    w = None
     try:
-        with pd._open(pd.apply_replace(eff_index % pkg, replace), timeout) as r:
+        with pd._open_cancellable(pd.apply_replace(eff_index % pkg, replace), timeout, cancelled) as r:
             data = json.loads(r.read().decode("utf-8"))
+        w = pick_wheel(data, tag)
+    except pd.Cancelled:
+        raise
     except Exception as e:      # noqa: BLE001
-        raise oe.OfflineError("无法从 PyPI 查询 %s：%s\n网络不通时可在「镜像」栏填写（格式 旧域名=新域名，多组用分号隔开）。" % (pkg, e))
-    w = pick_wheel(data, tag)
-    if not w:
+        json_err = e
+    # 2) JSON 没拿到、里面没有合适的轮子、或最高版本对不上钉死版本时，再走 simple 索引：
+    #    国内镜像的 JSON API 常常 404 或数据滞后（实测：阿里云/中科大 404、清华只有 2.0.1），
+    #    但 simple 索引（/simple/<包>/）各家都有且更新。钉死校验在下面照样做，换源换不掉轮子。
+    #    只在走默认索引时才兜底：调用方明确指定了自定义索引（测试 / 运维）时不去碰公网，
+    #    查不到就按原样报错。
+    pinned = pinned_wheel(pkg) if eff_index == DEFAULT_INDEX else None
+    if eff_index == DEFAULT_INDEX and (w is None or (pinned is not None and w["version"] != pinned["version"])):
+        try:
+            w2 = _find_wheel_simple(pkg, tag, replace, timeout, cancelled)
+        except pd.Cancelled:
+            raise
+        except Exception:      # noqa: BLE001
+            w2 = None
+        if w2 is not None:
+            w = w2
+    if w is None:
+        if json_err is not None:
+            raise oe.OfflineError("无法从 PyPI 查询 %s：%s\n网络不通时可在「镜像」栏填写（格式 旧域名=新域名，多组用分号隔开）。" % (pkg, json_err))
         raise oe.OfflineError("PyPI 上没有适合当前程序（Python %s.%s）的 %s 安装包。"
                               % (sys.version_info[0], sys.version_info[1], pkg))
     # H-05：只有真正走默认 PyPI 索引时才强制钉死 —— 版本必须等于钉死版本，
     # 轮子文件名必须在钉死表里，哈希以钉死表为准（不信任索引自带的 digests）。
     # 自定义索引（测试 / 运维指定）不钉死。判断用替换前的生效索引，所以镜像
     # 替换（pypi.org=xxx）后仍按钉死哈希校验，换源也换不掉轮子。
-    if eff_index == DEFAULT_INDEX:
-        pinned = pinned_wheel(pkg)
-        if pinned is not None:
-            if w["version"] != pinned["version"]:
-                raise oe.OfflineError("%s 在 PyPI 上已是 %s，但本程序只信任钉死的 %s。\n"
-                                      "请升级到新版程序，或等新版发布后再安装组件。"
-                                      % (pkg, w["version"], pinned["version"]))
-            sha = pinned["sha256"].get(w["filename"])
-            if sha is None:
-                raise oe.OfflineError("%s 的安装包 %s 未在程序的校验表里，已拒绝安装。\n"
-                                      "请升级到新版程序。" % (pkg, w["filename"]))
-            w["sha256"] = sha
+    if pinned is not None:
+        if w["version"] != pinned["version"]:
+            raise oe.OfflineError("%s 在 PyPI 上已是 %s，但本程序只信任钉死的 %s。\n"
+                                  "请升级到新版程序，或等新版发布后再安装组件。"
+                                  % (pkg, w["version"], pinned["version"]))
+        sha = pinned["sha256"].get(w["filename"])
+        if sha is None:
+            raise oe.OfflineError("%s 的安装包 %s 未在程序的校验表里，已拒绝安装。\n"
+                                  "请升级到新版程序。" % (pkg, w["filename"]))
+        w["sha256"] = sha
     return w
+
+
+_SIMPLE_LINK_RE = re.compile(r'<a\s+([^>]*)>([^<]+)</a>', re.IGNORECASE)
+_SIMPLE_HREF_RE = re.compile(r'href="([^"]+)"')
+
+
+def _find_wheel_simple(pkg, tag, replace="", timeout=30, cancelled=None):
+    """在 simple 索引（https://pypi.org/simple/<包>/）里找轮子，返回格式同 pick_wheel。
+
+    simple 索引是 PEP 503 的最小 HTML：每行一个 <a href="轮子地址#sha256=…">文件名</a>，
+    被撤回的带 data-yanked。链接可能是相对路径（镜像站常用 ../../packages/…），
+    用 urljoin 拼成绝对地址。找不到合适的轮子返回 None。"""
+    url = pd.apply_replace("https://pypi.org/simple/%s/" % pkg, replace)
+    with pd._open_cancellable(url, timeout, cancelled) as r:
+        html = r.read().decode("utf-8", "replace")
+    rel = {}
+    for m in _SIMPLE_LINK_RE.finditer(html):
+        attrs, name = m.group(1), m.group(2).strip()
+        hm = _SIMPLE_HREF_RE.search(attrs)
+        if not hm or not name.endswith(".whl"):
+            continue
+        parts = name[:-4].split("-")
+        if len(parts) < 5 or not re.fullmatch(r"\d+(\.\d+)*", parts[1]):
+            continue
+        rel.setdefault(parts[1], []).append({
+            "packagetype": "bdist_wheel", "filename": name,
+            "url": urllib.parse.urljoin(url, hm.group(1)), "size": 0,
+            "digests": {"sha256": ""},
+            "yanked": "data-yanked" in attrs})
+    return pick_wheel({"releases": rel}, tag)
 
 
 # ---------------------------------------------------------------- 安装
@@ -296,13 +361,23 @@ def verify_import():
                               "请安装「Microsoft Visual C++ 2015-2022 Redistributable (x64)」后重启程序）" % e)
 
 
-def install(runtime, tag=None, replace="", progress=None, cancelled=None, timeout=60, index=None):
-    """下载并安装全部组件。progress(第几个, 共几个, 文件名, 已下字节, 总字节)。返回 {包名: 版本}。"""
+def install(runtime, tag=None, replace="", progress=None, cancelled=None, timeout=60, index=None,
+            status=None):
+    """下载并安装全部组件。progress(第几个, 共几个, 文件名, 已下字节, 总字节)。返回 {包名: 版本}。
+    status(文字)：查询 PyPI 等下载之外的步骤也报给界面，别让用户干等。
+    取消（2.15.7 修）：以前先连查 4 个包的 PyPI JSON（每个最多 30 秒），全程不查
+    cancelled，点取消后界面一直停在「正在取消…」；现在每步前都查取消。"""
     ok, why = supported()
     if not ok:
         raise oe.OfflineError(why)
     tag = tag or py_tag()
-    wheels = [(pkg, find_wheel(pkg, tag, replace, index)) for pkg in PKGS]
+    wheels = []
+    for pkg in PKGS:
+        if cancelled and cancelled():
+            raise pd.Cancelled()
+        if status:
+            status("正在查询 PyPI：%s…" % pkg)
+        wheels.append((pkg, find_wheel(pkg, tag, replace, index, cancelled=cancelled)))
     work, new = os.path.join(runtime, "_downloads"), os.path.join(runtime, "_new")
     os.makedirs(work, exist_ok=True)
     shutil.rmtree(new, ignore_errors=True)
@@ -310,6 +385,8 @@ def install(runtime, tag=None, replace="", progress=None, cancelled=None, timeou
     n = len(wheels)
     try:
         for i, (pkg, w) in enumerate(wheels):
+            if cancelled and cancelled():
+                raise pd.Cancelled()
             dest = os.path.join(work, w["filename"])
             if not (os.path.isfile(dest) and (not w["sha256"] or _sha256(dest) == w["sha256"])):
                 def prog(done, total, i=i, w=w):
@@ -319,6 +396,10 @@ def install(runtime, tag=None, replace="", progress=None, cancelled=None, timeou
                 if w["sha256"] and _sha256(dest) != w["sha256"]:
                     os.remove(dest)
                     raise oe.OfflineError("%s 校验失败（文件损坏或被篡改），请重试。" % w["filename"])
+            if cancelled and cancelled():
+                raise pd.Cancelled()
+            if status:
+                status("正在安装 %s…" % pkg)
             _extract(dest, new)
     except BaseException:
         shutil.rmtree(new, ignore_errors=True)

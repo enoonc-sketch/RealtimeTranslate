@@ -47,6 +47,18 @@ def _sha256_file(path):
     return h.hexdigest()
 
 
+def _script_hash_ok(path):
+    """M-01：winocr.ps1 执行前验哈希。比对前先把 CRLF 归一化成 LF：
+    仓库以前没有 .gitattributes，Windows 检出时 git 会把 LF 换成 CRLF，
+    云端构建打出来的包里就是 CRLF 版 —— 内容没变，哈希却对不上，
+    2.15.5 / 2.15.7 的全新安装都会误报“已被改动”。归一化后只认内容，
+    真被替换的脚本照样拦得住（内容一变哈希就变）。读不到文件时抛 OSError，
+    由调用方报“读取失败”，不和“被改动”混在一起。"""
+    with open(path, "rb") as f:
+        data = f.read()
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest() == _SCRIPT_SHA256
+
+
 class OcrError(Exception):
     pass
 
@@ -165,8 +177,10 @@ def _run_ps(image_path, lang=None, want_json=False, timeout=20):
         raise OcrError("找不到 winocr.ps1（打包时漏了该文件）")
     # M-01：执行前先验脚本哈希 —— winocr.ps1 被替换过就拒绝跑，
     # 防止恶意脚本借程序权限执行；被改动时提示重装。
+    # v2.15.6：用 _script_hash_ok（CRLF 先归一化成 LF 再比对），
+    # 别再拿原始哈希直接比 —— Windows 检出的 CRLF 版内容没变也会误报。
     try:
-        if _sha256_file(script) != _SCRIPT_SHA256:
+        if not _script_hash_ok(script):
             raise OcrError("winocr.ps1 已被改动，拒绝执行。请重新安装程序。")
     except OcrError:
         raise
