@@ -176,8 +176,8 @@ ok("H-05 pinned numpy win wheel hash",
    == "919eb420662b0b4ba34889df503f3d5329775b0c1d5f7e5f5af4fba8315b1e30")
 ok("H-05 pinned ctranslate2 linux wheel hash",
    ri.pinned_wheel("ctranslate2")["sha256"]
-   ["ctranslate2-4.9.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"]
-   == "5d9b3edd73ba665f16a19cd3a498ce74fbfb6204bc0ac321f00f2600a41e8810")
+   ["ctranslate2-4.9.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"]
+   == "18fe1f6a241265b1269ad087f613d7b0fc0d8aac44b3e6eeb36285339918e336")
 
 
 class _FakeResp:
@@ -539,8 +539,8 @@ lock = open(os.path.join(ROOT, "requirements-lock.txt")).read()
 ok("M-07 lockfile pins pyinstaller", "pyinstaller==6.22.3" in lock)
 rlock = open(os.path.join(ROOT, "requirements-runtime-lock.txt")).read()
 ok("M-07 runtime lockfile pins all four",
-   all(x in rlock for x in ("numpy==2.5.5", "pyyaml==6.0.3",
-                            "sentencepiece==0.2.3", "ctranslate2==4.9.0")))
+   all(x in rlock for x in ("numpy==2.5.5", "pyyaml==6.0.4",
+                            "sentencepiece==0.2.3", "ctranslate2==4.9.1")))
 wf = open(os.path.join(ROOT, ".github", "workflows", "build-exe.yml")).read()
 ok("M-07 workflow uses lockfiles",
    "-r requirements-lock.txt" in wf and "-r requirements-runtime-lock.txt" in wf

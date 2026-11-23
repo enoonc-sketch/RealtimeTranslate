@@ -67,11 +67,11 @@ PINNED_WHEELS = {
         "sentencepiece-0.2.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl":
             "cc3189b79c1ffda767f71b04238c27ac746f3b7abc263eab9a41c4cf46aee49e",
     }},
-    "ctranslate2": {"version": "4.9.0", "sha256": {
-        "ctranslate2-4.9.0-cp312-cp312-win_amd64.whl":
-            "ee930e984679ad16c5fb7bc8da2eaca8c269f86d02cb9eeec087baa1837b5bd2",
-        "ctranslate2-4.9.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl":
-            "5d9b3edd73ba665f16a19cd3a498ce74fbfb6204bc0ac321f00f2600a41e8810",
+    "ctranslate2": {"version": "4.9.1", "sha256": {
+        "ctranslate2-4.9.1-cp312-cp312-win_amd64.whl":
+            "627aeb62a3a5a27266f9ebae820189c12eea8db713c8c202ea331c9ec47effcf",
+        "ctranslate2-4.9.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl":
+            "18fe1f6a241265b1269ad087f613d7b0fc0d8aac44b3e6eeb36285339918e336",
     }},
 }
 
@@ -151,7 +151,7 @@ def find_wheel(pkg, tag, replace="", index=None, timeout=30, cancelled=None):
     if eff_index == DEFAULT_INDEX and (w is None or (pinned is not None and w["version"] != pinned["version"])):
         try:
             if pinned is not None and w is not None and w["version"] != pinned["version"]:
-                # JSON 给了比钉死更新的版本（例如 ctranslate2 已是 4.9.1，程序只信任 4.9.0）：
+                # JSON 给了比钉死更新的版本（PyPI 出了新版、钉死表还没跟上时）：
                 # JSON API 只返回最新版的文件，钉死的旧版文件它看不到；simple 索引列出
                 # 全部版本，按钉死版本去找旧版轮子。simple 里没有旧版时 w2 为 None，
                 # 下面照样报“只信任钉死的”。
@@ -198,7 +198,7 @@ def _find_wheel_simple(pkg, tag, replace="", timeout=30, cancelled=None, wanted_
     被撤回的带 data-yanked。链接可能是相对路径（镜像站常用 ../../packages/…），
     用 urljoin 拼成绝对地址。找不到合适的轮子返回 None。
     wanted_version 给了就只认该版本的轮子 —— JSON API 只返回最新版的文件，
-    钉死的旧版（如 ctranslate2 4.9.0，PyPI 最新已是 4.9.1）只能在这里按版本找。"""
+    钉死的旧版只能在这里按版本找。"""
     url = pd.apply_replace("https://pypi.org/simple/%s/" % pkg, replace)
     with pd._open_cancellable(url, timeout, cancelled) as r:
         html = r.read().decode("utf-8", "replace")

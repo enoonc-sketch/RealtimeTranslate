@@ -9,6 +9,7 @@
 - **取消中能关窗口**：以前 busy 时点取消和右上角 × 都只是置标志，窗口关不掉；现在点一次是取消、再点一次直接关窗口（后台线程是 daemon，随程序退出结束；装完也不会再自动弹语言包对话框）。已下载的部分照样保留，再点重试会接着下。
 - 新增 `tests/test_runtime_cancel.py`（22 项：取消立即生效、超时重试、非超时错误立即抛出、停滞读取消/超时、续传 Range 头、查询前取消、查询进度上报、换候选前取消），已加入 CI 纯逻辑测试列表；`tests/test_secfix_20261120.py` 里 mock 的 `_open` 签名随新版更新（88 项仍全过）。
 - **下载慢加镜像预设**：下载对话框的镜像栏加了下拉框，可选默认（PyPI 官方）、清华镜像（pypi.tuna.tsinghua.edu.cn）、中科大镜像（pypi.mirrors.ustc.edu.cn），选项里直接带网址，选了就填进镜像栏（仍可手动改）。预设只换轮子下载地址（files.pythonhosted.org），查询仍走 PyPI —— 实测国内镜像的 JSON API 不可用（阿里云、中科大 404，清华数据滞后在 numpy 2.0.1），直接换 pypi.org 会查不到包；阿里云没进预设，它的轮子在 /pypi/packages/ 下、带路径前缀，替换规则（H-04，只认裸域名）不接受。
+- **钉死版本跟进最新**：ctranslate2 4.9.0→4.9.1（win_amd64 与 manylinux 的 cp312 轮子文件名与 sha256 均从 PyPI JSON 实测更新），`requirements-runtime-lock.txt` 同步改到 4.9.1；另把锁文件里的 pyyaml 6.0.3→6.0.4，与钉死表对齐（之前两边不一致）。其余三包（numpy 2.5.5、pyyaml 6.0.4、sentencepiece 0.2.3）已是最新，不用动。
 - **查询加 simple 索引兜底**：`find_wheel` 先走 JSON API，查不到、或最高版本对不上钉死版本（镜像 JSON 滞后）时，改走 simple 索引（/simple/<包>/）再找一次，各家镜像都有 simple 索引且数据更新；钉死校验（版本、文件名、哈希以钉死表为准）照样做。只在走默认索引时兜底，明确指定了自定义索引时不去碰公网，查不到按原样报错。2026-11-23 补：PyPI 上的包出了新版也会触发兜底（如 ctranslate2 已是 4.9.1，程序只信任钉死的 4.9.0）—— JSON API 只返回最新版的文件，旧版轮子在 simple 索引里按钉死版本找；simple 里没有旧版时照样报“只信任钉死的”，不偷换成新版。新增 `tests/test_runtime_mirror.py`（19 项），已加入 CI 纯逻辑测试列表。
 
 ## v2.15.6（2026-11-23）

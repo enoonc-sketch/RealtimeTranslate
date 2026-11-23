@@ -135,9 +135,10 @@ def test_json_good_no_simple_fetch():
 
 
 def test_simple_finds_pinned_when_json_newer():
-    """JSON 给了比钉死更新的版本时，去 simple 索引找钉死的旧版轮子（2026-11-23 真实报错：
-    ctranslate2 在 PyPI 已是 4.9.1，程序只信任钉死的 4.9.0 —— JSON API 只返回最新版
-    的文件，旧版轮子只能在 simple 索引里按版本找）。"""
+    """JSON 给了比钉死更新的版本时，去 simple 索引找钉死的旧版轮子（2026-11-23 真实报错，
+    当时 ctranslate2 在 PyPI 已是 4.9.1，程序只信任钉死的 4.9.0 —— JSON API 只返回最新版
+    的文件，旧版轮子只能在 simple 索引里按版本找；后来钉死表跟进到 4.9.1，此用例仍保
+    留作回归：钉死表没跟上新版时，下载不该直接报错）。"""
     newer = FakeResp(_json_bytes([("2.6.0", "numpy-2.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl")]))
     simple = _simple_html([
         ("../../packages/aa/bb/numpy-2.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
