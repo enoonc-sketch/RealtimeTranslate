@@ -1,6 +1,6 @@
 # winget 清单（版本清单）。sha256 由 packaging/make_manifests.py 发版后填，提交到 microsoft/winget-pkgs
 PackageIdentifier: RealtimeTranslate.RealtimeTranslate
-PackageVersion: 2.15.5
+PackageVersion: 2.15.8
 DefaultLocale: zh-CN
 ManifestType: version
 ManifestVersion: 1.6.0

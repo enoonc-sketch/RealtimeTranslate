@@ -12,7 +12,7 @@
 ; 放到本文件同目录（或 Inno Setup 的 Languages 目录）。找不到时自动回退为英文向导，不会编译失败。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.15.5"
+  #define MyAppVersion "2.15.8"
 #endif
 #define MyAppName "实时翻译"
 #ifdef OFFLINE

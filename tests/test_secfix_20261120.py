@@ -176,8 +176,8 @@ ok("H-05 pinned numpy win wheel hash",
    == "919eb420662b0b4ba34889df503f3d5329775b0c1d5f7e5f5af4fba8315b1e30")
 ok("H-05 pinned ctranslate2 linux wheel hash",
    ri.pinned_wheel("ctranslate2")["sha256"]
-   ["ctranslate2-4.9.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"]
-   == "5d9b3edd73ba665f16a19cd3a498ce74fbfb6204bc0ac321f00f2600a41e8810")
+   ["ctranslate2-4.9.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"]
+   == "18fe1f6a241265b1269ad087f613d7b0fc0d8aac44b3e6eeb36285339918e336")
 
 
 class _FakeResp:
@@ -205,7 +205,7 @@ def _fake_index(versions):
 
 _orig_open = pd._open
 try:
-    pd._open = lambda url, timeout: _FakeResp(_fake_index([
+    pd._open = lambda url, timeout, headers=None: _FakeResp(_fake_index([
         ("2.6.0", "numpy-2.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"),
         ("2.5.5", "numpy-2.5.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl")]))
     try:
@@ -213,14 +213,14 @@ try:
         ok("H-05 newer-than-pinned version refused", False)
     except oe.OfflineError as e:
         ok("H-05 newer-than-pinned version refused", "只信任钉死的" in str(e))
-    pd._open = lambda url, timeout: _FakeResp(_fake_index([
+    pd._open = lambda url, timeout, headers=None: _FakeResp(_fake_index([
         ("2.5.5", "numpy-2.5.5-cp312-cp312-manylinux_2_27_x86_64.whl")]))
     try:
         ri.find_wheel("numpy", "cp312")
         ok("H-05 unlisted wheel filename refused", False)
     except oe.OfflineError as e:
         ok("H-05 unlisted wheel filename refused", "校验表" in str(e))
-    pd._open = lambda url, timeout: _FakeResp(_fake_index([
+    pd._open = lambda url, timeout, headers=None: _FakeResp(_fake_index([
         ("2.5.5", "numpy-2.5.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl")]))
     w = ri.find_wheel("numpy", "cp312")
     ok("H-05 pinned wheel accepted with pinned sha",
@@ -240,9 +240,11 @@ ok("H-06 cache root fallback is user temp, not shared",
    "Public" not in oe._ascii_cache_root() and "ProgramData" not in oe._ascii_cache_root())
 
 # ---------------------------------------------------------------- M-01 OCR 脚本校验
+# v2.15.6：比对归一化后的哈希 —— Windows 检出的 CRLF 版内容没变也必须通过，
+# 只比原始哈希会在云端 Windows 构建里误报“已被改动”。
 real_ps = os.path.join(ROOT, "winocr.ps1")
 ok("M-01 pinned winocr.ps1 hash matches tree",
-   ocr_win._sha256_file(real_ps) == ocr_win._SCRIPT_SHA256)
+   ocr_win._script_hash_ok(real_ps))
 
 _calls = {"run": 0, "cmd": None}
 
@@ -537,8 +539,8 @@ lock = open(os.path.join(ROOT, "requirements-lock.txt")).read()
 ok("M-07 lockfile pins pyinstaller", "pyinstaller==6.22.3" in lock)
 rlock = open(os.path.join(ROOT, "requirements-runtime-lock.txt")).read()
 ok("M-07 runtime lockfile pins all four",
-   all(x in rlock for x in ("numpy==2.5.5", "pyyaml==6.0.3",
-                            "sentencepiece==0.2.3", "ctranslate2==4.9.0")))
+   all(x in rlock for x in ("numpy==2.5.5", "pyyaml==6.0.4",
+                            "sentencepiece==0.2.3", "ctranslate2==4.9.1")))
 wf = open(os.path.join(ROOT, ".github", "workflows", "build-exe.yml")).read()
 ok("M-07 workflow uses lockfiles",
    "-r requirements-lock.txt" in wf and "-r requirements-runtime-lock.txt" in wf
