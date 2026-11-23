@@ -134,6 +134,33 @@ def test_json_good_no_simple_fetch():
     check("JSON 正常：只查一次，不碰 simple", len(calls) == 1)
 
 
+def test_simple_finds_pinned_when_json_newer():
+    """JSON 给了比钉死更新的版本时，去 simple 索引找钉死的旧版轮子（2026-11-23 真实报错：
+    ctranslate2 在 PyPI 已是 4.9.1，程序只信任钉死的 4.9.0 —— JSON API 只返回最新版
+    的文件，旧版轮子只能在 simple 索引里按版本找）。"""
+    newer = FakeResp(_json_bytes([("2.6.0", "numpy-2.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl")]))
+    simple = _simple_html([
+        ("../../packages/aa/bb/numpy-2.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+         "numpy-2.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", False),
+        ("../../packages/d1/71/x/" + PINNED_NUMPY, PINNED_NUMPY, False)])
+    w, _calls = _run_find_wheel(newer, FakeResp(simple))
+    check("simple 兜底：JSON 更新时用 simple 里的钉死旧版",
+          isinstance(w, dict) and w["version"] == "2.5.5")
+    check("simple 兜底：旧版轮子哈希以钉死表为准",
+          isinstance(w, dict) and w["sha256"] == PINNED_SHA)
+
+
+def test_simple_no_pinned_when_json_newer_still_refused():
+    """JSON 更新、simple 里又没有钉死的旧版时，照样拒绝（不偷换成新版）。"""
+    newer = FakeResp(_json_bytes([("2.6.0", "numpy-2.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl")]))
+    simple = _simple_html([
+        ("../../packages/aa/bb/numpy-2.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+         "numpy-2.6.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", False)])
+    w, _calls = _run_find_wheel(newer, FakeResp(simple))
+    check("simple 兜底：JSON 更新且无旧版时照样拒绝",
+          isinstance(w, Exception) and "只信任钉死的" in str(w))
+
+
 def test_simple_newer_than_pinned_still_refused():
     """simple 里最高版本比钉死的新，照样拒绝（钉死校验没绕过去）。"""
     simple = _simple_html([
@@ -185,6 +212,8 @@ def test_mirror_presets():
 if __name__ == "__main__":
     test_simple_fallback_on_json_failure()
     test_simple_fallback_on_stale_json()
+    test_simple_finds_pinned_when_json_newer()
+    test_simple_no_pinned_when_json_newer_still_refused()
     test_json_good_no_simple_fetch()
     test_simple_newer_than_pinned_still_refused()
     test_simple_yanked_skipped()

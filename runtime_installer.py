@@ -150,7 +150,15 @@ def find_wheel(pkg, tag, replace="", index=None, timeout=30, cancelled=None):
     pinned = pinned_wheel(pkg) if eff_index == DEFAULT_INDEX else None
     if eff_index == DEFAULT_INDEX and (w is None or (pinned is not None and w["version"] != pinned["version"])):
         try:
-            w2 = _find_wheel_simple(pkg, tag, replace, timeout, cancelled)
+            if pinned is not None and w is not None and w["version"] != pinned["version"]:
+                # JSON 给了比钉死更新的版本（例如 ctranslate2 已是 4.9.1，程序只信任 4.9.0）：
+                # JSON API 只返回最新版的文件，钉死的旧版文件它看不到；simple 索引列出
+                # 全部版本，按钉死版本去找旧版轮子。simple 里没有旧版时 w2 为 None，
+                # 下面照样报“只信任钉死的”。
+                w2 = _find_wheel_simple(pkg, tag, replace, timeout, cancelled,
+                                        wanted_version=pinned["version"])
+            else:
+                w2 = _find_wheel_simple(pkg, tag, replace, timeout, cancelled)
         except pd.Cancelled:
             raise
         except Exception:      # noqa: BLE001
@@ -183,12 +191,14 @@ _SIMPLE_LINK_RE = re.compile(r'<a\s+([^>]*)>([^<]+)</a>', re.IGNORECASE)
 _SIMPLE_HREF_RE = re.compile(r'href="([^"]+)"')
 
 
-def _find_wheel_simple(pkg, tag, replace="", timeout=30, cancelled=None):
+def _find_wheel_simple(pkg, tag, replace="", timeout=30, cancelled=None, wanted_version=None):
     """在 simple 索引（https://pypi.org/simple/<包>/）里找轮子，返回格式同 pick_wheel。
 
     simple 索引是 PEP 503 的最小 HTML：每行一个 <a href="轮子地址#sha256=…">文件名</a>，
     被撤回的带 data-yanked。链接可能是相对路径（镜像站常用 ../../packages/…），
-    用 urljoin 拼成绝对地址。找不到合适的轮子返回 None。"""
+    用 urljoin 拼成绝对地址。找不到合适的轮子返回 None。
+    wanted_version 给了就只认该版本的轮子 —— JSON API 只返回最新版的文件，
+    钉死的旧版（如 ctranslate2 4.9.0，PyPI 最新已是 4.9.1）只能在这里按版本找。"""
     url = pd.apply_replace("https://pypi.org/simple/%s/" % pkg, replace)
     with pd._open_cancellable(url, timeout, cancelled) as r:
         html = r.read().decode("utf-8", "replace")
@@ -200,6 +210,8 @@ def _find_wheel_simple(pkg, tag, replace="", timeout=30, cancelled=None):
             continue
         parts = name[:-4].split("-")
         if len(parts) < 5 or not re.fullmatch(r"\d+(\.\d+)*", parts[1]):
+            continue
+        if wanted_version is not None and parts[1] != wanted_version:
             continue
         rel.setdefault(parts[1], []).append({
             "packagetype": "bdist_wheel", "filename": name,
