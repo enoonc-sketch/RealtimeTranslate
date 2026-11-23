@@ -1,5 +1,15 @@
 # 更新日志
 
+## v2.15.6（2026-11-23）
+
+修打字检测翻译的键盘钩子装不上（2.15.5 上报：状态栏报“键盘钩子安装失败，已保持关闭”）。
+
+- **钩子安装加固**（`start_typing_hook_win`）：`SetWindowsHookExW` / `UnhookWindowsHookEx` 补上 `argtypes` / `restype`（原来 ctypes 默认把 64 位钩子句柄截成 32 位 int）；`hMod` 改传 `GetModuleHandleW(None)`（原来传 `None`，部分机器会报 1428）；线程内重试 3 次、用 Event 交握（最多等 5 秒，不再只等 2 秒就判失败）。
+- **失败不再瞎猜原因**：失败时把 `GetLastError` 错误码带回来，状态栏按码提示（5 拒绝访问、1428 需要模块句柄、1460 超时等），不再一律写“可能被安全软件拦截”。
+- **轮询兜底**（新增 `start_typing_poll_win`）：钩子实在装不上时，改用 `GetAsyncKeyState` 每 10ms 轮询按键，打字检测照常用（响应稍慢；替换粘贴期间按住 Ctrl/Alt 时不转发）。
+- **开关打开立即生效**：以前打开打字检测开关要重启才启动钩子，装不上连重试的机会都没有；现在打开立即启动，重复启动会被拦下（`_start_typing` 加了“已在监听”保护）。
+- 新增 `tests/test_typing_hook_win.py`（19 项，fake user32 测安装成功 / 失败重试 / 一直失败报码 / 轮询转发 / 修饰键不转发），已加入 CI 纯逻辑测试列表。
+
 ## v2.15.5（2026-11-23）
 
 识别逻辑原来散在 `desktop_translator.py` 和 `typing_detect.py` 里，又粗又重复；现在统一收进新模块 `text_detect.py`（纯标准库、可单测），原来的函数名都保留，调用方不用改。
