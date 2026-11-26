@@ -267,7 +267,7 @@ CLOSE_NAMES = {"tray": "隐藏到托盘", "taskbar": "最小化到任务栏", "q
 CLOSE_CODES = {v: k for k, v in CLOSE_NAMES.items()}
 MINIMIZE_NAMES = {"taskbar": "留在任务栏", "tray": "收进托盘"}        # 点窗口 – 最小化时（v2.10）
 MINIMIZE_CODES = {v: k for k, v in MINIMIZE_NAMES.items()}
-__version__ = "2.15.5"
+__version__ = "2.15.6"
 APP_TITLE = "实时翻译"
 RUN_VALUE = "RealtimeTranslate"
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -372,7 +372,7 @@ DEFAULTS = {
     "bilingual": False, "reflow": True, "show_src": True, "geometry": "480x760",
     "engine": "Google", "auto_offline": True,
     "pointer": True, "pointer_scope": "word", "pack_mirror": "",
-    "hover": True, "hover_ms": 800, "hover_need_ctrl": False, "grab_spinner": True, "input_translate": False, "input_trigger": "space3", "translate_style": "default", "compare_engines": [], "settings_tab": "general", "settings_geometry": "",
+    "hover": True, "hover_ms": 800, "hover_need_ctrl": False, "grab_spinner": True, "input_translate": False, "input_trigger": "space3", "translate_style": "default", "compare_engines": [], "settings_tab": "general", "tools_open": False, "settings_geometry": "",
     # v2.14 打字检测翻译：默认全部关（typing 开关、停顿毫秒、范围）
     "typing": False, "typing_pause_ms": 1000, "typing_scope": "word",
     # v2.15 授权：打字检测翻译是专业版功能。license_* 只存本机 config.json，
@@ -2130,6 +2130,11 @@ def pointer_plan(ibeam, terminal, scope):
     return ["copy"]        # 认不出光标形状（软件自绘光标）：只复制已有的选区
 
 
+# 托盘「翻译成」子菜单里的常用目标语言（只列 LANGS 里真有的）
+TRAY_TARGET_LANGS = [(k, LANGS[k]) for k in ("zh-CN", "zh-TW", "en", "ja", "ko", "fr", "de", "es", "ru")
+                     if k in LANGS]
+
+
 def tray_menu_items(snap, is_win=True):
     """托盘右键菜单（纯逻辑，便于测试）。snap 是主程序备好的状态快照 dict。
 
@@ -2156,6 +2161,26 @@ def tray_menu_items(snap, is_win=True):
         {"label": "取词范围", "sub": [
             {"id": "scope:%s" % k, "label": v, "checked": scope == k}
             for k, v in SCOPE_NAMES.items()]},
+        {"label": "翻译工具", "sub": [
+            {"id": "tool:clipimg", "label": "粘贴图片翻译"},
+            {"id": "tool:image", "label": "翻译图片…"},
+            {"id": "tool:doc", "label": "翻译文档…"},
+            {"id": "tool:voice", "label": "语音输入"},
+            {"id": "tool:case", "label": "命名格式转换…"}]},
+        {"sep": True},
+        # v2.15.6：常用翻译设置直接在托盘里切换（主窗口精简后这些不再占位置）
+        {"label": "翻译成", "sub": [
+            {"id": "tl:%s" % k, "label": v, "checked": snap.get("tl") == k}
+            for k, v in TRAY_TARGET_LANGS if k]},
+    ]
+    if snap.get("engines"):          # 引擎列表由主程序给（离线引擎装没装会变）；空就不放空子菜单
+        items.append({"label": "翻译引擎", "sub": [
+            {"id": "engine:%s" % e, "label": e, "checked": snap.get("engine") == e}
+            for e in snap["engines"]]})
+    items += [
+        {"id": "smart", "label": "中英智能互译", "checked": bool(snap.get("smart"))},
+        {"id": "bilingual", "label": "双语对照", "checked": bool(snap.get("bilingual"))},
+        {"id": "mini_follow", "label": "小窗跟随指针", "checked": bool(snap.get("mini_follow"))},
         {"sep": True},
         {"id": "watch", "label": "监听剪贴板", "checked": bool(snap.get("watch"))},
         {"id": "top", "label": "窗口置顶", "checked": bool(snap.get("top"))},
@@ -2177,9 +2202,18 @@ def tray_menu_items(snap, is_win=True):
 
 
 def tray_tooltip(snap):
+    """托盘提示（Windows 限 127 字符，超了截断）。v2.15.6：第二行加上目标语言和引擎。"""
     on = lambda k: "开" if snap.get(k) else "关"
-    return "%s｜指针取词:%s 悬停:%s 范围:%s" % (
+    tip = "%s｜指针取词:%s 悬停:%s 范围:%s" % (
         APP_TITLE, on("pointer"), on("hover"), SCOPE_NAMES.get(snap.get("scope", "word"), "单词"))
+    extra = []
+    if snap.get("tl"):
+        extra.append("译成:%s" % LANGS.get(snap["tl"], snap["tl"]))
+    if snap.get("engine"):
+        extra.append("引擎:%s" % snap["engine"])
+    if extra:
+        tip += "\n" + " ".join(extra)
+    return tip[:127]
 
 
 def cursor_is_ibeam_win():
@@ -3221,6 +3255,9 @@ class App:
                 "auto_off": self.auto_off_var.get(),
                 "history_on": self.history_on_var.get(),
                 "autostart": self.auto_var.get() if hasattr(self, "auto_var") else False,
+                "tl": self._codes()[1], "engine": self.engine.get(), "engines": list(ENGINES),
+                "smart": self.smart_var.get(), "bilingual": self.bi_var.get(),
+                "mini_follow": self.mini_follow_var.get(),
                 "hotkey_main": self.hotkey_main_label,
                 "hotkey_pointer": self.hotkey_pointer_label,
                 "hotkey_shot": self.hotkey_shot_label,
@@ -3246,7 +3283,12 @@ class App:
                    "input": ("input_var", "_on_input_opt"),
                    "auto_off": ("auto_off_var", "_on_auto_offline"),
                    "autostart": ("auto_var", "_on_autostart"),
-                   "history_on": ("history_on_var", "_on_history_opt")}
+                   "history_on": ("history_on_var", "_on_history_opt"),
+                   "smart": ("smart_var", "_retranslate"),
+                   "bilingual": ("bi_var", "_on_bilingual"),
+                   "mini_follow": ("mini_follow_var", "_on_mini_follow")}
+        tools = {"clipimg": "_translate_clipboard_image", "image": "_translate_image_file",
+                 "doc": "_translate_doc_file", "voice": "start_voice_input", "case": "open_case_tool"}
         if cid in toggles:
             var, handler = toggles[cid]
             v = getattr(self, var, None)
@@ -3259,6 +3301,25 @@ class App:
             if code in SCOPE_NAMES:
                 self.scope_cb.set(SCOPE_NAMES[code])
                 self._on_pointer_opt()
+        elif isinstance(cid, str) and cid.startswith("tool:"):
+            fn = tools.get(cid.split(":", 1)[1])
+            if fn:
+                self.show_window()
+                getattr(self, fn)()
+        elif isinstance(cid, str) and cid.startswith("tl:"):
+            code = cid.split(":", 1)[1]
+            if code in LANGS:
+                self.tl.set(lang_name(code))
+                self._save()
+                self.translate_now()
+        elif isinstance(cid, str) and cid.startswith("engine:"):
+            eng = cid.split(":", 1)[1]
+            if eng in ENGINES:
+                self.engine.set(eng)
+                reset_online_state()
+                self._save()
+                self._warmup()
+                self.translate_now()
         elif cid == "clip":
             self.show_window()
             text = self._get_clip().strip()
@@ -3418,7 +3479,7 @@ class App:
                                     font=ui_font, wraplength=560, justify="left")
         self.dict_label.pack(fill="x")
 
-        # —— 按钮 ——（v2.15.5：18 个按钮按用途分成两行：常用操作 / 翻译工具，不再挤成一大片）
+        # —— 按钮 ——（v2.15.6：18 个按钮按用途分成两行：常用操作 / 翻译工具，不再挤成一大片）
         btns = ui_platform.FlowFrame(root)           # v2.13：放不下自动折行，不再把右边的按钮裁掉
         btns.pack(fill="x", padx=12, pady=(2, 0))
         B = lambda text, cmd: btns.add(ttk.Button(btns, text=text, command=cmd))      # noqa: E731
@@ -3430,9 +3491,12 @@ class App:
         B("清空", self.clear)
         B("—  最小化", self.minimize_to_taskbar)      # v2.13：一键最小化到任务栏（不受「关闭 ×」设置影响）
         B("退出", self.quit)
+        # v2.15.6：「翻译工具」默认收起，主窗口只留常用操作；点这个按钮展开 / 收起，状态会记住
+        self.tools_btn = ttk.Button(btns, text="▸ 更多工具", command=self.toggle_tools)
+        btns.add(self.tools_btn)
 
         tools = ttk.LabelFrame(root, text="翻译工具", padding=(8, 4))
-        tools.pack(fill="x", padx=12, pady=(8, 0))
+        self.tools_frame = tools
         btns_t = ui_platform.FlowFrame(tools)
         btns_t.pack(fill="x")
         T = lambda text, cmd: btns_t.add(ttk.Button(btns_t, text=text, command=cmd))  # noqa: E731
@@ -3507,35 +3571,31 @@ class App:
         opts = ttk.LabelFrame(root, text="常用", padding=(8, 4))
         opts.pack(fill="x", padx=12, pady=(8, 0))
 
+        # v2.15.6：「常用」只留 6 个最常用的开关（一行），按钮单独一行；
+        # 中英智能互译 / 点 × 最小化 / 开机自启 / 小窗跟随指针 改到高级设置里调（变量和同步逻辑保留）。
         o1 = ui_platform.FlowFrame(opts)
         o1.pack(fill="x")
         o1.add(ttk.Checkbutton(o1, text="窗口置顶", variable=self.top_var, command=self._on_top))
         o1.add(ttk.Checkbutton(o1, text="监听剪贴板", variable=self.watch_var, command=self._on_watch))
-        o1.add(ttk.Checkbutton(o1, text="中英智能互译", variable=self.smart_var, command=self._retranslate))
         o1.add(ttk.Checkbutton(o1, text="双语对照", variable=self.bi_var, command=self._on_bilingual))
         o1.add(ttk.Checkbutton(o1, text="显示原文", variable=self.show_src_var, command=self._on_show_src))
-        # v2.13：点 × 时最小化到任务栏（和高级设置 → 常规里的下拉框同步；以前只藏在设置里，找不到）
+        o1.add(ttk.Checkbutton(o1, text="指针取词", variable=self.pointer_var, command=self._on_pointer_opt))
+        o1.add(ttk.Checkbutton(o1, text="悬停取词", variable=self.hover_var, command=self._on_pointer_opt))
+        # 下面两个变量仍和高级设置里的下拉框同步（托盘 / 测试 / 旧配置迁移都用到），只是主窗口不再显示勾选框
         self.close_taskbar_var = tk.BooleanVar(value=self.cfg.get("close_action", "taskbar") == "taskbar")
-        o1.add(ttk.Checkbutton(o1, text="点 × 最小化到任务栏", variable=self.close_taskbar_var,
-                               command=self._on_close_taskbar))
-        if IS_WIN:      # v2.13.2：开机自启放到主窗口，勾上后开机自动缩在任务栏
-            o1.add(ttk.Checkbutton(o1, text="开机自动缩在任务栏", variable=self.auto_var,
-                                   command=self._on_autostart))
+        self.mini_follow_var = tk.BooleanVar(value=self.cfg.get("popup_mode") == "mini")
 
         o2 = ui_platform.FlowFrame(opts)
-        o2.pack(fill="x", pady=(2, 0))
-        o2.add(ttk.Checkbutton(o2, text="指针取词", variable=self.pointer_var, command=self._on_pointer_opt))
-        o2.add(ttk.Checkbutton(o2, text="悬停取词", variable=self.hover_var, command=self._on_pointer_opt))
-        # v2.11：「跟随指针的小窗口」以前只能在高级设置的下拉框里选，这里放一个开关（和下拉框同步）
-        self.mini_follow_var = tk.BooleanVar(value=self.cfg.get("popup_mode") == "mini")
-        o2.add(ttk.Checkbutton(o2, text="小窗跟随指针", variable=self.mini_follow_var,
-                               command=self._on_mini_follow))
+        o2.pack(fill="x", pady=(4, 0))
         o2.add(ttk.Button(o2, text="生词本", command=self.open_vocab))
         self.fav_btn = ttk.Button(o2, text="☆ 收藏", command=self.favorite_current)
         o2.add(self.fav_btn)
         o2.add(ttk.Button(o2, text="翻译历史…", command=self.open_history))
         o2.add(ttk.Button(o2, text="高级设置…", command=self.open_settings))
         self._flows = (btns, btns_t, o1, o2)
+
+        self._opts_frame = opts
+        self._set_tools_visible(bool(self.cfg.get("tools_open", False)))
 
         self._build_settings_win()
 
@@ -3551,11 +3611,31 @@ class App:
         else:
             self.src.focus_set()
 
+    def _set_tools_visible(self, show):
+        """展开 / 收起主窗口的「翻译工具」分组（v2.15.6）。"""
+        fr = self.tools_frame
+        if show:
+            if not fr.winfo_manager():
+                fr.pack(fill="x", padx=12, pady=(8, 0), before=self._opts_frame)
+            self.tools_btn.configure(text="▾ 收起工具")
+        else:
+            fr.pack_forget()
+            self.tools_btn.configure(text="▸ 更多工具")
+        self._tools_open = bool(show)
+
+    def toggle_tools(self):
+        self._set_tools_visible(not getattr(self, "_tools_open", False))
+        self.cfg["tools_open"] = self._tools_open
+        try:
+            self._save()
+        except Exception:
+            pass
+
     # ------------------------------------------------ 高级设置（按用途分类）
     def _build_settings_win(self):
         """高级设置窗口：创建后先隐藏，控件一直存在（托盘 / 快捷键随时可读写选项）。
 
-        分类（v2.15.5 合并为 4 页）：常规（含托盘）/ 翻译（含历史）/ 取词 / 网络与快捷键（离线、代理、快捷键、关于）。
+        分类（v2.15.6 合并为 4 页）：常规（含托盘）/ 翻译（含历史）/ 取词 / 网络与快捷键（离线、代理、快捷键、关于）。
         和主窗口共用同一批变量，两边的勾选永远同步。
         """
         win = tk.Toplevel(self.root)
@@ -3601,7 +3681,7 @@ class App:
         self.settings_nb = nb
         self.settings_tabs = {}
 
-        # v2.15.5：页签从 7 个收成 4 个，相近的内容合并成同一页里的分组：
+        # v2.15.6：页签从 7 个收成 4 个，相近的内容合并成同一页里的分组：
         #   常规 = 常规 + 托盘；翻译 = 翻译 + 历史；取词；网络与快捷键 = 离线与网络 + 快捷键与关于。
         # 旧的页签 key（tray / history / offline / about）仍然保留在 settings_tabs 里，指向合并后的页，
         # 所以 open_settings("offline")、搜索跳转、记住上次页签等都照常工作。
@@ -3988,10 +4068,12 @@ class App:
         check(f, "第一次隐藏到托盘时提示一次", self.tray_tip_var, self._save,
               "只在第一次弹出气泡，告诉你程序没退出、去哪里找回。")
         ttk.Label(f, text="托盘图标右键菜单：", font=self.ui_font).pack(anchor="w", pady=(16, 2))
-        ttk.Label(f, text="显示主窗口 / 截图翻译 / 翻译剪贴板内容\n"
+        ttk.Label(f, text="显示主窗口 / 截图翻译 / 整窗翻译 / 翻译剪贴板内容\n"
+                          "翻译工具：粘贴图片、翻译图片、翻译文档、语音输入、命名格式\n"
+                          "翻译成（切换目标语言）/ 翻译引擎 / 中英智能互译 / 双语对照 / 小窗跟随指针\n"
                           "指针取词、悬停取词、取词范围（可直接开关、切换）\n"
                           "监听剪贴板、窗口置顶、断网自动离线、开机自启\n"
-                          "高级设置 / 网络检查 / 离线语言包 / 退出",
+                          "翻译历史 / 高级设置 / 网络检查 / 离线语言包 / 退出",
                   style="Note.TLabel", justify="left").pack(anchor="w", padx=(12, 0))
         ttk.Label(f, text="单击托盘图标显示主窗口。", style="Note.TLabel").pack(anchor="w", pady=(8, 0))
 

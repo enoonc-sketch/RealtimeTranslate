@@ -41,7 +41,7 @@ ok("settings window exists, hidden at start", not sw.winfo_viewable())
 
 # 分类页
 tabs = [app.settings_nb.tab(i, "text") for i in range(app.settings_nb.index("end"))]
-ok("tabs: 常规/翻译/取词/网络与快捷键 (v2.15.5 merged)",
+ok("tabs: 常规/翻译/取词/网络与快捷键 (v2.15.6 merged)",
    tabs == ["常规", "翻译", "取词", "网络与快捷键"])
 ok("old tab keys still resolve to merged pages",
    app.settings_tabs["tray"] is app.settings_tabs["general"] and
@@ -56,6 +56,19 @@ ok("main window no longer has 范围 combobox", app.scope_cb.winfo_toplevel() is
 ok("main 离线语言包… button still on main window",
    any(t == "离线语言包…" for f in app.root.winfo_children() for t in texts(f)
        if f.winfo_toplevel() is app.root))
+
+# v2.15.6：翻译工具默认收起，可展开 / 收起
+ok("tools hidden by default", not app.tools_frame.winfo_manager())
+app.toggle_tools(); app.root.update()
+ok("tools shown after toggle", app.tools_frame.winfo_manager() == "pack" and app.cfg["tools_open"] is True)
+app.toggle_tools(); app.root.update()
+ok("tools hidden again", not app.tools_frame.winfo_manager() and app.cfg["tools_open"] is False)
+
+# v2.15.6：常用勾选区精简
+main_checks = [str(w.cget("text")) for w in walk(app.root)
+               if w.winfo_class() == "TCheckbutton" and w.winfo_toplevel() is app.root]
+ok("main checks trimmed to 6", main_checks == ["窗口置顶", "监听剪贴板", "双语对照", "显示原文", "指针取词", "悬停取词"])
+ok("moved options still in settings", any("中英智能互译" in t for t in texts(app.settings_tabs["translate"])))
 
 # 打开 / 关闭 / 选页
 app.open_settings("grab")

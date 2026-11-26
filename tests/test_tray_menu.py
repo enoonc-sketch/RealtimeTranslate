@@ -40,6 +40,22 @@ ok("show is default item", by["show"].get("default") is True)
 ok("no autostart item off Windows", "autostart" not in [i.get("id") for i in dt.tray_menu_items(snap, False)])
 ok("tooltip short & has state", len(dt.tray_tooltip(snap)) < 127 and "整行" in dt.tray_tooltip(snap))
 
+
+# ---- v2.15.6：托盘新增翻译工具 / 翻译成 / 引擎 / 翻译开关 ----
+snap2 = dict(snap, tl="en", engine="Google", engines=["Google", "微软"], smart=True, bilingual=False, mini_follow=True)
+by2 = {i["id"]: i for i in flat(dt.tray_menu_items(snap2, True)) if i.get("id")}
+for need in ("tool:clipimg", "tool:image", "tool:doc", "tool:voice", "tool:case",
+             "tl:zh-CN", "tl:en", "engine:Google", "smart", "bilingual", "mini_follow"):
+    ok("menu has " + need, need in by2)
+ok("tl radio follows snapshot", by2["tl:en"]["checked"] and not by2["tl:zh-CN"]["checked"])
+ok("engine radio follows snapshot", by2["engine:Google"]["checked"] and not by2["engine:微软"]["checked"])
+ok("no empty engine submenu", not any(i.get("id", "").startswith("engine:")
+                                      for i in flat(dt.tray_menu_items(snap, True))))
+ok("tooltip shows target + engine", "译成:" + dt.LANGS["en"] in dt.tray_tooltip(snap2) and "引擎:Google" in dt.tray_tooltip(snap2))
+ok("tooltip still short with extras", len(dt.tray_tooltip(snap2)) <= 127)
+ok("tooltip without tl/engine unchanged", "译成" not in dt.tray_tooltip(snap))
+
+
 # ---- 2. 构建 + 分发（假 user32） ----
 class FakeUser32:
     def __init__(self, pick):
@@ -147,6 +163,14 @@ app.root.deiconify()
 app.hide_window()
 ok("hide-to-tray balloon shown exactly once", len(app.tray.n) == 1 and app.cfg["tray_tip_shown"] is True)
 app.tray = None
+
+# v2.15.6：托盘切换目标语言 / 中英智能互译 / 工具入口
+app._on_tray_cmd("tl:ja")
+ok("tray tl:ja sets target", app._codes()[1] == "ja" and app._tray_snap["tl"] == "ja")
+sm = app.smart_var.get(); app._on_tray_cmd("smart")
+ok("tray smart toggles", app.smart_var.get() == (not sm))
+hit = []; app.open_case_tool = lambda: hit.append(1); app._on_tray_cmd("tool:case")
+ok("tray tool:case opens tool", hit == [1])
 app.root.destroy()
 print("ALL OK" if all(res) else "FAILED")
 sys.exit(0 if all(res) else 1)

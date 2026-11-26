@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "realtime-translate"
-version = "2.15.5"
+version = "2.15.6"
 description = "实时翻译：划词 / 指针取词 / 悬停取词 / 截图 OCR 翻译，支持离线引擎"
 readme = "README.md"
 requires-python = ">=3.9"
