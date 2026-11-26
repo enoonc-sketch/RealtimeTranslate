@@ -3418,7 +3418,7 @@ class App:
                                     font=ui_font, wraplength=560, justify="left")
         self.dict_label.pack(fill="x")
 
-        # —— 按钮 ——
+        # —— 按钮 ——（v2.15.5：18 个按钮按用途分成两行：常用操作 / 翻译工具，不再挤成一大片）
         btns = ui_platform.FlowFrame(root)           # v2.13：放不下自动折行，不再把右边的按钮裁掉
         btns.pack(fill="x", padx=12, pady=(2, 0))
         B = lambda text, cmd: btns.add(ttk.Button(btns, text=text, command=cmd))      # noqa: E731
@@ -3426,20 +3426,26 @@ class App:
         B("复制原文", self.copy_source)
         B("🔊 原文", self.speak_source)
         B("🔊 译文", self.speak_result)
-        B("清空", self.clear)
-        B("网络检查", self.open_netcheck)
-        B("离线语言包…", self._show_offline_packs)
-        B("导入语言包…", self._import_packs)
-        B("⚖ 多引擎对照", self.open_compare)
-        B("Aa 命名格式", self.open_case_tool)
         B("🧹 去格式", self.clean_source)
-        B("截图翻译", self.start_screenshot)
-        B("翻译文档…", self._translate_doc_file)
-        B("翻译图片…", self._translate_image_file)
-        B("粘贴图片翻译", self._translate_clipboard_image)
-        B("🎤 语音输入", self.start_voice_input)
+        B("清空", self.clear)
         B("—  最小化", self.minimize_to_taskbar)      # v2.13：一键最小化到任务栏（不受「关闭 ×」设置影响）
         B("退出", self.quit)
+
+        tools = ttk.LabelFrame(root, text="翻译工具", padding=(8, 4))
+        tools.pack(fill="x", padx=12, pady=(8, 0))
+        btns_t = ui_platform.FlowFrame(tools)
+        btns_t.pack(fill="x")
+        T = lambda text, cmd: btns_t.add(ttk.Button(btns_t, text=text, command=cmd))  # noqa: E731
+        T("截图翻译", self.start_screenshot)
+        T("粘贴图片翻译", self._translate_clipboard_image)
+        T("翻译图片…", self._translate_image_file)
+        T("翻译文档…", self._translate_doc_file)
+        T("🎤 语音输入", self.start_voice_input)
+        T("⚖ 多引擎对照", self.open_compare)
+        T("Aa 命名格式", self.open_case_tool)
+        T("网络检查", self.open_netcheck)
+        T("离线语言包…", self._show_offline_packs)
+        T("导入语言包…", self._import_packs)
         # v2.11：整窗翻译 / 实时刷新 / 悬停整窗等进阶功能放在「高级设置 → 取词」，主窗口保持简洁；
         # 这一行平时是空的，只在文档翻译进行中显示「取消翻译」。
         btns2 = ttk.Frame(root)
@@ -3529,11 +3535,11 @@ class App:
         o2.add(self.fav_btn)
         o2.add(ttk.Button(o2, text="翻译历史…", command=self.open_history))
         o2.add(ttk.Button(o2, text="高级设置…", command=self.open_settings))
-        self._flows = (btns, o1, o2)
+        self._flows = (btns, btns_t, o1, o2)
 
         self._build_settings_win()
 
-        self._fit_rows = (top, eng_frame, btns, opts)
+        self._fit_rows = (top, eng_frame, btns, tools, opts)
 
         self.hint = ttk.Label(root, text="", foreground="#5b6676", wraplength=560)
         self.hint.pack(anchor="w", fill="x", padx=12, pady=(6, 10))
@@ -3549,7 +3555,7 @@ class App:
     def _build_settings_win(self):
         """高级设置窗口：创建后先隐藏，控件一直存在（托盘 / 快捷键随时可读写选项）。
 
-        分类：常规 / 翻译 / 取词 / 托盘 / 离线与网络 / 关于。
+        分类（v2.15.5 合并为 4 页）：常规（含托盘）/ 翻译（含历史）/ 取词 / 网络与快捷键（离线、代理、快捷键、关于）。
         和主窗口共用同一批变量，两边的勾选永远同步。
         """
         win = tk.Toplevel(self.root)
@@ -3595,20 +3601,38 @@ class App:
         self.settings_nb = nb
         self.settings_tabs = {}
 
+        # v2.15.5：页签从 7 个收成 4 个，相近的内容合并成同一页里的分组：
+        #   常规 = 常规 + 托盘；翻译 = 翻译 + 历史；取词；网络与快捷键 = 离线与网络 + 快捷键与关于。
+        # 旧的页签 key（tray / history / offline / about）仍然保留在 settings_tabs 里，指向合并后的页，
+        # 所以 open_settings("offline")、搜索跳转、记住上次页签等都照常工作。
+        self.settings_pages = []           # [(key, ScrollFrame)] 真正显示的页，按顺序
+        PAGE_OF = {"tray": "general", "history": "translate", "offline": "system", "about": "system"}
+        PAGE_TITLE = {"general": "常规", "translate": "翻译", "grab": "取词", "system": "网络与快捷键"}
+
         def tab(key, title):
             # v2.13：每页放进可滚动容器——小屏 / 大字号 / 高缩放下内容比窗口高时可以滚，不再被截断
-            sf = ui_platform.ScrollFrame(nb, padding=14)
-            nb.add(sf, text=title)
+            page = PAGE_OF.get(key, key)
+            sf = self.settings_tabs.get(page)
+            if sf is None:
+                sf = ui_platform.ScrollFrame(nb, padding=14)
+                nb.add(sf, text=PAGE_TITLE.get(page, title))
+                self.settings_tabs[page] = sf
+                self.settings_pages.append((page, sf))
+                cur["merged"] = False
+            else:
+                cur["merged"] = True       # 合并进已有页：下一个分组标题前补一条分隔线
             self.settings_tabs[key] = sf
             cur["tab"] = key
             return sf.body
 
         self._settings_index = []          # (tab_key, widget, 文字) 供搜索
         self._settings_deps = []           # (控件列表, 条件函数) 依赖关系置灰
-        cur = {"tab": None}
+        cur = {"tab": None, "merged": False}
 
         def section(parent, title, first=False):
             """分组小标题（苹果偏好设置式）：灰色粗体 + 细分隔线。"""
+            if first and cur.get("merged"):
+                first, cur["merged"] = False, False
             if not first:
                 ttk.Separator(parent).pack(fill="x", pady=(16, 6))
             lab = ttk.Label(parent, text=title, style="Section.TLabel")
@@ -3958,7 +3982,7 @@ class App:
 
         # 托盘
         f = tab("tray", "托盘")
-        section(f, "托盘", first=True)
+        section(f, "托盘图标", first=True)
         self.tray_state_label = ttk.Label(f, text="", style="Note.TLabel")
         self.tray_state_label.pack(anchor="w")
         check(f, "第一次隐藏到托盘时提示一次", self.tray_tip_var, self._save,
@@ -4080,7 +4104,7 @@ class App:
         ttk.Label(bar, text="勾选项改完立即生效；带「保存」按钮的（术语表 / 代理 / 快捷键）要点保存。",
                   style="Note.TLabel").pack(side="left", padx=10)
         # 标签页文字也进搜索索引
-        for key, sf in self.settings_tabs.items():
+        for key, sf in self.settings_pages:
             self._settings_index.append((key, None, nb.tab(sf, "text")))
         self._refresh_settings_deps()
 
@@ -4177,7 +4201,7 @@ class App:
     def _remember_settings_tab(self):
         try:
             cur = self.settings_nb.select()
-            for k, sf in self.settings_tabs.items():
+            for k, sf in self.settings_pages:
                 if str(sf) == cur:
                     self.cfg["settings_tab"] = k
         except Exception:

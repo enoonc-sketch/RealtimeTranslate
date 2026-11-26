@@ -2,6 +2,12 @@
 import hashlib, io, json, os, sys, tempfile, threading, time, zipfile, http.server, functools
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE)); sys.path.insert(0, HERE)
+def _walk(w):
+    yield w
+    for c in w.winfo_children():
+        yield from _walk(c)
+
+
 import desktop_translator as dt, offline_engine as oe, pack_downloader as pd, runtime_installer as ri
 
 tmp = tempfile.mkdtemp(); srv = os.path.join(tmp, "srv"); os.makedirs(os.path.join(srv, "whl"))
@@ -52,7 +58,7 @@ res = []
 def ok(n, c): print(("PASS " if c else "FAIL ") + n); res.append(bool(c))
 
 ok("standard build: no 离线 engine, but 离线语言包 button exists", "离线" not in app.engine.cget("values") and any(
-    str(w.cget("text")) == "离线语言包…" for f in r.winfo_children() for w in f.winfo_children() if hasattr(w, "cget") and "text" in w.keys()))
+    str(w.cget("text")) == "离线语言包…" for w in _walk(r) if hasattr(w, "cget") and "text" in w.keys()))
 # 1. 选「否」：什么都不发生
 app._show_offline_packs(); pump(0.2)
 ok("decline -> nothing downloaded/opened", asked and not getattr(app, "rt_win", None) and not ri.installed(dt._runtime_dir()))
